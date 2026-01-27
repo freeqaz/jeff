@@ -370,25 +370,15 @@ impl FunctionSlices {
                     jump_table_address: RelocationTarget::Address(address),
                     size,
                 } => {
-                    let next_addr_size = match jt {
-                        JumpTableType::Absolute => match size {
-                            Some(num) => num.get(),
-                            None => 0,
-                        },
-                        _ => 0,
-                    };
-
-                    // End of block
-                    let next_address = ins_addr + 4 + next_addr_size;
-                    self.blocks.insert(block_start, Some(next_address));
-
                     log::debug!(
                         "Fetching {} jump table entries @ {} with size {:?}",
                         if jt == JumpTableType::Absolute { "absolute" } else { "relative" },
                         address,
                         size
                     );
-                    let (entries, size) = uniq_jump_table_entries(
+
+                    // Get actual entries and size FIRST, before calculating block end
+                    let (entries, actual_size) = uniq_jump_table_entries(
                         obj,
                         address,
                         jt,
@@ -397,7 +387,17 @@ impl FunctionSlices {
                         function_start,
                         function_end.or_else(|| self.end()),
                     )?;
-                    log::debug!("-> size {}: {:?}", size, entries);
+                    log::debug!("-> actual size {}: {:?}", actual_size, entries);
+
+                    // Only inline jump tables (immediately after bctr) extend block end.
+                    // External jump tables in data sections should not affect block end.
+                    let is_inline = jt == JumpTableType::Absolute
+                        && address.address == ins_addr.address + 4;
+                    let next_addr_size = if is_inline { actual_size } else { 0 };
+
+                    // End of block - now uses actual size for inline tables
+                    let next_address = ins_addr + 4 + next_addr_size;
+                    self.blocks.insert(block_start, Some(next_address));
 
                     // if this function has a known end, check that every jump table entry is within function bounds
                     let within_func_bounds = match function_end {
@@ -420,7 +420,7 @@ impl FunctionSlices {
                                 .is_some_and(|fn_addr| fn_addr != function_start)
                         })
                     {
-                        self.jump_table_references.insert(address, size);
+                        self.jump_table_references.insert(address, actual_size);
                         let mut branches = vec![];
                         for addr in entries {
                             branches.push(addr);

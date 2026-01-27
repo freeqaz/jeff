@@ -256,7 +256,9 @@ fn get_jump_table_entries(
             data = &data[increment..];
             cur_addr += increment as u32;
         }
-        Ok((entries, size))
+        // Return actual bytes read, not VM-estimated size (which may be larger)
+        let actual_size = cur_addr.address - addr.address;
+        Ok((entries, actual_size))
     }
     // FIXME: this guessing routine only works for absolute jump tables
     // make one for relative jump tables!
@@ -413,8 +415,45 @@ mod tests {
 
         // With fix: Ok with 2 entries. Without fix: Err
         assert!(result.is_ok(), "Should break gracefully, not error");
-        let (entries, _) = result.unwrap();
+        let (entries, size) = result.unwrap();
         assert!(entries.len() <= 2, "Should stop at invalid entry");
+        // Verify size is actual bytes read (2 entries * 4 bytes = 8), not VM estimate (16)
+        assert_eq!(size, 8, "Should return actual bytes read, not VM estimate");
+    }
+
+    /// Test that external jump tables (not immediately after bctr) don't inflate function bounds.
+    #[test]
+    fn test_external_jump_table_size_returned_correctly() {
+        // Build code section: code at start, jump table at a different location
+        // Function at 0x80000000-0x80000040
+        // Jump table at 0x80000080 (external, not inline)
+        let mut code_data = vec![0u8; 0x100];
+        // Jump table entries at offset 0x80 (address 0x80000080)
+        code_data[0x80..0x84].copy_from_slice(&0x80000010u32.to_be_bytes()); // valid
+        code_data[0x84..0x88].copy_from_slice(&0x80000020u32.to_be_bytes()); // valid
+        code_data[0x88..0x8C].copy_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // INVALID
+
+        let text_section = make_test_section(
+            ".text", ObjSectionKind::Code, 0x80000000, code_data,
+        );
+
+        let obj = make_test_obj(vec![text_section]);
+
+        // bctr at 0x80000030, jump table at 0x80000080 (not inline - not at bctr+4)
+        let result = uniq_jump_table_entries(
+            &obj,
+            SectionAddress::new(0, 0x80000080), // external jump table
+            JumpTableType::Absolute,
+            NonZeroU32::new(12),  // 3 entries claimed but only 2 valid
+            SectionAddress::new(0, 0x80000030), // bctr address
+            SectionAddress::new(0, 0x80000000), // function start
+            Some(SectionAddress::new(0, 0x80000100)), // function end
+        );
+
+        assert!(result.is_ok());
+        let (entries, size) = result.unwrap();
+        assert_eq!(entries.len(), 2, "Should have 2 valid entries");
+        assert_eq!(size, 8, "Should return actual bytes read (2*4=8), not VM estimate (12)");
     }
 
     /// Verify valid jump tables still work after fix.
