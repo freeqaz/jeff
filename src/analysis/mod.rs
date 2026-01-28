@@ -117,10 +117,11 @@ fn is_valid_jump_table_addr(
     jump_table_type: JumpTableType,
 ) -> bool {
     match jump_table_type {
-        // if absolute, jump table is in .text, in the middle of the func actually
+        // Absolute jump tables are typically in .text, but Xbox 360 compiler
+        // places them in .rdata (ReadOnlyData) instead
         JumpTableType::Absolute => {
             let kind = obj.sections[addr.section].kind;
-            kind == ObjSectionKind::Code && kind != ObjSectionKind::Bss
+            matches!(kind, ObjSectionKind::Code | ObjSectionKind::ReadOnlyData)
         }
         // else, addr must not be in code or bss
         JumpTableType::RelativeBytes(_)
@@ -457,5 +458,88 @@ mod tests {
         let (entries, size) = result.unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(size, 12);
+    }
+
+    /// Test that absolute jump tables in ReadOnlyData sections work (Xbox 360 pattern).
+    /// Xbox compiler places jump tables in .rdata instead of inline in .text.
+    #[test]
+    fn test_jump_table_in_rdata_section() {
+        // Build code section (section 0): 0x80000000-0x800000FF
+        let code_data = vec![0u8; 0x100];
+        let text_section = make_test_section(
+            ".text", ObjSectionKind::Code, 0x80000000, code_data,
+        );
+
+        // Build rdata section (section 1): 0x82000000-0x820000FF
+        // Jump table at 0x82000050 with entries pointing back to .text
+        let mut rdata_data = vec![0u8; 0x100];
+        rdata_data[0x50..0x54].copy_from_slice(&0x80000010u32.to_be_bytes()); // points to .text
+        rdata_data[0x54..0x58].copy_from_slice(&0x80000020u32.to_be_bytes()); // points to .text
+        rdata_data[0x58..0x5C].copy_from_slice(&0x80000030u32.to_be_bytes()); // points to .text
+        let rdata_section = make_test_section(
+            ".rdata", ObjSectionKind::ReadOnlyData, 0x82000000, rdata_data,
+        );
+
+        let obj = make_test_obj(vec![text_section, rdata_section]);
+
+        // Jump table is in section 1 (.rdata) at address 0x82000050
+        // bctr is in section 0 (.text) at address 0x80000080
+        // Function spans 0x80000000-0x80000100 in .text
+        let result = uniq_jump_table_entries(
+            &obj,
+            SectionAddress::new(1, 0x82000050), // jump table in rdata section
+            JumpTableType::Absolute,
+            NonZeroU32::new(12),  // 3 entries
+            SectionAddress::new(0, 0x80000080), // bctr in code section
+            SectionAddress::new(0, 0x80000000), // function start in code
+            Some(SectionAddress::new(0, 0x80000100)), // function end in code
+        );
+
+        assert!(result.is_ok(), "Jump table in .rdata should be valid");
+        let (entries, size) = result.unwrap();
+        assert_eq!(entries.len(), 3, "Should have 3 valid entries pointing to .text");
+        assert_eq!(size, 12, "Should return correct size (3 entries * 4 bytes)");
+
+        // Verify entries point to the correct addresses in the code section
+        assert!(entries.contains(&SectionAddress::new(0, 0x80000010)));
+        assert!(entries.contains(&SectionAddress::new(0, 0x80000020)));
+        assert!(entries.contains(&SectionAddress::new(0, 0x80000030)));
+    }
+
+    /// Test that is_valid_jump_table_addr correctly rejects invalid section types.
+    #[test]
+    fn test_is_valid_jump_table_addr_rejects_bss() {
+        let bss_section = make_test_section(
+            ".bss", ObjSectionKind::Bss, 0x80000000, vec![],
+        );
+        let obj = make_test_obj(vec![bss_section]);
+
+        // BSS sections should be rejected for absolute jump tables
+        let addr = SectionAddress::new(0, 0x80000000);
+        assert!(!is_valid_jump_table_addr(&obj, addr, JumpTableType::Absolute));
+    }
+
+    /// Test that is_valid_jump_table_addr accepts Code sections (original behavior).
+    #[test]
+    fn test_is_valid_jump_table_addr_accepts_code() {
+        let code_section = make_test_section(
+            ".text", ObjSectionKind::Code, 0x80000000, vec![0u8; 0x100],
+        );
+        let obj = make_test_obj(vec![code_section]);
+
+        let addr = SectionAddress::new(0, 0x80000000);
+        assert!(is_valid_jump_table_addr(&obj, addr, JumpTableType::Absolute));
+    }
+
+    /// Test that is_valid_jump_table_addr accepts ReadOnlyData sections (new behavior).
+    #[test]
+    fn test_is_valid_jump_table_addr_accepts_rdata() {
+        let rdata_section = make_test_section(
+            ".rdata", ObjSectionKind::ReadOnlyData, 0x82000000, vec![0u8; 0x100],
+        );
+        let obj = make_test_obj(vec![rdata_section]);
+
+        let addr = SectionAddress::new(0, 0x82000000);
+        assert!(is_valid_jump_table_addr(&obj, addr, JumpTableType::Absolute));
     }
 }
