@@ -176,6 +176,16 @@ pub fn parse_symbol_line(line: &str, obj: &mut ObjInfo) -> Result<Option<ObjSymb
     }
 }
 
+pub fn create_auto_symbol_name(prefix: &str, module_id: u32, address: u32) -> String {
+    let name = if module_id == 0 {
+        format!("{}_{:08X}", prefix, address)
+    } else {
+        format!("{}_{}_{:X}", prefix, module_id, address)
+    };
+
+    name
+}
+
 pub fn is_skip_symbol(symbol: &ObjSymbol) -> bool {
     if symbol.flags.is_no_write() {
         return true;
@@ -194,6 +204,7 @@ pub fn is_auto_symbol(symbol: &ObjSymbol) -> bool {
         || symbol.name.starts_with("jumptable_")
         || symbol.name.starts_with("gap_")
         || symbol.name.starts_with("pad_")
+        || symbol.name.starts_with("dtor_")
 }
 
 pub fn is_auto_label(symbol: &ObjSymbol) -> bool { symbol.name.starts_with("lbl_") }
@@ -641,10 +652,7 @@ pub fn apply_splits<R>(r: &mut R, obj: &mut ObjInfo) -> Result<()>
 where R: BufRead + ?Sized {
     let mut state = SplitState::None;
     for result in r.lines() {
-        let line = match result {
-            Ok(line) => line,
-            Err(e) => return Err(e.into()),
-        };
+        let line = result?;
         let split_line = parse_split_line(&line, &state)?;
         match (&mut state, split_line) {
             (
@@ -745,10 +753,7 @@ pub fn read_splits_sections(path: &Utf8NativePath) -> Result<Option<Vec<SectionD
     let mut sections = Vec::new();
     let mut state = SplitState::None;
     for result in file.lines() {
-        let line = match result {
-            Ok(line) => line,
-            Err(e) => return Err(e.into()),
-        };
+        let line = result?;
         let split_line = parse_split_line(&line, &state)?;
         match (&mut state, split_line) {
             (SplitState::None | SplitState::Unit(_), SplitLine::SectionsStart) => {

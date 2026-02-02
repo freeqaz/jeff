@@ -1,6 +1,6 @@
 use std::{
     cmp::min,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Display, Formatter, UpperHex},
     ops::{Add, AddAssign, BitAnd, Sub},
 };
@@ -11,15 +11,15 @@ use itertools::Itertools;
 use crate::{
     analysis::{
         executor::{ExecCbData, ExecCbResult, Executor},
-        skip_alignment,
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
         RelocationTarget,
     },
     obj::{
-        ObjInfo, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
-        SectionIndex,
+        ObjInfo, ObjSection, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags,
+        ObjSymbolKind, SectionIndex,
     },
+    util::config::create_auto_symbol_name,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -124,9 +124,21 @@ pub struct AnalyzerState {
     pub jump_tables: BTreeMap<SectionAddress, u32>,
     pub known_symbols: BTreeMap<SectionAddress, Vec<ObjSymbol>>,
     pub known_sections: BTreeMap<SectionIndex, String>,
+    pub skip_ranges: BTreeMap<SectionAddress, SectionAddress>,
 }
 
 impl AnalyzerState {
+    pub fn new(skip_ranges: BTreeMap<SectionAddress, SectionAddress>) -> Self {
+        Self {
+            sda_bases: None,
+            functions: BTreeMap::new(),
+            jump_tables: BTreeMap::new(),
+            known_symbols: BTreeMap::new(),
+            known_sections: BTreeMap::new(),
+            skip_ranges,
+        }
+    }
+
     pub fn apply(&self, obj: &mut ObjInfo) -> Result<()> {
         for (&section_index, section_name) in &self.known_sections {
             obj.sections[section_index].rename(section_name.clone())?;
@@ -143,11 +155,7 @@ impl AnalyzerState {
                 section.address,
                 section.address + section.size
             );
-            let name = if obj.module_id == 0 {
-                format!("fn_{:08X}", start.address)
-            } else {
-                format!("fn_{}_{:X}", obj.module_id, start.address)
-            };
+            let name = create_auto_symbol_name("fn", obj.module_id, start.address);
             obj.add_symbol(
                 ObjSymbol {
                     name,
@@ -404,12 +412,7 @@ impl AnalyzerState {
                 log::trace!("Finalizing {:#010X}", addr);
                 slices.finalize(obj, &self.functions)?;
                 for address in slices.function_references.iter().cloned() {
-                    // Only create functions for code sections
-                    // Some games use branches to data sections to prevent dead stripping (Mario Party)
-                    if matches!(obj.sections.get(address.section), Some(section) if section.kind == ObjSectionKind::Code)
-                    {
-                        self.functions.entry(address).or_default();
-                    }
+                    self.try_add_function(obj, address);
                 }
                 self.jump_tables.append(&mut slices.jump_table_references.clone());
                 let end = slices.end();
@@ -421,6 +424,25 @@ impl AnalyzerState {
             }
         }
         Ok(finalized_any)
+    }
+
+    fn try_add_function(&mut self, obj: &ObjInfo, address: SectionAddress) {
+        // Only create functions for code sections
+        // Some games use branches to data sections to prevent dead stripping (Mario Party)
+        if !matches!(obj.sections.get(address.section), Some(section) if section.kind == ObjSectionKind::Code)
+            // Avoid creating functions in skipped ranges
+            || self.in_skipped_range(address)
+        {
+            return;
+        }
+        self.functions.entry(address).or_default();
+    }
+
+    fn in_skipped_range(&self, address: SectionAddress) -> bool {
+        match self.skip_ranges.range(..=address).next_back() {
+            Some((&start, &end)) => address >= start && address < end,
+            None => false,
+        }
     }
 
     fn first_unbounded_function(&self) -> Option<SectionAddress> {
@@ -447,12 +469,7 @@ impl AnalyzerState {
     pub fn process_function_at(&mut self, obj: &ObjInfo, addr: SectionAddress) -> Result<bool> {
         Ok(if let Some(mut slices) = self.process_function(obj, addr)? {
             for address in slices.function_references.iter().cloned() {
-                // Only create functions for code sections
-                // Some games use branches to data sections to prevent dead stripping (Mario Party)
-                if matches!(obj.sections.get(address.section), Some(section) if section.kind == ObjSectionKind::Code)
-                {
-                    self.functions.entry(address).or_default();
-                }
+                self.try_add_function(obj, address);
             }
             self.jump_tables.append(&mut slices.jump_table_references.clone());
             if slices.can_finalize() {
@@ -506,7 +523,7 @@ impl AnalyzerState {
                         if first_end > second {
                             bail!("Overlapping functions {}-{} -> {}", first, first_end, second);
                         }
-                        let addr = match skip_alignment(section, first_end, second) {
+                        let addr = match self.skip_alignment(section, first_end, second) {
                             Some(addr) => addr,
                             None => continue,
                         };
@@ -533,7 +550,7 @@ impl AnalyzerState {
                     (Some((last, last_info)), None) => {
                         let Some(last_end) = last_info.end else { continue };
                         if last_end < section_end {
-                            let addr = match skip_alignment(section, last_end, section_end) {
+                            let addr = match self.skip_alignment(section, last_end, section_end) {
                                 Some(addr) => addr,
                                 None => continue,
                             };
@@ -559,6 +576,33 @@ impl AnalyzerState {
             ensure!(opt.is_none(), "Attempted to detect duplicate function @ {:#010X}", addr);
         }
         Ok(found_new)
+    }
+
+    fn skip_alignment(
+        &self,
+        section: &ObjSection,
+        mut addr: SectionAddress,
+        end: SectionAddress,
+    ) -> Option<SectionAddress> {
+        loop {
+            if let Some((&start, &end)) = self.skip_ranges.range(..=addr).next_back() {
+                if addr >= start && addr < end {
+                    addr = end;
+                }
+            };
+            if addr.address + 4 > end.address {
+                break None;
+            }
+            let data = match section.data_range(addr.address, addr.address + 4) {
+                Ok(data) => data,
+                Err(_) => return None,
+            };
+            if data == [0u8; 4] {
+                addr += 4;
+            } else {
+                break Some(addr);
+            }
+        }
     }
 }
 
@@ -613,6 +657,26 @@ pub fn locate_sda_bases(obj: &mut ObjInfo) -> Result<bool> {
         Some((sda2_base, sda_base)) => {
             obj.sda2_base = Some(sda2_base as u32);
             obj.sda_base = Some(sda_base as u32);
+            obj.add_symbol(
+                ObjSymbol {
+                    name: "_SDA2_BASE_".to_string(),
+                    address: sda2_base as u64,
+                    size_known: true,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    ..Default::default()
+                },
+                true,
+            )?;
+            obj.add_symbol(
+                ObjSymbol {
+                    name: "_SDA_BASE_".to_string(),
+                    address: sda_base as u64,
+                    size_known: true,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    ..Default::default()
+                },
+                true,
+            )?;
             Ok(true)
         }
         None => Ok(false),
@@ -622,7 +686,7 @@ pub fn locate_sda_bases(obj: &mut ObjInfo) -> Result<bool> {
 /// ProDG hardcodes .bss and .sbss section initialization in `entry`
 /// This function locates the memset calls and returns a list of
 /// (address, size) pairs for the .bss sections.
-pub fn locate_bss_memsets(obj: &mut ObjInfo) -> Result<Vec<(u32, u32)>> {
+pub fn locate_bss_memsets(obj: &ObjInfo) -> Result<Vec<(u32, u32)>> {
     let mut bss_sections: Vec<(u32, u32)> = Vec::new();
     let Some(entry) = obj.entry else {
         return Ok(bss_sections);
@@ -672,4 +736,51 @@ pub fn locate_bss_memsets(obj: &mut ObjInfo) -> Result<Vec<(u32, u32)>> {
         },
     )?;
     Ok(bss_sections)
+}
+
+/// Execute VM from specified entry point following inner-section branches and function calls,
+/// noting all branch targets outside the current section.
+pub fn locate_cross_section_branch_targets(
+    obj: &ObjInfo,
+    entry: SectionAddress,
+) -> Result<BTreeSet<SectionAddress>> {
+    let mut branch_targets = BTreeSet::<SectionAddress>::new();
+    let mut executor = Executor::new(obj);
+    executor.push(entry, VM::new(), false);
+    executor.run(
+        obj,
+        |ExecCbData { executor, vm, result, ins_addr, section: _, ins: _, block_start: _ }| {
+            match result {
+                StepResult::Continue | StepResult::LoadStore { .. } => {
+                    Ok(ExecCbResult::<()>::Continue)
+                }
+                StepResult::Illegal => bail!("Illegal instruction @ {}", ins_addr),
+                StepResult::Jump(target) => {
+                    if let BranchTarget::Address(RelocationTarget::Address(addr)) = target {
+                        if addr.section == entry.section {
+                            executor.push(addr, vm.clone_all(), true);
+                        } else {
+                            branch_targets.insert(addr);
+                        }
+                    }
+                    Ok(ExecCbResult::EndBlock)
+                }
+                StepResult::Branch(branches) => {
+                    for branch in branches {
+                        if let BranchTarget::Address(RelocationTarget::Address(addr)) =
+                            branch.target
+                        {
+                            if addr.section == entry.section {
+                                executor.push(addr, branch.vm, true);
+                            } else {
+                                branch_targets.insert(addr);
+                            }
+                        }
+                    }
+                    Ok(ExecCbResult::Continue)
+                }
+            }
+        },
+    )?;
+    Ok(branch_targets)
 }

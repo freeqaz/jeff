@@ -272,7 +272,7 @@ fn split_write_obj_exe(
 
     debug!("Splitting {} objects", module.obj.link_order.len());
     let module_name = module.config.name().to_string();
-    let split_objs = split_obj(&module.obj, None)?;
+    let split_objs = split_obj(&module.obj, None, false)?;
 
     debug!("Writing object files");
     DirBuilder::new()
@@ -628,7 +628,7 @@ fn disasm(args: DisasmArgs) -> Result<()> {
     // Gamepad Release
     apply_splits_file(&args.out, &mut obj)?;
     update_splits(&mut obj, None, false)?;
-    let split_objs = split_obj(&mut obj, None)?;
+    let split_objs = split_obj(&mut obj, None, false)?;
 
     for coff_obj in &split_objs {
         // skip autogenned splits for now

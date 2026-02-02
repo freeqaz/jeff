@@ -10,11 +10,11 @@ use sanitise_file_name::sanitize_with_options;
 use tracing_attributes::instrument;
 
 use crate::{
-    analysis::{cfa::SectionAddress, read_address, read_u32},
+    analysis::{cfa::SectionAddress, read_address, read_u32, relocation_target_for},
     obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocations, ObjSection, ObjSectionKind,
-        ObjSplit, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
-        ObjUnit, SectionIndex, SymbolIndex,
+        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjRelocations, ObjSection,
+        ObjSectionKind, ObjSplit, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
+        ObjSymbolScope, ObjUnit, SectionIndex, SymbolIndex,
     },
     util::{align_up, comment::MWComment, toposort::toposort},
 };
@@ -33,7 +33,9 @@ fn split_ctors_dtors(obj: &mut ObjInfo, start: SectionAddress, end: SectionAddre
 
     while current_address < end {
         // ProDG hack when the end address is not known
-        if matches!(read_u32(ctors_section, current_address.address), Some(0)) {
+        if matches!(read_u32(ctors_section, current_address.address), Some(0))
+            && relocation_target_for(obj, current_address, Some(ObjRelocKind::Absolute))?.is_none()
+        {
             while current_address < end {
                 ensure!(
                     matches!(read_u32(ctors_section, current_address.address), Some(0)),
@@ -528,8 +530,7 @@ fn validate_splits(obj: &ObjInfo) -> Result<()> {
         if let Some((_, symbol)) = obj
             .symbols
             .for_section_range(section_index, ..addr)
-            .filter(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
-            .next_back()
+            .rfind(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
         {
             ensure!(
                 addr >= symbol.address as u32 + symbol.size as u32,
@@ -547,8 +548,7 @@ fn validate_splits(obj: &ObjInfo) -> Result<()> {
         if let Some((_, symbol)) = obj
             .symbols
             .for_section_range(section_index, ..split.end)
-            .filter(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
-            .next_back()
+            .rfind(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
         {
             ensure!(
                 split.end >= symbol.address as u32 + symbol.size as u32,
@@ -771,8 +771,7 @@ fn trim_split_alignment(obj: &mut ObjInfo) -> Result<()> {
         if let Some((_, symbol)) = obj
             .symbols
             .for_section_range(section_index, addr..split.end)
-            .filter(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
-            .next_back()
+            .rfind(|&(_, s)| s.size_known && s.size > 0 && !s.flags.is_stripped())
         {
             split_end = symbol.address as u32 + symbol.size as u32;
         }
@@ -1057,7 +1056,11 @@ fn resolve_link_order(obj: &ObjInfo) -> Result<Vec<ObjUnit>> {
 
 /// Split an object into multiple relocatable objects.
 #[instrument(level = "debug", skip(obj))]
-pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo>> {
+pub fn split_obj(
+    obj: &ObjInfo,
+    module_name: Option<&str>,
+    globalize_symbols: bool,
+) -> Result<Vec<ObjInfo>> {
     let mut objects: Vec<ObjInfo> = vec![];
     let mut object_symbols: Vec<Vec<Option<SymbolIndex>>> = vec![];
     let mut name_to_obj: HashMap<String, usize> = HashMap::new();
@@ -1280,7 +1283,7 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
     }
 
     // Update relocations
-    let mut globalize_symbols = vec![];
+    let mut symbols_to_globalize = vec![];
     for (obj_idx, out_obj) in objects.iter_mut().enumerate() {
         let symbol_idxs = &mut object_symbols[obj_idx];
         for (_section_index, section) in out_obj.sections.iter_mut() {
@@ -1296,7 +1299,7 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
 
                         // If the symbol is local, we'll upgrade the scope to global
                         // and rename it to avoid conflicts
-                        if target_sym.flags.is_local() {
+                        if globalize_symbols && target_sym.flags.is_local() {
                             let address_str = if obj.module_id == 0 {
                                 format!("{:08X}", target_sym.address)
                             } else if let Some(section_index) = target_sym.section {
@@ -1315,7 +1318,7 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
                             } else {
                                 format!("{}_{}", target_sym.name, address_str)
                             };
-                            globalize_symbols.push((reloc.target_symbol, new_name));
+                            symbols_to_globalize.push((reloc.target_symbol, new_name));
                         }
 
                         symbol_idxs[reloc.target_symbol as usize] = Some(out_sym_idx);
@@ -1360,16 +1363,18 @@ pub fn split_obj(obj: &ObjInfo, module_name: Option<&str>) -> Result<Vec<ObjInfo
     }
 
     // Upgrade local symbols to global if necessary
-    for (obj, symbol_map) in objects.iter_mut().zip(&object_symbols) {
-        for (globalize_idx, new_name) in &globalize_symbols {
-            if let Some(symbol_idx) = symbol_map[*globalize_idx as usize] {
-                let mut symbol = obj.symbols[symbol_idx].clone();
-                symbol.name.clone_from(new_name);
-                if symbol.flags.is_local() {
-                    log::debug!("Globalizing {} in {}", symbol.name, obj.name);
-                    symbol.flags.set_scope(ObjSymbolScope::Global);
+    if globalize_symbols {
+        for (obj, symbol_map) in objects.iter_mut().zip(&object_symbols) {
+            for (globalize_idx, new_name) in &symbols_to_globalize {
+                if let Some(symbol_idx) = symbol_map[*globalize_idx as usize] {
+                    let mut symbol = obj.symbols[symbol_idx].clone();
+                    symbol.name.clone_from(new_name);
+                    if symbol.flags.is_local() {
+                        log::debug!("Globalizing {} in {}", symbol.name, obj.name);
+                        symbol.flags.set_scope(ObjSymbolScope::Global);
+                    }
+                    obj.symbols.replace(symbol_idx, symbol)?;
                 }
-                obj.symbols.replace(symbol_idx, symbol)?;
             }
         }
     }
@@ -1498,16 +1503,13 @@ pub fn end_for_section(obj: &ObjInfo, section_index: SectionIndex) -> Result<Sec
         section_end -= 4;
     }
     loop {
-        let last_symbol = obj
-            .symbols
-            .for_section_range(section_index, ..section_end)
-            .filter(|(_, s)| {
+        let last_symbol =
+            obj.symbols.for_section_range(section_index, ..section_end).rfind(|(_, s)| {
                 s.kind == ObjSymbolKind::Object
                     && s.size_known
                     && s.size > 0
                     && !s.flags.is_stripped()
-            })
-            .next_back();
+            });
         match last_symbol {
             Some((_, symbol)) if is_linker_generated_object(&symbol.name) => {
                 log::debug!(
@@ -1541,8 +1543,8 @@ fn auto_unit_name(
         length_limit: 20,
         ..Default::default()
     })
-    // Also replace $ to avoid issues with build.ninja
-    .replace('$', "_");
+    // Also replace characters that break downstream tooling (build.ninja, linker, etc)
+    .replace(['$', ','], "_");
     let mut unit_name = format!("auto_{}_{}", name, section_name.trim_start_matches('.'));
     // Ensure the name is unique
     if unit_exists(&unit_name, obj, new_splits) {
