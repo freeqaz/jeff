@@ -7,9 +7,11 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use itertools::Itertools;
+use powerpc::Opcode;
 
 use crate::{
     analysis::{
+        disassemble,
         executor::{ExecCbData, ExecCbResult, Executor},
         skip_alignment,
         slices::{FunctionSlices, TailCallResult},
@@ -17,8 +19,8 @@ use crate::{
         RelocationTarget,
     },
     obj::{
-        ObjInfo, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
-        SectionIndex,
+        ObjInfo, ObjSection, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags,
+        ObjSymbolKind, ObjSymbolScope, SectionIndex,
     },
 };
 
@@ -124,12 +126,64 @@ pub struct AnalyzerState {
     pub jump_tables: BTreeMap<SectionAddress, u32>,
     pub known_symbols: BTreeMap<SectionAddress, Vec<ObjSymbol>>,
     pub known_sections: BTreeMap<SectionIndex, String>,
+    /// Functions that were merged as tail blocks into their predecessors.
+    /// These need to be removed from obj.symbols during apply().
+    pub merged_tail_blocks: Vec<SectionAddress>,
+    /// Functions whose ends were extended by absorbing tail blocks.
+    /// These need their symbol size updated in apply().
+    pub extended_functions: Vec<SectionAddress>,
 }
 
 impl AnalyzerState {
     pub fn apply(&self, obj: &mut ObjInfo) -> Result<()> {
         for (&section_index, section_name) in &self.known_sections {
             obj.sections[section_index].rename(section_name.clone())?;
+        }
+        // Remove symbols for functions that were merged as tail blocks
+        for addr in &self.merged_tail_blocks {
+            if let Ok(Some((index, _))) = obj.symbols.kind_at_section_address(
+                addr.section,
+                addr.address,
+                ObjSymbolKind::Function,
+            ) {
+                let existing = &obj.symbols[index];
+                let symbol = ObjSymbol {
+                    name: format!("__DELETED_{}", existing.name),
+                    kind: ObjSymbolKind::Unknown,
+                    size: 0,
+                    flags: ObjSymbolFlagSet(
+                        ObjSymbolFlags::RelocationIgnore
+                            | ObjSymbolFlags::NoWrite
+                            | ObjSymbolFlags::NoExport
+                            | ObjSymbolFlags::Stripped,
+                    ),
+                    ..existing.clone()
+                };
+                obj.symbols.replace(index, symbol)?;
+            }
+        }
+        // Update sizes for functions that absorbed tail blocks
+        for addr in &self.extended_functions {
+            if let Some(info) = self.functions.get(addr) {
+                if let Some(end) = info.end {
+                    let new_size = (end.address - addr.address) as u64;
+                    if let Ok(Some((index, _))) = obj.symbols.kind_at_section_address(
+                        addr.section,
+                        addr.address,
+                        ObjSymbolKind::Function,
+                    ) {
+                        let existing = &obj.symbols[index];
+                        if existing.size != new_size {
+                            let symbol = ObjSymbol {
+                                size: new_size,
+                                size_known: true,
+                                ..existing.clone()
+                            };
+                            obj.symbols.replace(index, symbol)?;
+                        }
+                    }
+                }
+            }
         }
         for (&start, FunctionInfo { end, .. }) in self.functions.iter() {
             let Some(end) = end else { continue };
@@ -286,9 +340,21 @@ impl AnalyzerState {
                         let known_end = addr + *known_size;
                         assert_eq!(func.end.is_some(), true, "Function at {} has no detected end rather than known end {}. There must be an error in processing!", addr, known_end);
                         let func_end = func.end.unwrap();
-                        assert_eq!(func_end, known_end,
-                                   "Function at {} has known end addr {}, but during processing, ending was found to be {}!",
-                                   addr, known_end, func_end);
+                        // pdata sizes are conservative and may not include
+                        // out-of-line tail blocks, so allow func_end >= known_end
+                        if func_end < known_end {
+                            panic!(
+                                "Function at {} has known end addr {}, but during processing, \
+                                 ending was found to be {} (smaller than expected)!",
+                                addr, known_end, func_end
+                            );
+                        } else if func_end != known_end {
+                            log::info!(
+                                "Function at {} extends beyond pdata end {} to {} \
+                                 (likely tail block inclusion)",
+                                addr, known_end, func_end
+                            );
+                        }
                     }
                 } else {
                     unreachable!();
@@ -325,6 +391,11 @@ impl AnalyzerState {
             }
             bail!("Failed to finalize functions");
         }
+
+        // Merge tail blocks: small functions that are actually out-of-line code
+        // from the preceding function (e.g., loop exit paths placed after .pdata end)
+        self.merge_tail_blocks(obj)?;
+
         Ok(())
     }
 
@@ -488,6 +559,221 @@ impl AnalyzerState {
             true => Some(slices),
             false => None,
         })
+    }
+
+    /// Post-pass to merge small functions that are actually tail blocks of their predecessor.
+    ///
+    /// After all functions are detected (from pdata, symbols, and gap-filling), this scans for
+    /// adjacent function pairs where the second function is a tail block of the first. This
+    /// handles cases where symbols.txt already has the fake function defined from a previous run.
+    fn merge_tail_blocks(&mut self, obj: &ObjInfo) -> Result<()> {
+        let mut merges: Vec<(SectionAddress, SectionAddress)> = vec![];
+
+        for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
+            let section_start = SectionAddress::new(section_index, section.address as u32);
+            let section_end = section_start + section.size as u32;
+            let funcs_in_section: Vec<(SectionAddress, FunctionInfo)> = self
+                .functions
+                .range(section_start..section_end)
+                .map(|(&a, i)| (a, i.clone()))
+                .collect();
+
+            for window in funcs_in_section.windows(2) {
+                let (prev_addr, prev_info) = &window[0];
+                let (func_addr, func_info) = &window[1];
+
+                let Some(prev_end) = prev_info.end else { continue };
+                let Some(func_end) = func_info.end else { continue };
+
+                // Only consider the case where the candidate function starts right
+                // at the predecessor's end (no gap/alignment between them)
+                if *func_addr != prev_end {
+                    continue;
+                }
+
+                // Skip merging if the candidate has a global-scope symbol
+                // (user, PDB, or map file explicitly defined it as a real function)
+                if let Ok(Some((_, sym))) = obj.symbols.kind_at_section_address(
+                    func_addr.section,
+                    func_addr.address,
+                    ObjSymbolKind::Function,
+                ) {
+                    if sym.flags.scope() == ObjSymbolScope::Global {
+                        log::info!(
+                            "Skipping tail block merge of {:#010X} (global-scope symbol '{}')",
+                            func_addr, sym.name,
+                        );
+                        continue;
+                    }
+                }
+
+                // Check if this function is a tail block
+                if let Some(_tail_end) = Self::check_tail_block(
+                    section, *func_addr, func_end, *prev_addr, prev_end,
+                ) {
+                    log::info!(
+                        "Merging tail block function {:#010X}-{:#010X} into {:#010X} (extending from {:#010X})",
+                        func_addr, func_end, prev_addr, prev_end,
+                    );
+                    merges.push((*prev_addr, *func_addr));
+                }
+            }
+        }
+
+        for (prev_addr, tail_addr) in &merges {
+            // Get the tail function's end before removing it
+            let tail_end = self.functions.get(tail_addr).and_then(|i| i.end).unwrap();
+            // Remove the fake function
+            self.functions.remove(tail_addr);
+            // Track for symbol removal in apply()
+            self.merged_tail_blocks.push(*tail_addr);
+            // Extend the predecessor's end and track for size update in apply()
+            self.extended_functions.push(*prev_addr);
+            if let Some(info) = self.functions.get_mut(prev_addr) {
+                info.end = Some(tail_end);
+                // Mark for re-analysis with the new bounds
+                info.analyzed = false;
+                info.slices = None;
+            }
+        }
+
+        if !merges.is_empty() {
+            log::info!("Merged {} tail block(s), re-analyzing affected functions", merges.len());
+            // Re-analyze the extended functions
+            for (prev_addr, _) in &merges {
+                self.process_function_at(obj, *prev_addr)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if code at `gap_start` (up to `gap_end`) is a tail block of the preceding function.
+    ///
+    /// A tail block is an out-of-line code fragment (typically a loop exit path) that the
+    /// compiler placed after the .pdata-reported function end. It's characterized by:
+    /// - Starting with an unconditional branch (`b`, not `bl`) back into the preceding function
+    /// - Or containing only a few instructions that all branch back into the preceding function
+    ///   before ending with `blr`
+    ///
+    /// Returns `Some(block_end)` if this is a tail block, where `block_end` is the address
+    /// just past the last instruction in the tail block.
+    fn check_tail_block(
+        section: &ObjSection,
+        gap_start: SectionAddress,
+        gap_end: SectionAddress,
+        preceding_func_start: SectionAddress,
+        preceding_func_end: SectionAddress,
+    ) -> Option<SectionAddress> {
+        // Only consider small gaps (up to 64 bytes / 16 instructions)
+        let gap_size = gap_end.address - gap_start.address;
+        if gap_size > 64 {
+            return None;
+        }
+
+        // Check the first instruction
+        let first_ins = disassemble(section, gap_start.address)?;
+
+        // Case 1: First instruction is an unconditional branch (b, not bl) back into
+        // the preceding function. This is the classic out-of-line loop exit.
+        if first_ins.op == Opcode::B && !first_ins.field_lk() && !first_ins.field_aa() {
+            let target = first_ins.branch_dest(gap_start.address)?;
+            if target >= preceding_func_start.address && target < preceding_func_end.address {
+                // Scan forward to find the end of this tail block (up to blr or gap_end)
+                let mut addr = gap_start;
+                loop {
+                    let Some(ins) = disassemble(section, addr.address) else { break };
+                    addr += 4;
+                    // blr (unconditional return) or end of gap
+                    if ins.op == Opcode::Bclr && !ins.field_lk()
+                        && (ins.field_bo() & 0b10100 == 0b10100)
+                    {
+                        return Some(addr);
+                    }
+                    if addr >= gap_end {
+                        return Some(gap_end);
+                    }
+                }
+            }
+        }
+
+        // Case 2: Block contains only backward branches into the preceding function
+        // and ends with blr. Common for multi-exit loops.
+        let mut has_backward_branch = false;
+        let mut ends_with_blr = false;
+        let mut addr = gap_start;
+
+        while addr < gap_end {
+            let Some(ins) = disassemble(section, addr.address) else { break };
+            addr += 4;
+
+            // blr check (unconditional return)
+            if ins.op == Opcode::Bclr && !ins.field_lk()
+                && (ins.field_bo() & 0b10100 == 0b10100)
+            {
+                ends_with_blr = true;
+                // If the next instruction is still in the gap, keep scanning
+                // (there may be more code after this blr)
+                if addr >= gap_end {
+                    break;
+                }
+                continue;
+            }
+
+            // Unconditional branch (b, not bl)
+            if ins.op == Opcode::B && !ins.field_lk() && !ins.field_aa() {
+                if let Some(target) = ins.branch_dest(addr.address - 4) {
+                    if target >= preceding_func_start.address
+                        && target < preceding_func_end.address
+                    {
+                        has_backward_branch = true;
+                        continue;
+                    }
+                    // Forward branch within the gap is OK
+                    if target >= gap_start.address && target < gap_end.address {
+                        continue;
+                    }
+                }
+                // Branch outside both the gap and preceding function - not a tail block
+                return None;
+            }
+
+            // Conditional branch (bc, not bcl)
+            if ins.op == Opcode::Bc && !ins.field_lk() && !ins.field_aa() {
+                if let Some(target) = ins.branch_dest(addr.address - 4) {
+                    if target >= preceding_func_start.address
+                        && target < preceding_func_end.address
+                    {
+                        has_backward_branch = true;
+                        continue;
+                    }
+                    // Forward branch within the gap is OK
+                    if target >= gap_start.address && target < gap_end.address {
+                        continue;
+                    }
+                }
+                // Branch outside both the gap and preceding function - not a tail block
+                return None;
+            }
+
+            // bl (function call) - not a tail block characteristic
+            if ins.op == Opcode::B && ins.field_lk() {
+                return None;
+            }
+
+            // bctr (indirect branch) - too complex to analyze
+            if ins.op == Opcode::Bcctr {
+                return None;
+            }
+
+            // Other instructions are fine (arithmetic, loads, stores, etc.)
+        }
+
+        if has_backward_branch && ends_with_blr {
+            Some(gap_end)
+        } else {
+            None
+        }
     }
 
     fn detect_new_functions(&mut self, obj: &ObjInfo) -> Result<bool> {
