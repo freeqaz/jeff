@@ -572,22 +572,24 @@ impl AnalyzerState {
         for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
             let section_start = SectionAddress::new(section_index, section.address as u32);
             let section_end = section_start + section.size as u32;
-            let funcs_in_section: Vec<(SectionAddress, FunctionInfo)> = self
+
+            // Collect only the addresses and ends we need — avoid cloning FunctionInfo/slices.
+            let func_bounds: Vec<(SectionAddress, Option<SectionAddress>)> = self
                 .functions
                 .range(section_start..section_end)
-                .map(|(&a, i)| (a, i.clone()))
+                .map(|(&addr, info)| (addr, info.end))
                 .collect();
 
-            for window in funcs_in_section.windows(2) {
-                let (prev_addr, prev_info) = &window[0];
-                let (func_addr, func_info) = &window[1];
+            for window in func_bounds.windows(2) {
+                let (prev_addr, prev_end) = window[0];
+                let (func_addr, func_end) = window[1];
 
-                let Some(prev_end) = prev_info.end else { continue };
-                let Some(func_end) = func_info.end else { continue };
+                let Some(prev_end) = prev_end else { continue };
+                let Some(func_end) = func_end else { continue };
 
                 // Only consider the case where the candidate function starts right
                 // at the predecessor's end (no gap/alignment between them)
-                if *func_addr != prev_end {
+                if func_addr != prev_end {
                     continue;
                 }
 
@@ -609,20 +611,23 @@ impl AnalyzerState {
 
                 // Check if this function is a tail block
                 if let Some(_tail_end) = Self::check_tail_block(
-                    section, *func_addr, func_end, *prev_addr, prev_end,
+                    section, func_addr, func_end, prev_addr, prev_end,
                 ) {
                     log::info!(
                         "Merging tail block function {:#010X}-{:#010X} into {:#010X} (extending from {:#010X})",
                         func_addr, func_end, prev_addr, prev_end,
                     );
-                    merges.push((*prev_addr, *func_addr));
+                    merges.push((prev_addr, func_addr));
                 }
             }
         }
 
         for (prev_addr, tail_addr) in &merges {
-            // Get the tail function's end before removing it
-            let tail_end = self.functions.get(tail_addr).and_then(|i| i.end).unwrap();
+            let tail_end = self
+                .functions
+                .get(tail_addr)
+                .and_then(|i| i.end)
+                .expect("tail function must exist in map");
             // Remove the fake function
             self.functions.remove(tail_addr);
             // Track for symbol removal in apply()
@@ -648,6 +653,29 @@ impl AnalyzerState {
         Ok(())
     }
 
+    /// Maximum size of a tail block candidate in bytes (16 instructions).
+    const MAX_TAIL_BLOCK_BYTES: u32 = 64;
+
+    /// Check whether `ins` is an unconditional `blr` (return from function).
+    fn is_unconditional_blr(ins: &powerpc::Ins) -> bool {
+        ins.op == Opcode::Bclr && !ins.field_lk() && (ins.field_bo() & 0b10100 == 0b10100)
+    }
+
+    /// If `ins` at `ins_addr` is a non-link, non-absolute branch whose target falls within
+    /// `func_start..func_end`, return `Some(target)`. Otherwise return `None`.
+    fn branch_into_range(
+        ins: &powerpc::Ins,
+        ins_addr: u32,
+        func_start: u32,
+        func_end: u32,
+    ) -> Option<u32> {
+        if ins.field_lk() || ins.field_aa() {
+            return None;
+        }
+        let target = ins.branch_dest(ins_addr)?;
+        if target >= func_start && target < func_end { Some(target) } else { None }
+    }
+
     /// Check if code at `gap_start` (up to `gap_end`) is a tail block of the preceding function.
     ///
     /// A tail block is an out-of-line code fragment (typically a loop exit path) that the
@@ -665,115 +693,131 @@ impl AnalyzerState {
         preceding_func_start: SectionAddress,
         preceding_func_end: SectionAddress,
     ) -> Option<SectionAddress> {
-        // Only consider small gaps (up to 64 bytes / 16 instructions)
         let gap_size = gap_end.address - gap_start.address;
-        if gap_size > 64 {
+        if gap_size > Self::MAX_TAIL_BLOCK_BYTES {
             return None;
         }
 
-        // Check the first instruction
-        let first_ins = disassemble(section, gap_start.address)?;
-
-        // Case 1: First instruction is an unconditional branch (b, not bl) back into
-        // the preceding function. This is the classic out-of-line loop exit.
-        if first_ins.op == Opcode::B && !first_ins.field_lk() && !first_ins.field_aa() {
-            let target = first_ins.branch_dest(gap_start.address)?;
-            if target >= preceding_func_start.address && target < preceding_func_end.address {
-                // Scan forward to find the end of this tail block (up to blr or gap_end)
-                let mut addr = gap_start;
-                loop {
-                    let Some(ins) = disassemble(section, addr.address) else { break };
-                    addr += 4;
-                    // blr (unconditional return) or end of gap
-                    if ins.op == Opcode::Bclr && !ins.field_lk()
-                        && (ins.field_bo() & 0b10100 == 0b10100)
-                    {
-                        return Some(addr);
-                    }
-                    if addr >= gap_end {
-                        return Some(gap_end);
-                    }
-                }
-            }
+        // Case 1: First instruction is an unconditional branch back into the predecessor.
+        if let Some(result) = Self::check_tail_block_backward_branch(
+            section,
+            gap_start,
+            gap_end,
+            preceding_func_start,
+            preceding_func_end,
+        ) {
+            return Some(result);
         }
 
-        // Case 2: Block contains only backward branches into the preceding function
-        // and ends with blr. Common for multi-exit loops.
+        // Case 2: All branches target the predecessor, block ends with blr.
+        Self::check_tail_block_scan_block(
+            section,
+            gap_start,
+            gap_end,
+            preceding_func_start,
+            preceding_func_end,
+        )
+    }
+
+    /// Case 1: First instruction is an unconditional branch (`b`, not `bl`) back into
+    /// the preceding function. This is the classic out-of-line loop exit.
+    ///
+    /// Scans forward from `gap_start` until a `blr` or `gap_end` to determine the
+    /// tail block extent.
+    fn check_tail_block_backward_branch(
+        section: &ObjSection,
+        gap_start: SectionAddress,
+        gap_end: SectionAddress,
+        preceding_func_start: SectionAddress,
+        preceding_func_end: SectionAddress,
+    ) -> Option<SectionAddress> {
+        let first_ins = disassemble(section, gap_start.address)?;
+
+        if first_ins.op != Opcode::B {
+            return None;
+        }
+        // Must branch back into the preceding function
+        Self::branch_into_range(
+            &first_ins,
+            gap_start.address,
+            preceding_func_start.address,
+            preceding_func_end.address,
+        )?;
+
+        // Scan forward to find the end of this tail block (up to blr or gap_end)
+        let mut addr = gap_start;
+        loop {
+            let ins = disassemble(section, addr.address)?;
+            addr += 4;
+            if Self::is_unconditional_blr(&ins) {
+                return Some(addr);
+            }
+            if addr >= gap_end {
+                return Some(gap_end);
+            }
+        }
+    }
+
+    /// Case 2: Scan the entire gap block — if every branch instruction targets back
+    /// into the preceding function (no outward calls or forward jumps to other functions),
+    /// and the block ends with `blr`, treat it as a tail block.
+    fn check_tail_block_scan_block(
+        section: &ObjSection,
+        gap_start: SectionAddress,
+        gap_end: SectionAddress,
+        preceding_func_start: SectionAddress,
+        preceding_func_end: SectionAddress,
+    ) -> Option<SectionAddress> {
         let mut has_backward_branch = false;
         let mut ends_with_blr = false;
         let mut addr = gap_start;
 
         while addr < gap_end {
-            let Some(ins) = disassemble(section, addr.address) else { break };
+            let ins = disassemble(section, addr.address)?;
             addr += 4;
 
-            // blr check (unconditional return)
-            if ins.op == Opcode::Bclr && !ins.field_lk()
-                && (ins.field_bo() & 0b10100 == 0b10100)
-            {
+            if Self::is_unconditional_blr(&ins) {
                 ends_with_blr = true;
-                // If the next instruction is still in the gap, keep scanning
-                // (there may be more code after this blr)
                 if addr >= gap_end {
                     break;
                 }
                 continue;
             }
 
-            // Unconditional branch (b, not bl)
-            if ins.op == Opcode::B && !ins.field_lk() && !ins.field_aa() {
-                if let Some(target) = ins.branch_dest(addr.address - 4) {
-                    if target >= preceding_func_start.address
-                        && target < preceding_func_end.address
+            match ins.op {
+                // Unconditional or conditional branch (not link)
+                Opcode::B | Opcode::Bc if !ins.field_lk() && !ins.field_aa() => {
+                    let ins_addr = addr.address - 4;
+                    if Self::branch_into_range(
+                        &ins,
+                        ins_addr,
+                        preceding_func_start.address,
+                        preceding_func_end.address,
+                    )
+                    .is_some()
                     {
                         has_backward_branch = true;
                         continue;
                     }
                     // Forward branch within the gap is OK
-                    if target >= gap_start.address && target < gap_end.address {
-                        continue;
+                    if let Some(target) = ins.branch_dest(ins_addr) {
+                        if target >= gap_start.address && target < gap_end.address {
+                            continue;
+                        }
                     }
+                    // Branch outside both the gap and preceding function
+                    return None;
                 }
-                // Branch outside both the gap and preceding function - not a tail block
-                return None;
+                // bl (function call) — tail blocks don't call other functions
+                Opcode::B if ins.field_lk() => return None,
+                // bctr (indirect branch) — too complex to analyze
+                Opcode::Bcctr => return None,
+                // Other instructions are fine (arithmetic, loads, stores, etc.)
+                _ => {}
             }
-
-            // Conditional branch (bc, not bcl)
-            if ins.op == Opcode::Bc && !ins.field_lk() && !ins.field_aa() {
-                if let Some(target) = ins.branch_dest(addr.address - 4) {
-                    if target >= preceding_func_start.address
-                        && target < preceding_func_end.address
-                    {
-                        has_backward_branch = true;
-                        continue;
-                    }
-                    // Forward branch within the gap is OK
-                    if target >= gap_start.address && target < gap_end.address {
-                        continue;
-                    }
-                }
-                // Branch outside both the gap and preceding function - not a tail block
-                return None;
-            }
-
-            // bl (function call) - not a tail block characteristic
-            if ins.op == Opcode::B && ins.field_lk() {
-                return None;
-            }
-
-            // bctr (indirect branch) - too complex to analyze
-            if ins.op == Opcode::Bcctr {
-                return None;
-            }
-
-            // Other instructions are fine (arithmetic, loads, stores, etc.)
         }
 
-        if has_backward_branch && ends_with_blr {
-            Some(gap_end)
-        } else {
-            None
-        }
+        if has_backward_branch && ends_with_blr { Some(gap_end) } else { None }
     }
 
     fn detect_new_functions(&mut self, obj: &ObjInfo) -> Result<bool> {
@@ -959,3 +1003,7 @@ pub fn locate_bss_memsets(obj: &mut ObjInfo) -> Result<Vec<(u32, u32)>> {
     )?;
     Ok(bss_sections)
 }
+
+#[cfg(test)]
+#[path = "cfa_tests.rs"]
+mod cfa_tests;
