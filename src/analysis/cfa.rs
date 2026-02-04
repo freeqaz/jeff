@@ -19,7 +19,7 @@ use crate::{
     },
     obj::{
         ObjInfo, ObjSection, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags,
-        ObjSymbolKind, SectionIndex,
+        ObjSymbolKind, ObjSymbolScope, SectionIndex,
     },
     util::config::create_auto_symbol_name,
 };
@@ -608,6 +608,22 @@ impl AnalyzerState {
                 // at the predecessor's end (no gap/alignment between them)
                 if *func_addr != prev_end {
                     continue;
+                }
+
+                // Skip merging if the candidate has a global-scope symbol
+                // (user, PDB, or map file explicitly defined it as a real function)
+                if let Ok(Some((_, sym))) = obj.symbols.kind_at_section_address(
+                    func_addr.section,
+                    func_addr.address,
+                    ObjSymbolKind::Function,
+                ) {
+                    if sym.flags.scope() == ObjSymbolScope::Global {
+                        log::info!(
+                            "Skipping tail block merge of {:#010X} (global-scope symbol '{}')",
+                            func_addr, sym.name,
+                        );
+                        continue;
+                    }
                 }
 
                 // Check if this function is a tail block
