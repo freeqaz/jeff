@@ -1,26 +1,41 @@
-# jeff [![Build Status]][actions]
+# jeff (freeqaz fork)
 
-[Build Status]: https://github.com/encounter/decomp-toolkit/actions/workflows/build.yml/badge.svg
-[actions]: https://github.com/encounter/decomp-toolkit/actions
+> **This is a fork of [rjkiv/jeff](https://github.com/rjkiv/jeff)** with additional fixes and features for the [Dance Central 3 decomp](https://github.com/milohax/dc3-decomp). It stays in sync with upstream and is available as a drop-in replacement.
 
-https://youtu.be/0OzXZGA1k3s
+## Fork additions
 
-Forked from and inspired by [encounter's GC/Wii decomp toolkit](https://github.com/encounter/decomp-toolkit), jeff is 
+**Xbox 360 linking pipeline** — Generate linkable COFF objects and produce a hybrid executable via `ninja link` (decomp `.obj` files where functions match, original object code elsewhere). Requires the Xbox 360 SDK linker under Wine.
+
+**Tail block detection & merging** — The MSVC compiler sometimes places out-of-line code (loop exits, error paths) after the `.pdata`-reported function end. This fork detects these tail blocks and merges them back into their parent function, fixing false function boundaries that would otherwise break CFA analysis.
+
+**Section merge for split objects** — When a translation unit has multiple fragments of the same section (e.g. `.pdata`), they are now merged into a single section in the output COFF rather than producing duplicate sections that the linker rejects.
+
+**COFF symbol fixes** — `Unknown`+`Global` symbols (such as save/restore sled entry points like `__savegprlr_14`) now emit `IMAGE_SYM_CLASS_EXTERNAL` instead of `IMAGE_SYM_CLASS_LABEL`, and jump table symbols are emitted with `Global` scope so the linker can resolve cross-object references.
+
+**Jump table analysis improvements** — Support for absolute jump tables in `.rdata` sections, fixes for jump table bounds inflation when the VM over-estimates table size, and crash fixes for edge cases in the jump table VM.
+
+**Upstream sync** — Includes all upstream decomp-toolkit changes through v1.8.0 (DWARF dump improvements, `skip_cfa_ranges` config option, relocation fixes, and more).
+
+---
+
+Forked from and inspired by [encounter's GC/Wii decomp toolkit](https://github.com/encounter/decomp-toolkit), jeff is
 a decomp-toolkit meant for disassembling Xbox 360 executables (xexes). It aims to assist potential Xbox 360 decompilation projects with
 the same benefits that encounter's toolkit provides, including function boundary analysis, relocation restorations, splits, and integration
 with other decompilation tools like [objdiff](https://github.com/encounter/objdiff) and
 [decomp.me](https://decomp.me).
 
+https://youtu.be/0OzXZGA1k3s
+
 Much like the original GC/Wii decomp toolkit, jeff aims to automate as much of the decompilation setup process as possible,
 allowing developers to spend less time configuring a project and more time focusing on what matters most in a decomp: matching code.
 
-I had made jeff with the goal of starting up a [decomp for Dance Central 3](https://github.com/rjkiv/dc3-decomp),
-but realized the potential jeff has to work with several other Xbox 360 games, and thus, tried to add support for that to the best of my ability.
+Jeff was originally created by [rjkiv](https://github.com/rjkiv) with the goal of starting up a [decomp for Dance Central 3](https://github.com/rjkiv/dc3-decomp),
+but has the potential to work with several other Xbox 360 games.
 
-**DISCLAIMER**: Although I genuinely tried my best to get jeff working with the pool of xexes I had to test with,
-**I make absolutely zero guarantees that this will work out of the box with every last Xbox 360 game! Expect bugs!**
+**DISCLAIMER**: Although we genuinely tried our best to get jeff working with the pool of xexes we had to test with,
+**we make absolutely zero guarantees that this will work out of the box with every last Xbox 360 game! Expect bugs!**
 
-If you spot a bug or crash, please submit an issue, and I will try my best to help you through it.
+If you spot a bug or crash, please submit an issue, and we will try our best to help you through it.
 
 For use in a new decompilation project, see [jeff-template](https://github.com/rjkiv/jeff-template), which provides a
 project structure and build system that uses jeff under the hood.
