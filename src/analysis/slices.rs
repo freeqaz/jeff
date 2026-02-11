@@ -103,8 +103,8 @@ fn check_prologue_sequence(
     }
     #[inline(always)]
     fn is_stwu(ins: Ins) -> bool {
-        // stwu r1, d(r1)
-        ins.op == Opcode::Stwu && ins.field_rs() == 1 && ins.field_ra() == 1
+        // stwu[x] r1, d(r1)
+        matches!(ins.op, Opcode::Stwu | Opcode::Stwux) && ins.field_rs() == 1 && ins.field_ra() == 1
     }
     #[inline(always)]
     fn is_stw(ins: Ins) -> bool {
@@ -225,7 +225,11 @@ impl FunctionSlices {
             ins.op == Opcode::Or && ins.field_rd() == 1
         }
 
-        if check_sequence(section, addr, Some(ins), &[(&is_mtlr, &is_addi), (&is_or, &is_mtlr)])? {
+        if check_sequence(section, addr, Some(ins), &[
+            (&is_mtlr, &is_addi),
+            (&is_mtlr, &is_or),
+            (&is_or, &is_mtlr),
+        ])? {
             if let Some(epilogue) = self.epilogue {
                 if epilogue != addr {
                     bail!("Found duplicate epilogue: {:#010X} and {:#010X}", epilogue, addr)
@@ -370,25 +374,15 @@ impl FunctionSlices {
                     jump_table_address: RelocationTarget::Address(address),
                     size,
                 } => {
-                    let next_addr_size = match jt {
-                        JumpTableType::Absolute => match size {
-                            Some(num) => num.get(),
-                            None => 0,
-                        },
-                        _ => 0,
-                    };
-
-                    // End of block
-                    let next_address = ins_addr + 4 + next_addr_size;
-                    self.blocks.insert(block_start, Some(next_address));
-
                     log::debug!(
                         "Fetching {} jump table entries @ {} with size {:?}",
                         if jt == JumpTableType::Absolute { "absolute" } else { "relative" },
                         address,
                         size
                     );
-                    let (entries, size) = uniq_jump_table_entries(
+
+                    // Get actual entries and size FIRST, before calculating block end
+                    let (entries, actual_size) = uniq_jump_table_entries(
                         obj,
                         address,
                         jt,
@@ -397,30 +391,32 @@ impl FunctionSlices {
                         function_start,
                         function_end.or_else(|| self.end()),
                     )?;
-                    log::debug!("-> size {}: {:?}", size, entries);
+                    log::debug!("-> actual size {}: {:?}", actual_size, entries);
 
-                    // if this function has a known end, check that every jump table entry is within function bounds
-                    let within_func_bounds = match function_end {
-                        Some(end) => {
-                            !entries.iter().any(|&addr| addr < function_start || addr >= end)
-                        }
-                        None => false,
-                    };
+                    // Only inline jump tables (immediately after bctr) extend block end.
+                    // External jump tables in data sections should not affect block end.
+                    let is_inline = jt == JumpTableType::Absolute
+                        && address.address == ins_addr.address + 4;
+                    let next_addr_size = if is_inline { actual_size } else { 0 };
 
-                    // this if statements is true if:
-                    // the next_address is in our jump table entries OR next_address marks the start of one our established blocks
-                    // OR we're within known func bounds
-                    // AND
-                    // none of our jump table entries are known function starts
-                    if (entries.contains(&next_address)
-                        || self.blocks.contains_key(&next_address)
-                        || within_func_bounds)
+                    // End of block - now uses actual size for inline tables
+                    let next_address = ins_addr + 4 + next_addr_size;
+                    self.blocks.insert(block_start, Some(next_address));
+
+                    let max_block = self
+                        .blocks
+                        .keys()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(next_address)
+                        .max(next_address);
+                    if entries.iter().any(|&addr| addr > function_start && addr <= max_block)
                         && !entries.iter().any(|&addr| {
                             self.is_known_function(known_functions, addr)
                                 .is_some_and(|fn_addr| fn_addr != function_start)
                         })
                     {
-                        self.jump_table_references.insert(address, size);
+                        self.jump_table_references.insert(address, actual_size);
                         let mut branches = vec![];
                         for addr in entries {
                             branches.push(addr);
@@ -800,7 +796,7 @@ impl FunctionSlices {
                 }
             }
             // If we discovered a function prologue, known tail call.
-            if slices.prologue.is_some() {
+            if slices.prologue.is_some() || slices.has_r1_load {
                 log::trace!("Prologue discovered; known tail call: {:#010X}", addr);
                 return TailCallResult::Is;
             }

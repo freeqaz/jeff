@@ -234,6 +234,9 @@ pub struct ProjectConfig {
     /// Marks all emitted symbols as "exported" to prevent the linker from removing them.
     #[serde(default = "bool_true", skip_serializing_if = "is_true")]
     pub export_all: bool,
+    /// Promotes local symbols referenced by other units to global.
+    #[serde(default = "bool_true", skip_serializing_if = "is_true")]
+    pub globalize_symbols: bool,
     /// Optional base path for all object files.
     #[serde(with = "unix_path_serde_option", default, skip_serializing_if = "is_default")]
     pub object_base: Option<Utf8UnixPathBuf>,
@@ -259,6 +262,7 @@ impl Default for ProjectConfig {
             symbols_known: false,
             fill_gaps: true,
             export_all: true,
+            globalize_symbols: true,
             object_base: None,
             extract_objects: true,
         }
@@ -299,6 +303,8 @@ pub struct ModuleConfig {
     /// Process exception tables and zero out uninitialized data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clean_extab: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_cfa_ranges: Vec<SkipCfaRangeConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -315,6 +321,10 @@ pub struct ExtractConfig {
     /// Path is relative to `out_dir/include`.
     #[serde(with = "unix_path_serde_option", default, skip_serializing_if = "Option::is_none")]
     pub header: Option<Utf8UnixPathBuf>,
+    /// If specified, any relocations within the symbol will be written to the given file in JSON
+    /// format. Path is relative to `out_dir/bin`.
+    #[serde(with = "unix_path_serde_option", default, skip_serializing_if = "Option::is_none")]
+    pub relocations: Option<Utf8UnixPathBuf>,
     /// The type for the extracted symbol in the header file. By default, the header will emit
     /// a full symbol declaration (a.k.a. `symbol`), but this can be set to `raw` to emit the raw
     /// data as a byte array. `none` avoids emitting a header entirely, in which case the `header`
@@ -361,6 +371,16 @@ pub struct AddRelocationConfig {
     pub addend: i64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SkipCfaRangeConfig {
+    /// The start address of the range to skip.
+    /// Format: `section:address`, e.g. `.text:0x80001234`.
+    pub start: SectionAddressRef,
+    /// The end address of the range to skip.
+    /// Format: `section:address`, e.g. `.text:0x80001234`.
+    pub end: SectionAddressRef,
+}
+
 impl ModuleConfig {
     pub fn file_name(&self) -> &str { self.object.file_name().unwrap_or(self.object.as_str()) }
 
@@ -370,6 +390,19 @@ impl ModuleConfig {
     }
 
     pub fn name(&self) -> &str { self.name.as_deref().unwrap_or_else(|| self.file_prefix()) }
+
+    pub fn skip_cfa_ranges(
+        &self,
+        obj: &ObjInfo,
+    ) -> Result<BTreeMap<SectionAddress, SectionAddress>> {
+        let mut skip_cfa_ranges = BTreeMap::new();
+        for range in &self.skip_cfa_ranges {
+            let start = range.start.resolve(obj)?;
+            let end = range.end.resolve(obj)?;
+            skip_cfa_ranges.insert(start, end);
+        }
+        Ok(skip_cfa_ranges)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -401,9 +434,22 @@ pub struct OutputExtract {
     pub binary: Option<Utf8UnixPathBuf>,
     #[serde(with = "unix_path_serde_option")]
     pub header: Option<Utf8UnixPathBuf>,
+    #[serde(with = "unix_path_serde_option")]
+    pub relocations: Option<Utf8UnixPathBuf>,
     pub header_type: String,
     pub custom_type: Option<String>,
     pub custom_data: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ExtractRelocInfo {
+    offset: u32,
+    #[serde(rename = "type")]
+    kind: ObjRelocKind,
+    target: String,
+    addend: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    module: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -540,7 +586,9 @@ pub fn info(args: InfoArgs) -> Result<()> {
         apply_selfile(&mut obj, file.map()?)?;
     }
 
-    println!("{}:", obj.name);
+    if !obj.name.is_empty() {
+        println!("{}:", obj.name);
+    }
     if let Some(entry) = obj.entry {
         println!("Entry point: {entry:#010X}");
     }
@@ -608,17 +656,17 @@ fn update_symbols(
         .filter(|(_, r)| r.module_id == obj.module_id)
     {
         if source_module_id == obj.module_id {
-            // Skip if already resolved
-            let (_, source_section) =
-                obj.sections.get_elf_index(rel_reloc.section as SectionIndex).ok_or_else(|| {
-                    anyhow!(
-                        "Failed to locate REL section {} in module ID {}: source module {}, {:?}",
-                        rel_reloc.section,
-                        obj.module_id,
-                        source_module_id,
-                        rel_reloc
-                    )
-                })?;
+            let Some((_, source_section)) =
+                obj.sections.get_elf_index(rel_reloc.section as SectionIndex)
+            else {
+                log::warn!(
+                    "Missing relocation module {}, section {}; skipping",
+                    obj.module_id,
+                    rel_reloc.section
+                );
+                continue;
+            };
+
             if source_section.relocations.contains(rel_reloc.address) {
                 continue;
             }
@@ -689,15 +737,16 @@ fn create_relocations(
     // Resolve all relocations in this module
     for rel_reloc in take(&mut obj.unresolved_relocations) {
         // Skip if already resolved
-        let (_, source_section) =
-            obj.sections.get_elf_index(rel_reloc.section as SectionIndex).ok_or_else(|| {
-                anyhow!(
-                    "Failed to locate REL section {} in module ID {}: {:?}",
-                    rel_reloc.section,
-                    obj.module_id,
-                    rel_reloc
-                )
-            })?;
+        let Some((_, source_section)) =
+            obj.sections.get_elf_index(rel_reloc.section as SectionIndex)
+        else {
+            log::warn!(
+                "Missing relocation module {}, section {}; skipping",
+                obj.module_id,
+                rel_reloc.section
+            );
+            continue;
+        };
         if source_section.relocations.contains(rel_reloc.address) {
             continue;
         }
@@ -754,8 +803,16 @@ fn create_relocations(
                 Some(rel_reloc.module_id)
             },
         };
-        let (_, source_section) =
-            obj.sections.get_elf_index_mut(rel_reloc.section as SectionIndex).unwrap();
+        let Some((_, source_section)) =
+            obj.sections.get_elf_index_mut(rel_reloc.section as SectionIndex)
+        else {
+            log::warn!(
+                "Missing relocation module {}, section {}; skipping",
+                obj.module_id,
+                rel_reloc.section
+            );
+            continue;
+        };
         source_section.relocations.insert(rel_reloc.address, reloc)?;
     }
 
@@ -886,7 +943,9 @@ fn load_analyze_dol(config: &ProjectConfig, object_base: &ObjectBase) -> Result<
         apply_signatures(&mut obj)?;
 
         if !config.quick_analysis {
-            let mut state = AnalyzerState::default();
+            let skip_ranges =
+                config.base.skip_cfa_ranges(&obj).context("Resolving skip CFA ranges")?;
+            let mut state = AnalyzerState::new(skip_ranges);
             debug!("Detecting function boundaries");
             FindSaveRestSleds::execute(&mut state, &obj)?;
             state.detect_functions(&obj)?;
@@ -967,7 +1026,7 @@ fn split_write_obj(
 
     debug!("Splitting {} objects", module.obj.link_order.len());
     let module_name = module.config.name().to_string();
-    let split_objs = split_obj(&module.obj, Some(module_name.as_str()))?;
+    let split_objs = split_obj(&module.obj, Some(module_name.as_str()), config.globalize_symbols)?;
 
     debug!("Writing object files");
     DirBuilder::new()
@@ -1059,12 +1118,35 @@ fn split_write_obj(
             }
         }
 
+        if let Some(relocations) = &extract.relocations {
+            let start = symbol.address as u32 - section.address as u32;
+            let end = start + symbol.size as u32;
+            let mut reloc_entries = Vec::new();
+            for (addr, reloc) in section.relocations.range(start..end) {
+                let target_symbol = &module.obj.symbols[reloc.target_symbol];
+                reloc_entries.push(ExtractRelocInfo {
+                    offset: addr - start,
+                    kind: reloc.kind,
+                    target: target_symbol.name.clone(),
+                    addend: reloc.addend,
+                    module: reloc.module,
+                });
+            }
+            let relocations_json = serde_json::to_vec_pretty(&reloc_entries)?;
+            let out_path = base_dir.join("bin").join(relocations.with_encoding());
+            if let Some(parent) = out_path.parent() {
+                DirBuilder::new().recursive(true).create(parent)?;
+            }
+            write_if_changed(&out_path, &relocations_json)?;
+        }
+
         // Copy to output config
         out_config.extract.push(OutputExtract {
             symbol: symbol.name.clone(),
             rename: extract.rename.clone(),
             binary: extract.binary.clone(),
             header: extract.header.clone(),
+            relocations: extract.relocations.clone(),
             header_type: header_kind.to_string(),
             custom_type: extract.custom_type.clone(),
             custom_data: extract.custom_data.clone(),
@@ -1163,7 +1245,9 @@ fn load_analyze_rel(
     if !config.symbols_known {
         debug!("Analyzing module {}", module_obj.module_id);
         if !config.quick_analysis {
-            let mut state = AnalyzerState::default();
+            let skip_ranges =
+                module_config.skip_cfa_ranges(&module_obj).context("Resolving skip CFA ranges")?;
+            let mut state = AnalyzerState::new(skip_ranges);
             FindSaveRestSleds::execute(&mut state, &module_obj)?;
             state.detect_functions(&module_obj)?;
             FindRelCtorsDtors::execute(&mut state, &module_obj)?;

@@ -1226,6 +1226,9 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                 ObjSymbolKind::Object => SymbolKind::Data,
                 ObjSymbolKind::Section => SymbolKind::Section,
                 ObjSymbolKind::Unknown => match sym.section {
+                    // SymbolKind::Label forces IMAGE_SYM_CLASS_LABEL in COFF regardless
+                    // of scope, so use Text for global symbols to get EXTERNAL storage class
+                    Some(_) if sym.flags.0.contains(ObjSymbolFlags::Global) => SymbolKind::Text,
                     Some(_) => SymbolKind::Label,
                     None => SymbolKind::Unknown,
                 },
@@ -1290,6 +1293,149 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
 
 pub fn coff_path_for_unit(unit: &str) -> Utf8NativePathBuf {
     Utf8UnixPath::new(unit).with_encoding().with_extension("obj")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::obj::{
+        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjRelocations, ObjSection,
+        ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
+    };
+
+    /// Build a minimal relocatable ObjInfo with one .text section and one symbol.
+    fn make_relocatable_obj(sym_kind: ObjSymbolKind, sym_flags: ObjSymbolFlagSet) -> ObjInfo {
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0,
+            size: 4,
+            data: vec![0x60, 0x00, 0x00, 0x00], // nop
+            align: 4,
+            elf_index: 0,
+            relocations: ObjRelocations::default(),
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+        let symbol = ObjSymbol {
+            name: "test_sym".into(),
+            address: 0,
+            section: Some(0),
+            size: 4,
+            size_known: true,
+            flags: sym_flags,
+            kind: sym_kind,
+            ..Default::default()
+        };
+        let mut obj = ObjInfo::new(
+            ObjKind::Relocatable,
+            ObjArchitecture::PowerPc,
+            "test.obj".into(),
+            vec![],
+            vec![section],
+        );
+        obj.symbols.add_direct(symbol).unwrap();
+        obj
+    }
+
+    /// Parse COFF symbol table entries, returning (name, storage_class) pairs.
+    fn parse_coff_symbol_classes(coff_data: &[u8]) -> Vec<(String, u8)> {
+        let sym_table_offset =
+            u32::from_le_bytes(coff_data[8..12].try_into().unwrap()) as usize;
+        let num_symbols =
+            u32::from_le_bytes(coff_data[12..16].try_into().unwrap()) as usize;
+        let string_table_start = sym_table_offset + num_symbols * 18;
+
+        let mut symbols = Vec::new();
+        let mut i = 0;
+        while i < num_symbols {
+            let off = sym_table_offset + i * 18;
+            let name_bytes = &coff_data[off..off + 8];
+            let name = if u32::from_le_bytes(name_bytes[0..4].try_into().unwrap()) == 0 {
+                // Long name: offset into string table
+                let str_off =
+                    u32::from_le_bytes(name_bytes[4..8].try_into().unwrap()) as usize;
+                let start = string_table_start + str_off;
+                let end = coff_data[start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| start + p)
+                    .unwrap_or(coff_data.len());
+                String::from_utf8_lossy(&coff_data[start..end]).to_string()
+            } else {
+                // Short name: inline
+                let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
+                String::from_utf8_lossy(&name_bytes[..end]).to_string()
+            };
+            let storage_class = coff_data[off + 16];
+            let num_aux = coff_data[off + 17] as usize;
+            symbols.push((name, storage_class));
+            i += 1 + num_aux;
+        }
+        symbols
+    }
+
+    const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
+    const IMAGE_SYM_CLASS_LABEL: u8 = 6;
+
+    /// Global + Unknown kind → EXTERNAL (the bug fix: previously was LABEL)
+    #[test]
+    fn test_write_coff_global_unknown_symbol_is_external() {
+        let obj = make_relocatable_obj(
+            ObjSymbolKind::Unknown,
+            ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+        );
+        let coff_data = write_coff(&obj).unwrap();
+        let symbols = parse_coff_symbol_classes(&coff_data);
+        let (_, storage_class) = symbols
+            .iter()
+            .find(|(name, _)| name == "test_sym")
+            .expect("Symbol test_sym not found in COFF output");
+        assert_eq!(
+            *storage_class, IMAGE_SYM_CLASS_EXTERNAL,
+            "Global+Unknown should be EXTERNAL (2), got {storage_class}"
+        );
+    }
+
+    /// Local + Unknown kind → LABEL (this was the original behavior, still correct)
+    #[test]
+    fn test_write_coff_local_unknown_symbol_is_label() {
+        let obj = make_relocatable_obj(
+            ObjSymbolKind::Unknown,
+            ObjSymbolFlagSet(ObjSymbolFlags::Local.into()),
+        );
+        let coff_data = write_coff(&obj).unwrap();
+        let symbols = parse_coff_symbol_classes(&coff_data);
+        let (_, storage_class) = symbols
+            .iter()
+            .find(|(name, _)| name == "test_sym")
+            .expect("Symbol test_sym not found in COFF output");
+        assert_eq!(
+            *storage_class, IMAGE_SYM_CLASS_LABEL,
+            "Local+Unknown should be LABEL (6), got {storage_class}"
+        );
+    }
+
+    /// Global + Function kind → EXTERNAL
+    #[test]
+    fn test_write_coff_function_symbol_is_external() {
+        let obj = make_relocatable_obj(
+            ObjSymbolKind::Function,
+            ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+        );
+        let coff_data = write_coff(&obj).unwrap();
+        let symbols = parse_coff_symbol_classes(&coff_data);
+        let (_, storage_class) = symbols
+            .iter()
+            .find(|(name, _)| name == "test_sym")
+            .expect("Symbol test_sym not found in COFF output");
+        assert_eq!(
+            *storage_class, IMAGE_SYM_CLASS_EXTERNAL,
+            "Global+Function should be EXTERNAL (2), got {storage_class}"
+        );
+    }
 }
 
 // debug only, lists section bounds
