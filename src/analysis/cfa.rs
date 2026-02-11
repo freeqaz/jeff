@@ -260,11 +260,11 @@ impl AnalyzerState {
                     section: Some(addr.section),
                     size: size as u64,
                     size_known: true,
-                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Local.into()),
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
                     kind: ObjSymbolKind::Object,
                     ..Default::default()
                 },
-                false,
+                true,
             )?;
         }
         for (&_addr, symbols) in &self.known_symbols {
@@ -1342,6 +1342,59 @@ mod tests {
             &section, gap_start, gap_end, func_start, func_end,
         );
         assert_eq!(result, None);
+    }
+
+    /// Jump table symbols created by apply() should have Global scope.
+    /// This ensures the linker can resolve cross-object jumptable references.
+    #[test]
+    fn test_jump_table_symbols_are_global() {
+        use crate::obj::{
+            ObjArchitecture, ObjInfo, ObjKind, ObjSectionKind, ObjSymbolScope,
+        };
+
+        // Create a minimal ObjInfo with a .rodata section covering the jump table
+        let section = ObjSection {
+            name: ".rodata".into(),
+            kind: ObjSectionKind::ReadOnlyData,
+            address: 0x8000_0000,
+            size: 0x100,
+            data: vec![0u8; 0x100],
+            align: 8,
+            ..Default::default()
+        };
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test".into(),
+            vec![],
+            vec![section],
+        );
+
+        // Create analyzer state with a jump table entry
+        let mut state = AnalyzerState::default();
+        let jt_addr = SectionAddress::new(0, 0x8000_0040);
+        state.jump_tables.insert(jt_addr, 0x20); // 32 bytes
+
+        // Apply the state to the object
+        state.apply(&mut obj).unwrap();
+
+        // Find the jumptable symbol
+        let jt_sym = obj
+            .symbols
+            .iter()
+            .find(|(_, s)| s.name.starts_with("jumptable_"))
+            .map(|(_, s)| s)
+            .expect("jumptable symbol not found after apply()");
+
+        assert_eq!(
+            jt_sym.flags.scope(),
+            ObjSymbolScope::Global,
+            "Jump table symbol should have Global scope, got {:?}",
+            jt_sym.flags.scope()
+        );
+        assert_eq!(jt_sym.kind, ObjSymbolKind::Object);
+        assert_eq!(jt_sym.size, 0x20);
+        assert_eq!(jt_sym.address, 0x8000_0040);
     }
 
     /// Case 1 variant: First instruction branches back, blr found before gap_end.

@@ -1187,12 +1187,29 @@ pub fn split_obj(
             //     current_address
             // );
 
+            // Determine section name and check for existing section to merge
+            let section_name = split.rename.as_ref().unwrap_or(&section.name).clone();
+            let (out_section_idx, merge_offset) =
+                match split_obj.sections.by_name(&section_name)? {
+                    Some((idx, existing_sec)) => {
+                        let raw_offset = existing_sec.size;
+                        // Align merge offset if the new fragment requires stricter alignment
+                        let padded = if align > 1 {
+                            (raw_offset + align - 1) & !(align - 1)
+                        } else {
+                            raw_offset
+                        };
+                        (idx, padded)
+                    }
+                    None => (split_obj.sections.next_section_index(), 0),
+                };
+
             // Collect relocations; target_symbol will be updated later
             let out_relocations = section
                 .relocations
                 .range(current_address.address..split_end.address)
                 .map(|(addr, o)| {
-                    (addr - current_address.address, ObjReloc {
+                    (addr - current_address.address + merge_offset as u32, ObjReloc {
                         kind: o.kind,
                         target_symbol: o.target_symbol,
                         addend: o.addend,
@@ -1202,7 +1219,6 @@ pub fn split_obj(
                 .collect_vec();
 
             // Add section symbols
-            let out_section_idx = split_obj.sections.next_section_index();
             for (symbol_idx, symbol) in obj
                 .symbols
                 .for_section_range(section_index, current_address.address..=split_end.address)
@@ -1229,7 +1245,7 @@ pub fn split_obj(
                     address: if split.common {
                         symbol.align.unwrap_or(4) as u64
                     } else {
-                        symbol.address - current_address.address as u64
+                        symbol.address - current_address.address as u64 + merge_offset
                     },
                     section: if split.common { None } else { Some(out_section_idx) },
                     size: symbol.size,
@@ -1261,21 +1277,42 @@ pub fn split_obj(
                         ..(split_end.address as u64 - section.address) as usize]
                         .to_vec(),
                 };
-                split_obj.sections.push(ObjSection {
-                    name: split.rename.as_ref().unwrap_or(&section.name).clone(),
-                    kind: section.kind,
-                    address: 0,
-                    size: split_end.address as u64 - current_address.address as u64,
-                    data,
-                    align,
-                    elf_index: out_section_idx + 1,
-                    relocations: ObjRelocations::new(out_relocations)?,
-                    virtual_address: Some(current_address.address as u64),
-                    file_offset: section.file_offset
-                        + (current_address.address as u64 - section.address),
-                    section_known: true,
-                    splits: Default::default(),
-                });
+                let fragment_size =
+                    split_end.address as u64 - current_address.address as u64;
+                if merge_offset > 0 {
+                    // Merge into existing section
+                    let existing = &mut split_obj.sections[out_section_idx];
+                    // Add alignment padding if needed
+                    let padding = merge_offset - existing.size;
+                    if padding > 0 {
+                        existing
+                            .data
+                            .extend(std::iter::repeat(0u8).take(padding as usize));
+                        existing.size += padding;
+                    }
+                    existing.data.extend_from_slice(&data);
+                    existing.size += fragment_size;
+                    existing.align = existing.align.max(align);
+                    for (addr, reloc) in out_relocations {
+                        existing.relocations.insert(addr, reloc)?;
+                    }
+                } else {
+                    split_obj.sections.push(ObjSection {
+                        name: section_name,
+                        kind: section.kind,
+                        address: 0,
+                        size: fragment_size,
+                        data,
+                        align,
+                        elf_index: out_section_idx + 1,
+                        relocations: ObjRelocations::new(out_relocations)?,
+                        virtual_address: Some(current_address.address as u64),
+                        file_offset: section.file_offset
+                            + (current_address.address as u64 - section.address),
+                        section_known: true,
+                        splits: Default::default(),
+                    });
+                }
             }
 
             current_address = next_addr;
@@ -1409,6 +1446,478 @@ pub fn default_section_align(section: &ObjSection) -> u64 {
             ".sbss" => 8, // ?
             _ => 8,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a section with the given name, kind, address, and data.
+    fn make_section(
+        name: &str,
+        kind: ObjSectionKind,
+        address: u64,
+        data: Vec<u8>,
+    ) -> ObjSection {
+        let size = data.len() as u64;
+        ObjSection {
+            name: name.to_string(),
+            kind,
+            address,
+            size,
+            data,
+            align: 8,
+            elf_index: 0,
+            relocations: ObjRelocations::default(),
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        }
+    }
+
+    /// Helper: create an executable ObjInfo from sections, with symbols and
+    /// link_order set up for the given unit structure.
+    fn make_executable(sections: Vec<ObjSection>) -> ObjInfo {
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test".to_string(),
+            vec![],
+            sections,
+        )
+    }
+
+    /// Two .pdata splits for the same unit should merge into one section.
+    #[test]
+    fn test_split_obj_merges_duplicate_sections() {
+        // Section 0: .text at 0x1000, 0x100 bytes
+        let text_data = vec![0x60u8; 0x100]; // NOP fill
+        let mut text_sec = make_section(".text", ObjSectionKind::Code, 0x1000, text_data);
+
+        // Section 1: .pdata at 0x2000, 0x20 bytes (two 16-byte fragments)
+        let mut pdata_data = vec![0xAA; 0x10];
+        pdata_data.extend_from_slice(&[0xBB; 0x10]);
+        let mut pdata_sec =
+            make_section(".pdata", ObjSectionKind::ReadOnlyData, 0x2000, pdata_data);
+
+        // Add splits
+        text_sec.splits.push(0x1000, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x1100,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        pdata_sec.splits.push(0x2000, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x2010,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        pdata_sec.splits.push(0x2010, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x2020,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+
+        let mut obj = make_executable(vec![text_sec, pdata_sec]);
+
+        // Add symbols
+        // 0: text function
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "text_func".into(),
+                address: 0x1000,
+                section: Some(0),
+                size: 0x100,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        // 1: pdata entry in first fragment
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "pdata_sym1".into(),
+                address: 0x2000,
+                section: Some(1),
+                size: 0x10,
+                size_known: true,
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            })
+            .unwrap();
+        // 2: pdata entry in second fragment
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "pdata_sym2".into(),
+                address: 0x2010,
+                section: Some(1),
+                size: 0x10,
+                size_known: true,
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Add relocations in .pdata pointing to text_func
+        obj.sections[1].relocations = ObjRelocations::new(vec![
+            (0x2000, ObjReloc {
+                kind: ObjRelocKind::Absolute,
+                target_symbol: 0, // text_func
+                addend: 0,
+                module: None,
+            }),
+            (0x2010, ObjReloc {
+                kind: ObjRelocKind::Absolute,
+                target_symbol: 0, // text_func
+                addend: 0,
+                module: None,
+            }),
+        ])
+        .unwrap();
+
+        // Set up link order
+        obj.link_order.push(ObjUnit {
+            name: "TestUnit".into(),
+            autogenerated: false,
+            comment_version: None,
+            order: None,
+        });
+
+        // Run split
+        let result = split_obj(&obj, None, false).unwrap();
+
+        // Should produce exactly one output object
+        assert_eq!(result.len(), 1, "Expected 1 output object");
+        let out = &result[0];
+
+        // Count .pdata sections — should be exactly one (merged)
+        let pdata_sections: Vec<_> = out
+            .sections
+            .iter()
+            .filter(|(_, s)| s.name == ".pdata")
+            .collect();
+        assert_eq!(
+            pdata_sections.len(),
+            1,
+            "Expected exactly 1 .pdata section after merge, got {}",
+            pdata_sections.len()
+        );
+
+        let (_, merged_pdata) = &pdata_sections[0];
+
+        // Merged size should be 0x20 (both 0x10-byte fragments)
+        assert_eq!(merged_pdata.size, 0x20, "Merged .pdata size should be 0x20");
+
+        // Merged data should be [0xAA * 16] ++ [0xBB * 16]
+        assert_eq!(merged_pdata.data.len(), 0x20);
+        assert!(
+            merged_pdata.data[..0x10].iter().all(|&b| b == 0xAA),
+            "First fragment data should be 0xAA"
+        );
+        assert!(
+            merged_pdata.data[0x10..0x20].iter().all(|&b| b == 0xBB),
+            "Second fragment data should be 0xBB"
+        );
+
+        // Second fragment's symbol should be at offset 0x10
+        let sym2 = out
+            .symbols
+            .iter()
+            .find(|(_, s)| s.name == "pdata_sym2")
+            .map(|(_, s)| s)
+            .expect("pdata_sym2 not found");
+        assert_eq!(sym2.address, 0x10, "Second pdata symbol address should be 0x10");
+
+        // Both relocations should be present
+        let relocs: Vec<_> = merged_pdata.relocations.iter().collect();
+        assert_eq!(relocs.len(), 2, "Merged section should have 2 relocations");
+        // First relocation at offset 0
+        assert_eq!(relocs[0].0, 0);
+        // Second relocation at offset 0x10
+        assert_eq!(relocs[1].0, 0x10);
+    }
+
+    /// Two .pdata splits for *different* units should NOT be merged — each
+    /// output object gets its own .pdata section.
+    #[test]
+    fn test_split_obj_no_false_merge_across_units() {
+        let text_data = vec![0x60u8; 0x100];
+        let mut text_sec = make_section(".text", ObjSectionKind::Code, 0x1000, text_data);
+
+        let mut pdata_data = vec![0xAA; 0x10];
+        pdata_data.extend_from_slice(&[0xBB; 0x10]);
+        let mut pdata_sec =
+            make_section(".pdata", ObjSectionKind::ReadOnlyData, 0x2000, pdata_data);
+
+        // .text has two splits for different units
+        text_sec.splits.push(0x1000, ObjSplit {
+            unit: "UnitA".into(),
+            end: 0x1080,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        text_sec.splits.push(0x1080, ObjSplit {
+            unit: "UnitB".into(),
+            end: 0x1100,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+
+        // .pdata splits for different units
+        pdata_sec.splits.push(0x2000, ObjSplit {
+            unit: "UnitA".into(),
+            end: 0x2010,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        pdata_sec.splits.push(0x2010, ObjSplit {
+            unit: "UnitB".into(),
+            end: 0x2020,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+
+        let mut obj = make_executable(vec![text_sec, pdata_sec]);
+
+        // Symbols
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "func_a".into(),
+                address: 0x1000,
+                section: Some(0),
+                size: 0x80,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "func_b".into(),
+                address: 0x1080,
+                section: Some(0),
+                size: 0x80,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "pdata_a".into(),
+                address: 0x2000,
+                section: Some(1),
+                size: 0x10,
+                size_known: true,
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "pdata_b".into(),
+                address: 0x2010,
+                section: Some(1),
+                size: 0x10,
+                size_known: true,
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            })
+            .unwrap();
+
+        obj.link_order.push(ObjUnit {
+            name: "UnitA".into(),
+            autogenerated: false,
+            comment_version: None,
+            order: None,
+        });
+        obj.link_order.push(ObjUnit {
+            name: "UnitB".into(),
+            autogenerated: false,
+            comment_version: None,
+            order: None,
+        });
+
+        let result = split_obj(&obj, None, false).unwrap();
+
+        assert_eq!(result.len(), 2, "Expected 2 output objects");
+
+        // Each output object should have exactly one .pdata section (not merged)
+        for out in &result {
+            let pdata_count = out.sections.iter().filter(|(_, s)| s.name == ".pdata").count();
+            assert_eq!(
+                pdata_count, 1,
+                "Object '{}' should have exactly 1 .pdata section, got {}",
+                out.name, pdata_count
+            );
+        }
+    }
+
+    /// When fragments need alignment padding, the merge should include padding.
+    /// First fragment is 0x0A bytes; second fragment starts at 0x2010 (8-byte
+    /// aligned in the source) with `align: Some(8)`. The gap between 0x200A and
+    /// 0x2010 is zero-filled. The merged output should pad the first fragment
+    /// to 0x10 bytes before appending the second fragment.
+    #[test]
+    fn test_split_obj_merge_with_alignment_padding() {
+        // .text at 0x1000, 0x100 bytes
+        let text_data = vec![0x60u8; 0x100];
+        let mut text_sec = make_section(".text", ObjSectionKind::Code, 0x1000, text_data);
+
+        // .pdata at 0x2000: first fragment 0x0A bytes, 6 bytes zero gap,
+        // second fragment 0x10 bytes. Total raw = 0x20 bytes.
+        let mut pdata_data = vec![0xAA; 0x0A];
+        pdata_data.extend_from_slice(&[0x00; 0x06]); // zero gap
+        pdata_data.extend_from_slice(&[0xBB; 0x10]);
+        let mut pdata_sec =
+            make_section(".pdata", ObjSectionKind::ReadOnlyData, 0x2000, pdata_data);
+
+        text_sec.splits.push(0x1000, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x1100,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+
+        // First pdata fragment: 0x2000..0x200A (10 bytes)
+        pdata_sec.splits.push(0x2000, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x200A,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        // Second pdata fragment: 0x2010..0x2020 (16 bytes, 8-byte aligned src)
+        pdata_sec.splits.push(0x2010, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x2020,
+            align: Some(8), // requires 8-byte alignment
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+
+        let mut obj = make_executable(vec![text_sec, pdata_sec]);
+
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "text_func".into(),
+                address: 0x1000,
+                section: Some(0),
+                size: 0x100,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "pdata_1".into(),
+                address: 0x2000,
+                section: Some(1),
+                size: 0x0A,
+                size_known: true,
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "pdata_2".into(),
+                address: 0x2010,
+                section: Some(1),
+                size: 0x10,
+                size_known: true,
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            })
+            .unwrap();
+
+        obj.link_order.push(ObjUnit {
+            name: "TestUnit".into(),
+            autogenerated: false,
+            comment_version: None,
+            order: None,
+        });
+
+        let result = split_obj(&obj, None, false).unwrap();
+        assert_eq!(result.len(), 1);
+        let out = &result[0];
+
+        let pdata_sections: Vec<_> = out
+            .sections
+            .iter()
+            .filter(|(_, s)| s.name == ".pdata")
+            .collect();
+        assert_eq!(pdata_sections.len(), 1, "Should have exactly 1 merged .pdata");
+
+        let (_, merged) = &pdata_sections[0];
+
+        // First fragment: 0x0A bytes. Align 8 → merge_offset = 0x10.
+        // Padding = 6 bytes. Second fragment: 0x10 bytes.
+        // Merged size = 0x0A + 6 + 0x10 = 0x20.
+        assert_eq!(
+            merged.size, 0x20,
+            "Merged section size should include alignment padding (0x20), got {:#X}",
+            merged.size
+        );
+
+        // Data layout: 0xAA * 10 bytes + 0x00 * 6 bytes (padding) + 0xBB * 16 bytes
+        assert!(
+            merged.data[..0x0A].iter().all(|&b| b == 0xAA),
+            "First fragment data"
+        );
+        assert!(
+            merged.data[0x0A..0x10].iter().all(|&b| b == 0x00),
+            "Alignment padding should be zeros"
+        );
+        assert!(
+            merged.data[0x10..0x20].iter().all(|&b| b == 0xBB),
+            "Second fragment data"
+        );
+
+        // Second symbol should be at offset 0x10 (aligned)
+        let sym2 = out
+            .symbols
+            .iter()
+            .find(|(_, s)| s.name == "pdata_2")
+            .map(|(_, s)| s)
+            .expect("pdata_2 not found");
+        assert_eq!(
+            sym2.address, 0x10,
+            "Second symbol address should be at aligned merge offset 0x10"
+        );
     }
 }
 
