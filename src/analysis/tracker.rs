@@ -577,8 +577,16 @@ impl Tracker {
         section_index: SectionIndex,
         section: &ObjSection,
     ) -> Result<()> {
+        let is_pdata = section.name == ".pdata";
         let mut addr = SectionAddress::new(section_index, section.address as u32);
-        for chunk in section.data.chunks_exact(4) {
+        for (i, chunk) in section.data.chunks_exact(4).enumerate() {
+            // Xbox 360 .pdata entries are 8 bytes: word 0 = function VA,
+            // word 1 = packed metadata (not an address). Skip word 1 to
+            // avoid false relocations to __unwind$ symbols.
+            if is_pdata && i % 2 == 1 {
+                addr += 4;
+                continue;
+            }
             let value = u32::from_be_bytes(chunk.try_into()?);
             if let Some(value) = self.is_valid_address(obj, addr, value) {
                 self.relocations
@@ -930,4 +938,90 @@ fn generate_special_symbol(obj: &mut ObjInfo, addr: u32, name: &str) -> Result<S
         },
         true,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::obj::{ObjArchitecture, ObjKind, ObjSection, ObjSectionKind};
+
+    /// .pdata word 1 (packed metadata) should not generate relocations,
+    /// even when its value falls in a valid code section address range.
+    #[test]
+    fn test_process_data_skips_pdata_metadata() {
+        // .text at 0x80001000, size 0x2000
+        let text_data = vec![0x60u8; 0x2000];
+        let text_sec = ObjSection {
+            name: ".text".to_string(),
+            kind: ObjSectionKind::Code,
+            address: 0x80001000,
+            size: 0x2000,
+            data: text_data,
+            align: 4,
+            elf_index: 0,
+            relocations: Default::default(),
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+
+        // .pdata at 0x80004000, two 8-byte entries
+        // Entry 0: word0 = 0x80001000 (valid .text addr), word1 = 0x80001500 (looks valid but is metadata)
+        // Entry 1: word0 = 0x80001100 (valid .text addr), word1 = 0x80002800 (looks valid but is metadata)
+        let mut pdata_data = vec![0u8; 0x10];
+        pdata_data[0..4].copy_from_slice(&0x80001000u32.to_be_bytes());
+        pdata_data[4..8].copy_from_slice(&0x80001500u32.to_be_bytes()); // metadata, NOT an address
+        pdata_data[8..12].copy_from_slice(&0x80001100u32.to_be_bytes());
+        pdata_data[12..16].copy_from_slice(&0x80002800u32.to_be_bytes()); // metadata, NOT an address
+        let pdata_sec = ObjSection {
+            name: ".pdata".to_string(),
+            kind: ObjSectionKind::ReadOnlyData,
+            address: 0x80004000,
+            size: 0x10,
+            data: pdata_data,
+            align: 4,
+            elf_index: 1,
+            relocations: Default::default(),
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+
+        let obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test".to_string(),
+            vec![],
+            vec![text_sec, pdata_sec],
+        );
+
+        let mut tracker = Tracker::new(&obj);
+        tracker.process_data(&obj, 1, &obj.sections[1]).unwrap();
+
+        // Word 0 offsets (0x80004000, 0x80004008) should have relocations
+        let addr0 = SectionAddress::new(1, 0x80004000);
+        let addr8 = SectionAddress::new(1, 0x80004008);
+        assert!(
+            tracker.relocations.contains_key(&addr0),
+            "Word 0 of entry 0 should have a relocation"
+        );
+        assert!(
+            tracker.relocations.contains_key(&addr8),
+            "Word 0 of entry 1 should have a relocation"
+        );
+
+        // Word 1 offsets (0x80004004, 0x8000400C) should NOT have relocations
+        let addr4 = SectionAddress::new(1, 0x80004004);
+        let addr_c = SectionAddress::new(1, 0x8000400C);
+        assert!(
+            !tracker.relocations.contains_key(&addr4),
+            "Word 1 of entry 0 (metadata) should NOT have a relocation"
+        );
+        assert!(
+            !tracker.relocations.contains_key(&addr_c),
+            "Word 1 of entry 1 (metadata) should NOT have a relocation"
+        );
+    }
 }

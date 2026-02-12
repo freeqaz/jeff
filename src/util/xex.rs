@@ -14,9 +14,9 @@ use object::{
     endian,
     read::pe::PeFile32,
     write::{SectionId, SymbolId},
-    Architecture, BinaryFormat, Endianness, File, Import, Object, ObjectComdat, ObjectKind,
-    ObjectSection, ObjectSegment, ObjectSymbol, Relocation, RelocationFlags, RelocationTarget,
-    SectionKind, Symbol, SymbolFlags, SymbolKind, SymbolScope, SymbolSection,
+    Architecture, BinaryFormat, ComdatKind, Endianness, File, Import, Object, ObjectComdat,
+    ObjectKind, ObjectSection, ObjectSegment, ObjectSymbol, Relocation, RelocationFlags,
+    RelocationTarget, SectionKind, Symbol, SymbolFlags, SymbolKind, SymbolScope, SymbolSection,
 };
 use typed_path::{Utf8NativePathBuf, Utf8UnixPath};
 
@@ -1193,9 +1193,67 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
     let mut sect_map: BTreeMap<SectionIndex, SectionId> = Default::default();
     let mut sym_map: BTreeMap<SymbolIndex, SymbolId> = Default::default();
 
+    // Collect __unwind$ symbol info for COMDAT extraction:
+    // Maps (section_index, offset_in_section) -> (symbol_index, size)
+    let mut unwind_regions: BTreeMap<(ObjSectionIndex, u64), (ObjSymbolIndex, u64)> =
+        Default::default();
+    for (idx, sym) in obj.symbols.iter() {
+        if sym.name.starts_with("__unwind$") && sym.section.is_some() && sym.size > 0 {
+            let section_idx = sym.section.unwrap();
+            if let Some(sect) = obj.sections.get(section_idx) {
+                let offset = sym.address - sect.address;
+                unwind_regions.insert((section_idx, offset), (idx, sym.size));
+            }
+        }
+    }
+
+    // Track COMDAT sections for __unwind$ symbols:
+    // Maps (section_index, offset) -> comdat_section_id
+    let mut unwind_comdat_sections: BTreeMap<(ObjSectionIndex, u64), SectionId> = Default::default();
+
     // insert the sections
     for (idx, sect) in obj.sections.iter() {
-        // println!("Section: {}", sect.name);
+        // Fix ADDR32 relocation sites: replace stale XEX absolute VAs with correct addend.
+        // COFF IMAGE_REL_PPC_ADDR32 is additive (result = symbol_VA + stored_value), so the
+        // stored value must be the addend (usually 0), not the original XEX VA.
+        let mut data = sect.data.clone();
+        if sect.kind != ObjSectionKind::Bss {
+            for (addr, reloc) in sect.relocations.iter() {
+                if reloc.kind == ObjRelocKind::Absolute {
+                    let offset = addr as usize;
+                    if offset + 4 <= data.len() {
+                        let addend = reloc.addend as i32;
+                        data[offset..offset + 4].copy_from_slice(&addend.to_be_bytes());
+                    }
+                }
+            }
+        }
+
+        // Extract __unwind$ regions into individual COMDAT sections
+        let section_unwinds: Vec<_> = unwind_regions
+            .range((idx, 0)..(idx, u64::MAX))
+            .map(|(&(_, offset), &(sym_idx, size))| (offset, size, sym_idx))
+            .collect();
+
+        if !section_unwinds.is_empty() {
+            for (offset, size, _sym_idx) in &section_unwinds {
+                let start = *offset as usize;
+                let end = start + *size as usize;
+                if end <= data.len() {
+                    let comdat_data = &data[start..end];
+                    let comdat_sect_id = cur_coff.add_section(
+                        Vec::new(),
+                        b".text$x".to_vec(),
+                        SectionKind::Text,
+                    );
+                    // Ensure the section has a section symbol (required by COFF COMDAT)
+                    cur_coff.section_symbol(comdat_sect_id);
+                    cur_coff.append_section_data(comdat_sect_id, comdat_data, sect.align.max(4));
+                    unwind_comdat_sections.insert((idx, *offset), comdat_sect_id);
+                }
+            }
+        }
+
         let sect_id =
             cur_coff.add_section(Vec::new(), sect.name.clone().into_bytes(), match sect.kind {
                 ObjSectionKind::Code => SectionKind::Text,
@@ -1204,13 +1262,75 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                 ObjSectionKind::Bss => SectionKind::UninitializedData,
             });
         if sect.kind != ObjSectionKind::Bss {
-            cur_coff.append_section_data(sect_id, &sect.data, sect.align);
+            cur_coff.append_section_data(sect_id, &data, sect.align);
         }
         sect_map.insert(idx, sect_id);
     }
 
     // insert the symbols
+    let mut comdat_pending: Vec<(SectionId, SymbolId)> = Vec::new();
+
     for (idx, sym) in obj.symbols.iter() {
+        // For __unwind$ symbols with COMDAT sections: create a LOCAL symbol in .text
+        // (for .pdata/.rdata intra-object refs) AND a GLOBAL symbol in .text$x COMDAT
+        // (for cross-object dedup). The local symbol is mapped for relocation targets
+        // within this object; the global COMDAT symbol handles external references.
+        let is_unwind_comdat = sym.name.starts_with("__unwind$")
+            && sym.section.is_some()
+            && sym.size > 0;
+        let comdat_info = if is_unwind_comdat {
+            let section_idx = sym.section.unwrap();
+            let offset = if let Some(sect) = obj.sections.get(section_idx) {
+                sym.address - sect.address
+            } else {
+                0
+            };
+            unwind_comdat_sections.get(&(section_idx, offset)).copied()
+        } else {
+            None
+        };
+
+        if let Some(comdat_sect_id) = comdat_info {
+            // Add LOCAL symbol in .text (for intra-object .pdata/.rdata references)
+            let local_sym_id = cur_coff.add_symbol(object::write::Symbol {
+                name: sym.name.clone().into_bytes(),
+                value: match sym.section {
+                    Some(idx) => match obj.sections.get(idx) {
+                        Some(sect) => sym.address - sect.address,
+                        None => bail!("Could not find section for symbol {}!", sym.name),
+                    },
+                    None => 0,
+                },
+                size: 0,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Compilation, // LOCAL
+                weak: false,
+                section: match sym.section {
+                    Some(idx) => {
+                        object::write::SymbolSection::Section(sect_map.get(&idx).unwrap().clone())
+                    }
+                    None => object::write::SymbolSection::Undefined,
+                },
+                flags: SymbolFlags::None,
+            });
+            // Map the original symbol index to the local version for relocation targets
+            sym_map.insert(idx, local_sym_id);
+
+            // Add GLOBAL symbol in COMDAT .text$x (for cross-object dedup)
+            let comdat_sym_id = cur_coff.add_symbol(object::write::Symbol {
+                name: sym.name.clone().into_bytes(),
+                value: 0,
+                size: 0,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Linkage, // GLOBAL
+                weak: false,
+                section: object::write::SymbolSection::Section(comdat_sect_id),
+                flags: SymbolFlags::None,
+            });
+            comdat_pending.push((comdat_sect_id, comdat_sym_id));
+            continue;
+        }
+
         let sym_id = cur_coff.add_symbol(object::write::Symbol {
             name: sym.name.clone().into_bytes(),
             value: match sym.section {
@@ -1236,9 +1356,6 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
             scope: match sym.flags.scope() {
                 ObjSymbolScope::Local => SymbolScope::Compilation,
                 _ => SymbolScope::Linkage,
-                // ObjSymbolScope::Global => SymbolScope::Linkage,
-                // ObjSymbolScope::Weak => SymbolScope::Linkage, // verify this
-                // ObjSymbolScope::Unknown => SymbolScope::Unknown,
             },
             weak: false, // sym.flags.scope() == ObjSymbolScope::Weak,
             section: match sym.section {
@@ -1252,6 +1369,15 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
         sym_map.insert(idx, sym_id);
     }
 
+    // Register COMDAT groups for __unwind$ COMDAT sections
+    for (comdat_sect_id, comdat_sym_id) in comdat_pending {
+        cur_coff.add_comdat(object::write::Comdat {
+            kind: ComdatKind::Any,
+            symbol: comdat_sym_id,
+            sections: vec![comdat_sect_id],
+        });
+    }
+
     // insert the relocs
     for (sect_idx, sect) in obj.sections.iter() {
         for (addr, reloc) in sect.relocations.iter() {
@@ -1259,6 +1385,60 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                 Some(id) => id,
                 None => bail!("Could not find symbol ID for index {}", reloc.target_symbol),
             };
+
+            // Check if this relocation originates from within an __unwind$ region;
+            // if so, also add it to the COMDAT section (with adjusted offset).
+            let offset = addr as u64;
+            if let Some(&(_, size)) = unwind_regions.get(&(sect_idx, 0)).or_else(|| {
+                // Find the region that contains this offset
+                unwind_regions
+                    .range(..=(sect_idx, offset))
+                    .rev()
+                    .next()
+                    .filter(|(&(si, start), &(_, sz))| {
+                        si == sect_idx && offset >= start && offset < start + sz
+                    })
+                    .map(|(_, v)| v)
+            }) {
+                // Find which unwind region contains this offset
+                for (&(si, start), &(_sym_idx, sz)) in &unwind_regions {
+                    if si == sect_idx && offset >= start && offset < start + sz {
+                        if let Some(&comdat_sect_id) =
+                            unwind_comdat_sections.get(&(sect_idx, start))
+                        {
+                            let comdat_offset = offset - start;
+                            cur_coff.add_relocation(
+                                comdat_sect_id,
+                                object::write::Relocation {
+                                    offset: comdat_offset,
+                                    symbol: sym_id.clone(),
+                                    addend: 0,
+                                    flags: RelocationFlags::Coff { typ: reloc.to_coff() },
+                                },
+                            )?;
+                            match reloc.kind {
+                                ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
+                                    cur_coff.add_relocation(
+                                        comdat_sect_id,
+                                        object::write::Relocation {
+                                            offset: comdat_offset,
+                                            symbol: sym_id.clone(),
+                                            addend: 0,
+                                            flags: RelocationFlags::Coff {
+                                                typ: object::pe::IMAGE_REL_PPC_PAIR,
+                                            },
+                                        },
+                                    )?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Always add to main section (all relocations stay in .text)
             cur_coff.add_relocation(
                 sect_map.get(&sect_idx).unwrap().clone(),
                 object::write::Relocation {
@@ -1416,6 +1596,87 @@ mod tests {
             *storage_class, IMAGE_SYM_CLASS_LABEL,
             "Local+Unknown should be LABEL (6), got {storage_class}"
         );
+    }
+
+    const IMAGE_SYM_CLASS_STATIC: u8 = 3;
+
+    /// __unwind$ symbols produce two COFF symbols: LOCAL in .text + GLOBAL in COMDAT .text$x
+    #[test]
+    fn test_write_coff_unwind_symbol_is_comdat() {
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0,
+            size: 40,
+            data: vec![0x60; 40], // 10 nops (40 bytes)
+            align: 4,
+            elf_index: 0,
+            relocations: ObjRelocations::default(),
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+        let unwind_sym = ObjSymbol {
+            name: "__unwind$12345".into(),
+            address: 0,
+            section: Some(0),
+            size: 40,
+            size_known: true,
+            flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+            kind: ObjSymbolKind::Function,
+            ..Default::default()
+        };
+        let mut obj = ObjInfo::new(
+            ObjKind::Relocatable,
+            ObjArchitecture::PowerPc,
+            "test.obj".into(),
+            vec![],
+            vec![section],
+        );
+        obj.symbols.add_direct(unwind_sym).unwrap();
+        let coff_data = write_coff(&obj).unwrap();
+
+        // Parse COFF and verify TWO __unwind$ symbols: LOCAL + EXTERNAL
+        let symbols = parse_coff_symbol_classes(&coff_data);
+        let unwind_syms: Vec<_> = symbols
+            .iter()
+            .filter(|(name, _)| name == "__unwind$12345")
+            .collect();
+        assert_eq!(
+            unwind_syms.len(),
+            2,
+            "Expected 2 __unwind$ symbols (LOCAL + GLOBAL), got {}",
+            unwind_syms.len()
+        );
+        assert!(
+            unwind_syms.iter().any(|(_, c)| *c == IMAGE_SYM_CLASS_STATIC),
+            "Expected a LOCAL (STATIC=3) __unwind$ symbol in .text"
+        );
+        assert!(
+            unwind_syms.iter().any(|(_, c)| *c == IMAGE_SYM_CLASS_EXTERNAL),
+            "Expected a GLOBAL (EXTERNAL=2) __unwind$ symbol in COMDAT .text$x"
+        );
+
+        // Verify there's a .text$x section with COMDAT flag
+        let num_sections = u16::from_le_bytes(coff_data[2..4].try_into().unwrap()) as usize;
+        let mut found_comdat = false;
+        for i in 0..num_sections {
+            let off = 20 + i * 40;
+            let name = String::from_utf8_lossy(&coff_data[off..off + 8])
+                .trim_end_matches('\0')
+                .to_string();
+            if name == ".text$x" {
+                found_comdat = true;
+                let chars =
+                    u32::from_le_bytes(coff_data[off + 36..off + 40].try_into().unwrap());
+                assert!(
+                    chars & 0x1000 != 0,
+                    ".text$x should have IMAGE_SCN_LNK_COMDAT flag, got 0x{chars:08X}"
+                );
+            }
+        }
+        assert!(found_comdat, "Expected a .text$x COMDAT section for __unwind$");
     }
 
     /// Global + Function kind → EXTERNAL
