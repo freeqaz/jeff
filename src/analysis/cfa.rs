@@ -1522,3 +1522,7 @@ pub fn locate_cross_section_branch_targets(
     )?;
     Ok(branch_targets)
 }
+
+#[cfg(test)]
+#[path = "cfa_tests.rs"]
+mod cfa_tests;
