@@ -28,7 +28,11 @@ use crate::{
         ObjUnit, SectionIndex as ObjSectionIndex, SectionIndex, SymbolIndex as ObjSymbolIndex,
         SymbolIndex,
     },
-    util::{crypto::decrypt_aes128_cbc_no_padding, xex_imports::replace_ordinal},
+    util::{
+        config::is_auto_label,
+        crypto::decrypt_aes128_cbc_no_padding,
+        xex_imports::replace_ordinal,
+    },
 };
 
 // quick and ez ways to read data from a block of bytes
@@ -1354,6 +1358,7 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                 },
             },
             scope: match sym.flags.scope() {
+                ObjSymbolScope::Local if is_auto_label(sym) => SymbolScope::Linkage,
                 ObjSymbolScope::Local => SymbolScope::Compilation,
                 _ => SymbolScope::Linkage,
             },
