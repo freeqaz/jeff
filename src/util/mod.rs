@@ -8,6 +8,7 @@ pub mod config;
 pub mod crypto;
 pub mod dep;
 pub mod diff;
+pub mod disasm_tests;
 pub mod dol;
 pub mod dwarf;
 pub mod elf;
