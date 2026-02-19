@@ -547,6 +547,60 @@ impl FunctionSlices {
             // }
         }
 
+        // Speculatively follow possible_blocks entries.
+        // These are forward branches that couldn't be proven internal during Pass 1
+        // (because they're beyond the currently-known function end). Common case:
+        // bctrl (opaque indirect call) followed by b <epilogue>, where the epilogue
+        // is a forward branch to code that restores the stack and returns.
+        // Following these entries extends the function bounds, which may reveal gaps
+        // (between the branch and its target) that contain unreachable but valid code
+        // such as switch dispatch blocks or tail blocks.
+        loop {
+            let Some((&addr, _)) = self.possible_blocks.first_key_value() else { break };
+            let vm = self.possible_blocks.remove(&addr).unwrap();
+            if !self.add_block_start(addr) {
+                continue;
+            }
+            executor.push(addr, vm, true);
+            if matches!(
+                executor.run(obj, |data| {
+                    self.instruction_callback(
+                        data,
+                        obj,
+                        function_start,
+                        function_end,
+                        known_functions,
+                    )
+                })?,
+                Some(false)
+            ) {
+                return Ok(false);
+            }
+            // Block processed. Re-run gap detection since function bounds may have extended.
+            while let Some((first, _)) = self.first_disconnected_block() {
+                let gap_vm = self.possible_blocks.remove(&first.start);
+                executor.push(
+                    first.end,
+                    gap_vm.unwrap_or_else(|| VM::new_from_obj(obj)),
+                    true,
+                );
+                if matches!(
+                    executor.run(obj, |data| {
+                        self.instruction_callback(
+                            data,
+                            obj,
+                            function_start,
+                            function_end,
+                            known_functions,
+                        )
+                    })?,
+                    Some(false)
+                ) {
+                    return Ok(false);
+                }
+            }
+        }
+
         // Visit trailing blocks
         if let Some(known_end) = function_end {
             'outer: loop {

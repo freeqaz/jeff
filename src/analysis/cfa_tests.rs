@@ -232,8 +232,8 @@ fn test_jump_table_absolute_3() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // CFA detects end at 0x82FBB4B8 - the remaining 0x64 bytes are a tail block
-    // only reachable via branches the CFA can't follow without .pdata context
+    // Trailing bytes (0x64) are unreachable: the code at the tail starts with lfs (float load)
+    // and has no backward branches to the main body. Only discoverable via .pdata context.
     assert_eq!(func.end, Some(SectionAddress::new(0, 0x82FBB4B8)));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
@@ -411,7 +411,8 @@ fn test_jump_table_relative_bytes_5() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // CFA detects end at 0x82317C50 - remaining 0x28 bytes are a tail block
+    // Trailing bytes (0x28) are unreachable: starts with subi r31, r12, XXXX (unwind helper)
+    // with no backward branches to the main body. Only discoverable via .pdata context.
     assert_eq!(func.end, Some(SectionAddress::new(1, 0x82317C50)));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
@@ -480,7 +481,8 @@ fn test_jump_table_relative_bytes_7() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // CFA detects end at 0x82592F50 - remaining 0x80 bytes are a tail block
+    // Trailing bytes (0x80) are unreachable: starts with mfspr r12, LR (own prologue)
+    // — a separate function or exception handler within the .pdata range.
     assert_eq!(func.end, Some(SectionAddress::new(1, 0x82592F50)));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
@@ -624,7 +626,8 @@ fn test_jump_table_relative_shorts_4() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // CFA detects end at 0x823F7C90 - remaining 0x68 bytes are a tail block
+    // Trailing bytes (0x68) are unreachable: starts with mfspr r12, LR (own prologue)
+    // — a separate function or exception handler within the .pdata range.
     assert_eq!(func.end, Some(SectionAddress::new(1, 0x823F7C90)));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
@@ -776,12 +779,9 @@ fn test_jump_table_relative_shorts_8() -> Result<()> {
     Ok(())
 }
 
-// This function has a bctrl (indirect call via vtable) followed by an unconditional branch to
-// the exit. The jump table dispatch code at 0x82185BAC is unreachable from the main entry point
-// because bctrl is opaque to CFA. In production, .pdata or gap-filling discovers this secondary
-// entry. We simulate that here with a two-phase analysis: first the main entry, then the switch
-// dispatch entry. The switch code does MSVC-style stack shuffling (stw/lwz through r1) before
-// the cmplwi bound check, exercising both the backward-look pattern matcher and stack slot tracking.
+// this one has an absolute jump table,
+// except different registers are used when rlwinm'ing - it stores R4 to 0x50(R1), and then loads from 0x50(R1) into R3, and R3 is then used to index.
+// to get this to pass, we need some sort of mechanism that keeps track of what's in the stack at any given time
 #[test]
 fn test_jump_table_absolute_stack_meme() -> Result<()> {
     let test_cfg: Vec<TestConfig> =
@@ -794,34 +794,27 @@ fn test_jump_table_absolute_stack_meme() -> Result<()> {
     );
     let mut state = AnalyzerState::default();
     let start_addr = SectionAddress::new(0, cur_test.function_start);
-
-    // Phase 1: Analyze main entry point
-    // Discovers the short path: prologue → bl → vtable bctrl → b exit
-    // The bctrl is opaque, so CFA cannot follow through to the switch dispatch
+    // CFA completed with no errors
     let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    // we have one more function
     assert!(res);
-    assert!(state.jump_tables.is_empty()); // no JT visible from main entry
-
-    // Phase 2: Analyze the switch dispatch entry (simulates .pdata/gap-fill discovery)
-    // This code does: lwz from stack → stw/lwz shuffle → cmplwi r4, 0x168 → bgt default →
-    // lwz (backward-look matches) → rlwinm (×4) → lis+addi (table base) → lwzx → mtctr → bctr
-    let switch_addr = SectionAddress::new(0, 0x82185bac);
-    let res2 = state.process_function_at(&obj, switch_addr).unwrap_or_else(|e| panic!("{:?}", e));
-    assert!(res2);
-
-    // Now the jump table should be discovered
+    assert_eq!(state.functions.len(), 1);
+    let func = state.functions.get(&start_addr);
+    assert!(func.is_some());
+    let func = func.unwrap();
+    assert!(func.is_function());
+    // does the detected function end match our expected end?
+    assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
+    // for this func, we should have 1 jump table
+    assert_eq!(state.jump_tables.is_empty(), false);
     assert_eq!(state.jump_tables.len(), 1);
     // 0x5A4 bytes = 0x169 entries × 4 bytes/entry (Absolute)
     let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x82185be8));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x5A4);
-
-    // The switch function should have many basic blocks (dispatch + case bodies + default + exit)
-    let switch_func = state.functions.get(&switch_addr);
-    assert!(switch_func.is_some());
-    let switch_func = switch_func.unwrap();
-    assert!(switch_func.slices.is_some());
-    let slices = switch_func.slices.as_ref().unwrap();
-    assert!(slices.blocks.len() > 5);
+    // we should also have a lotta basic blocks
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert!(slices.blocks.len() > 5); // idk the exact number but i know it's more than 5
     Ok(())
 }
