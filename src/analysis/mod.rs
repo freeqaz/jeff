@@ -243,6 +243,14 @@ fn get_jump_table_entries(
                     | JumpTableType::RelativeShortsTimes2(_) => reloc_address.address,
                 };
                 if entry_addr > 0 {
+                    // Jump table entries must resolve to 4-byte aligned code addresses
+                    if entry_addr & 3 != 0 {
+                        log::debug!(
+                            "Jump table ended early: entry {:#010X} at {:#010X} not 4-byte aligned",
+                            entry_addr, cur_addr
+                        );
+                        break;
+                    }
                     let Ok((section_index, _)) = obj.sections.at_address(entry_addr) else {
                         // End of actual table - VM may have over-estimated size
                         log::debug!(
@@ -261,9 +269,24 @@ fn get_jump_table_entries(
         let actual_size = cur_addr.address - addr.address;
         Ok((entries, actual_size))
     }
-    // FIXME: this guessing routine only works for absolute jump tables
-    // make one for relative jump tables!
     else {
+        let increment: u32 = match jump_table_type {
+            JumpTableType::Absolute => 4,
+            JumpTableType::RelativeBytes(_) | JumpTableType::RelativeBytesTimes4(_) => 1,
+            JumpTableType::RelativeShorts(_) | JumpTableType::RelativeShortsTimes2(_) => 2,
+        };
+        let relative_addr = match jump_table_type {
+            JumpTableType::Absolute => None,
+            JumpTableType::RelativeBytes(addr)
+            | JumpTableType::RelativeBytesTimes4(addr)
+            | JumpTableType::RelativeShorts(addr)
+            | JumpTableType::RelativeShortsTimes2(addr) => {
+                addr.and_then(|t| match t {
+                    RelocationTarget::Address(a) => Some(a),
+                    _ => None,
+                })
+            }
+        };
         let mut entries = Vec::new();
         let mut cur_addr = addr;
         loop {
@@ -275,13 +298,47 @@ fn get_jump_table_entries(
                     RelocationTarget::External => break,
                 }
             } else if obj.kind == ObjKind::Executable {
-                let Some(value) = read_u32(section, cur_addr.address) else {
-                    break;
-                };
-                let Ok((section_index, _)) = obj.sections.at_address(value) else {
-                    break;
-                };
-                SectionAddress::new(section_index, value)
+                match jump_table_type {
+                    JumpTableType::Absolute => {
+                        let Some(value) = read_u32(section, cur_addr.address) else {
+                            break;
+                        };
+                        let Ok((section_index, _)) = obj.sections.at_address(value) else {
+                            break;
+                        };
+                        SectionAddress::new(section_index, value)
+                    }
+                    JumpTableType::RelativeBytes(_) | JumpTableType::RelativeBytesTimes4(_) => {
+                        let offset = (cur_addr.address as u64 - section.address) as usize;
+                        if offset >= section.data.len() { break; }
+                        let byte_val = section.data[offset];
+                        if byte_val == 0 && !entries.is_empty() { break; }
+                        let Some(base) = relative_addr else { break; };
+                        let entry_addr = match jump_table_type {
+                            JumpTableType::RelativeBytesTimes4(_) => base.address + (byte_val as u32 * 4),
+                            _ => base.address + byte_val as u32,
+                        };
+                        let Ok((section_index, _)) = obj.sections.at_address(entry_addr) else {
+                            break;
+                        };
+                        SectionAddress::new(section_index, entry_addr)
+                    }
+                    JumpTableType::RelativeShorts(_) | JumpTableType::RelativeShortsTimes2(_) => {
+                        let offset = (cur_addr.address as u64 - section.address) as usize;
+                        if offset + 2 > section.data.len() { break; }
+                        let short_val = u16::from_be_bytes(*array_ref!(section.data, offset, 2));
+                        if short_val == 0 && !entries.is_empty() { break; }
+                        let Some(base) = relative_addr else { break; };
+                        let entry_addr = match jump_table_type {
+                            JumpTableType::RelativeShortsTimes2(_) => base.address + (short_val as u32 * 2),
+                            _ => base.address + short_val as u32,
+                        };
+                        let Ok((section_index, _)) = obj.sections.at_address(entry_addr) else {
+                            break;
+                        };
+                        SectionAddress::new(section_index, entry_addr)
+                    }
+                }
             } else {
                 break;
             };
@@ -289,13 +346,13 @@ fn get_jump_table_entries(
                 break;
             }
             entries.push(target);
-            cur_addr += 4;
+            cur_addr += increment;
         }
         let size = cur_addr.address - addr.address;
         log::info!(
             "Guessed jump table @ {:#010X} with entry count {} (from {:#010X})",
             addr,
-            size / 4,
+            entries.len(),
             from
         );
         Ok((entries, size))

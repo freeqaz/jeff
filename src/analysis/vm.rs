@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{collections::BTreeMap, num::NonZeroU32};
 
 use powerpc::{Argument, Ins, Opcode, GPR};
 
@@ -153,6 +153,8 @@ pub struct VM {
     pub ctr: GprValue,
     /// The last modified CR
     pub last_modified_cr: u8,
+    /// Stack slot tracking: maps r1-relative offsets to stored GPR values
+    pub stack_slots: BTreeMap<i16, Gpr>,
 }
 
 impl VM {
@@ -857,7 +859,26 @@ impl VM {
                 } else if is_update_op(op) {
                     self.gpr[source].set_direct(GprValue::Unknown, None);
                 }
+                // Track stack stores: stw rS, offset(r1)
+                if op == Opcode::Stw && ins.field_ra() == 1 {
+                    let offset = ins.field_offset() as i16;
+                    let rs = ins.field_rs() as usize;
+                    self.stack_slots.insert(offset, self.gpr[rs]);
+                }
                 if op == Opcode::Lwz {
+                    // Check stack slot tracking first: lwz rD, offset(r1)
+                    if ins.field_ra() == 1 {
+                        let offset = ins.field_offset() as i16;
+                        if let Some(stored_gpr) = self.stack_slots.get(&offset).cloned() {
+                            let mut gpr = stored_gpr;
+                            gpr.source = GprSource {
+                                kind: GprSourceLocation::Stack(offset as usize),
+                                version: gpr.version,
+                            };
+                            self.gpr[ins.field_rd() as usize] = gpr;
+                            return result;
+                        }
+                    }
                     // the following sequence checkers are terrible hacks
                     // the "proper" way to do it would be to track values of stack offsets/memory offsets as they're written to/read from,
                     // but for the life me i can't figure out how to do that
@@ -941,6 +962,12 @@ impl VM {
         for gpr in &mut self.gpr {
             if gpr.value == GprValue::ComparisonResult(crf as u8) {
                 gpr.value = value;
+                // Propagate narrowed value back to the stack slot this register was loaded from
+                if let GprSourceLocation::Stack(offset) = gpr.source.kind {
+                    if let Some(slot) = self.stack_slots.get_mut(&(offset as i16)) {
+                        slot.value = value;
+                    }
+                }
             }
         }
     }
