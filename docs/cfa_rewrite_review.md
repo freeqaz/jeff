@@ -463,6 +463,14 @@ Open technical debt (non-blocking for this branch state):
     - `dc1/TU0/default.xex`
     - `gh2/360 TU0 Strum Limit Fix/default.xex`
   - Result: `dtk xex info` succeeded for all sampled titles.
+  - Shadow-gated DC3 split rerun after `R7 E2d` and split COMDAT guardrail updates:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-e2d-<timestamp>`
+    - Result: `status=0`, `4448` total files, `2223` `.obj` files.
+    - Compared to earlier `vmreport` baseline:
+      - only `config.json`, `dep`, and `obj/xdk/LIBCMT/crtgpr.obj` differed.
+      - `crtgpr.obj` delta aligns with current COMDAT fall-through handling for `__savegprlr_*`/`__restgprlr_*`.
+    - Determinism check (same commit, second run):
+      - no non-trivial diffs (`config.json`/`dep` excluded).
 
 #### Useful XEX Links (Local Workspace)
 

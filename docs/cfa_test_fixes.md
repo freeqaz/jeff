@@ -137,12 +137,20 @@ Follow-up status:
       - `dc1/TU0/default.xex`
       - `gh2/360 TU0 Strum Limit Fix/default.xex`
   - Active linking/COFF stability update:
-    - `src/util/xex.rs` now sanitizes relocation-site addends for additional PPC relocation kinds
-      (`PpcRel24`, `PpcRel14`, `PpcAddr16*`, `PpcEmbSda21`) in addition to absolute relocations.
+    - `src/util/xex.rs` sanitizes relocation-site addends for `Absolute` and `PpcRel24` before
+      COFF emission.
+    - `src/util/split.rs` excludes `__savegprlr_*` and `__restgprlr_*` from COMDAT extraction to
+      preserve CRT fall-through semantics.
     - Validation: `cargo test util::xex::tests::` remains green (`5/5`).
     - Real-XEX smoke after relocation rewrite:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-mixed-<timestamp>`
       - Result: `rc=0`, `4448` files, `2223` `.obj`.
+    - Post-E2d shadow-gated rerun:
+      - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-e2d-<timestamp>`
+      - Result: `rc=0`, `4448` files, `2223` `.obj`.
+      - Compared to older baseline, only `config.json`, `dep`, and `obj/xdk/LIBCMT/crtgpr.obj`
+        changed; `crtgpr.obj` change matches the COMDAT CRT stub policy update.
+      - Same-commit rerun is deterministic (no non-trivial diffs excluding `config.json`/`dep`).
   - Useful local XEX paths:
     - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
     - `/home/free/code/milohax/milo-executable-library/dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
