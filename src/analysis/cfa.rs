@@ -304,7 +304,7 @@ impl AnalyzerState {
         Ok(())
     }
 
-    pub fn detect_functions(&mut self, obj: &ObjInfo) -> Result<()> {
+    pub(crate) fn phase_seed_discovery(&mut self, obj: &ObjInfo) -> Result<Vec<SectionAddress>> {
         // Apply known functions from pdata/import data
         for (&addr, &size) in &obj.known_functions {
             self.functions.insert(addr, FunctionInfo {
@@ -338,8 +338,16 @@ impl AnalyzerState {
             self.functions.entry(this_sec_start).or_default();
         }
 
+        Ok(self.functions.keys().copied().collect_vec())
+    }
+
+    pub(crate) fn phase_slice_seeded_functions(
+        &mut self,
+        obj: &ObjInfo,
+        seed_addrs: &[SectionAddress],
+    ) -> Result<()> {
         // Process known functions first
-        for addr in self.functions.keys().cloned().collect_vec() {
+        for &addr in seed_addrs {
             self.process_function_at(obj, addr)?;
 
             // some assertions, since we're working with known function boundaries
@@ -375,7 +383,10 @@ impl AnalyzerState {
 
         // the rest...
         println!("Known functions complete.");
+        Ok(())
+    }
 
+    pub(crate) fn phase_discover_remaining_functions(&mut self, obj: &ObjInfo) -> Result<()> {
         if let Some(entry) = obj.entry.map(|n| n as u32) {
             // Locate entry function bounds
             let (section_index, _) = obj
@@ -401,12 +412,23 @@ impl AnalyzerState {
             }
             bail!("Failed to finalize functions");
         }
+        Ok(())
+    }
 
+    pub(crate) fn phase_finalize_and_validate(&mut self, obj: &ObjInfo) -> Result<()> {
         // Merge tail blocks: small functions that are actually out-of-line code
         // from the preceding function (e.g., loop exit paths placed after .pdata end)
         self.merge_tail_blocks(obj)?;
         self.validate_invariants(obj)
             .context("CFA invariant validation failed after detect_functions")?;
+        Ok(())
+    }
+
+    pub fn detect_functions(&mut self, obj: &ObjInfo) -> Result<()> {
+        let seed_addrs = self.phase_seed_discovery(obj)?;
+        self.phase_slice_seeded_functions(obj, &seed_addrs)?;
+        self.phase_discover_remaining_functions(obj)?;
+        self.phase_finalize_and_validate(obj)?;
 
         Ok(())
     }
