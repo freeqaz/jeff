@@ -36,6 +36,17 @@ New regression coverage includes:
 - Unvisited-seed positive (`.pdata` detached helper) and negative (embedded data) behavior.
 - VM stack-shuffle variants with instruction gaps and register rename.
 
+### Current Branch Status (2026-02-20)
+
+- Branch/version: `cfa_fix` on `1.9.2`
+- Core CFA suites currently passing:
+  - `cargo test cfa_tests` (20/20)
+  - `cargo test analysis::slices::tests::tail_call` (3/3)
+  - `cargo test analysis::vm::tests::` (2/2)
+- Worktree state after validation: clean
+
+Primary remaining follow-up is cleanup of unrelated compiler warnings; CFA robustness work targeted here is stable and covered by regression tests.
+
 ## Background: How CFA Detects Jump Tables
 
 The CFA's PPC virtual machine (`vm.rs`) tracks register values as instructions execute. For jump

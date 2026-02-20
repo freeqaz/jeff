@@ -223,3 +223,22 @@ Validation run:
 - `cargo test analysis::slices::tests::tail_call`
 - `cargo test analysis::tests::`
 - `cargo test analysis::vm::tests::`
+
+## Current Status Snapshot (2026-02-20)
+
+- Branch: `cfa_fix`
+- Version: `1.9.2`
+- Commit head: `161dd81` (`Bump project version to 1.9.2`)
+- Working tree: clean after validation
+- Dev branch delta: only one version-bump commit (`1.9.1`) remains on `dev`, superseded by `1.9.2` here
+
+Current observed test state on this branch:
+
+- `cargo test cfa_tests` -> 20 passed
+- `cargo test analysis::slices::tests::tail_call` -> 3 passed
+- `cargo test analysis::vm::tests::` -> 2 passed
+
+Open technical debt (non-blocking for this branch state):
+
+- Existing compiler warnings outside CFA modules (`src/util/*`, `src/obj/*`)
+- Legacy VM pattern-specific hacks still present, though now partially insulated by stack-slot provenance and new regression tests
