@@ -28,6 +28,8 @@ Current implementation snapshot:
     - `runtime_vm_shadow_report(...)`
     - `VmRuntimeShadowConfig`
     - `VmRuntimeShadowReport`
+    - `VmRuntimeShadowFunctionReport`
+  - Runtime VM shadow reports now include per-function sampled-step and categorized diff summaries.
   - Runtime gate controls already available for VM rollout:
     - `DTK_CFA_ENABLE_VM2_SHADOW`
     - `DTK_CFA_MAX_VM_SHADOW_DELTAS`

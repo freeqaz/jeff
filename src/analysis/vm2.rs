@@ -326,17 +326,35 @@ impl Default for VmRuntimeShadowConfig {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VmRuntimeShadowFunctionReport {
+    pub start: SectionAddress,
+    pub steps_sampled: usize,
+    pub summary: VmShadowDiffSummary,
+}
+
+impl VmRuntimeShadowFunctionReport {
+    pub fn total_diffs(&self) -> usize {
+        self.summary.total()
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct VmRuntimeShadowReport {
     pub summary: VmShadowDiffSummary,
     pub functions_requested: usize,
     pub functions_sampled: usize,
     pub steps_sampled: usize,
+    pub function_reports: Vec<VmRuntimeShadowFunctionReport>,
 }
 
 impl VmRuntimeShadowReport {
     pub fn total_diffs(&self) -> usize {
         self.summary.total()
+    }
+
+    pub fn functions_with_diffs(&self) -> usize {
+        self.function_reports.iter().filter(|report| report.total_diffs() != 0).count()
     }
 }
 
@@ -460,6 +478,8 @@ pub fn runtime_vm_shadow_report(
             continue;
         }
         report.functions_sampled += 1;
+        let mut function_report =
+            VmRuntimeShadowFunctionReport { start, steps_sampled: 0, summary: Default::default() };
 
         let mut vm = VM::new_from_obj(obj);
         let mut addr = start;
@@ -470,13 +490,14 @@ pub fn runtime_vm_shadow_report(
             let Some(ins) = disassemble(section, addr.address) else {
                 break;
             };
+            function_report.steps_sampled += 1;
             report.steps_sampled += 1;
             let result = vm.step(obj, addr, ins);
 
             // Candidate runtime shadow currently maps from the legacy VM state.
             let candidate = Vm2::from_legacy_vm(&vm);
             let diff = VmShadowDiffReport::from_legacy_pair(&vm, &candidate);
-            report.summary.accumulate(&diff.summary);
+            function_report.summary.accumulate(&diff.summary);
 
             match result {
                 StepResult::Continue | StepResult::LoadStore { .. } | StepResult::Branch(_) => {
@@ -485,6 +506,8 @@ pub fn runtime_vm_shadow_report(
                 StepResult::Illegal | StepResult::Jump(_) => break,
             }
         }
+        report.summary.accumulate(&function_report.summary);
+        report.function_reports.push(function_report);
     }
     report
 }
@@ -618,10 +641,45 @@ mod tests {
         );
         assert_eq!(report.functions_requested, 1);
         assert_eq!(report.functions_sampled, 1);
+        assert_eq!(report.function_reports.len(), 1);
+        assert_eq!(report.function_reports[0].start, SectionAddress::new(0, 0x1000));
         assert!(
             report.steps_sampled >= 1,
             "runtime shadow report should record at least one sampled step"
         );
+        assert_eq!(report.function_reports[0].steps_sampled, report.steps_sampled);
+        assert_eq!(report.functions_with_diffs(), 0);
+        assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_skips_non_code_functions() {
+        let section = ObjSection {
+            name: ".data".into(),
+            kind: ObjSectionKind::Data,
+            address: 0x1000,
+            size: 8,
+            data: vec![0; 8],
+            align: 4,
+            ..Default::default()
+        };
+        let obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "vm2-shadow-test".into(),
+            vec![],
+            vec![section],
+        );
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 0);
+        assert_eq!(report.steps_sampled, 0);
+        assert!(report.function_reports.is_empty());
         assert_eq!(report.total_diffs(), 0);
     }
 

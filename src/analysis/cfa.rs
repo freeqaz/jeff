@@ -21,7 +21,7 @@ use crate::{
         },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
-        vm2::{runtime_vm_shadow_report, VmRuntimeShadowConfig},
+        vm2::{runtime_vm_shadow_report, VmRuntimeShadowConfig, VmRuntimeShadowReport},
         RelocationTarget,
     },
     obj::{
@@ -205,6 +205,31 @@ fn log_pipeline_digest_delta_entries(entries: &[PipelineDiffEntry]) {
             entry.address,
             entry.left,
             entry.right
+        );
+    }
+}
+
+fn log_vm_runtime_shadow_function_entries(report: &VmRuntimeShadowReport) {
+    let mismatched = report
+        .function_reports
+        .iter()
+        .filter(|function_report| function_report.total_diffs() != 0)
+        .collect_vec();
+    if mismatched.is_empty() {
+        return;
+    }
+    let shown = mismatched.len().min(MAX_LOGGED_SHADOW_DELTA_ENTRIES);
+    log::warn!("VM shadow function deltas (showing {} of {}):", shown, mismatched.len());
+    for function_report in mismatched.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
+        log::warn!(
+            "  {}: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) sampled_steps={}",
+            function_report.start,
+            function_report.total_diffs(),
+            function_report.summary.presence,
+            function_report.summary.value,
+            function_report.summary.provenance,
+            function_report.summary.confidence,
+            function_report.steps_sampled
         );
     }
 }
@@ -631,7 +656,7 @@ impl AnalyzerState {
         let candidate_report = candidate_pipeline.run_with_report(obj)?;
         let candidate_digest = candidate_report.digest.clone();
 
-        let vm_shadow_deltas = if gate_config.enable_vm2_shadow {
+        let vm_shadow_report = if gate_config.enable_vm2_shadow {
             let default_config = VmRuntimeShadowConfig::default();
             let vm_shadow_config = VmRuntimeShadowConfig {
                 max_functions: read_shadow_usize_env(
@@ -646,7 +671,7 @@ impl AnalyzerState {
             let vm_shadow_report =
                 runtime_vm_shadow_report(obj, &legacy_seed_addresses, vm_shadow_config);
             log::debug!(
-                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} max_functions={} max_steps={}",
+                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} mismatched_functions={} max_functions={} max_steps={}",
                 vm_shadow_report.total_diffs(),
                 vm_shadow_report.summary.presence,
                 vm_shadow_report.summary.value,
@@ -655,13 +680,15 @@ impl AnalyzerState {
                 vm_shadow_report.functions_requested,
                 vm_shadow_report.functions_sampled,
                 vm_shadow_report.steps_sampled,
+                vm_shadow_report.functions_with_diffs(),
                 vm_shadow_config.max_functions,
                 vm_shadow_config.max_steps_per_function
             );
-            vm_shadow_report.total_diffs()
+            Some(vm_shadow_report)
         } else {
-            0
+            None
         };
+        let vm_shadow_deltas = vm_shadow_report.as_ref().map_or(0, VmRuntimeShadowReport::total_diffs);
 
         let phase_checkpoint_summary = compare_phase_checkpoints(&legacy_report, &candidate_report);
         let phase_checkpoint_entries = phase_checkpoint_diff_entries(&legacy_report, &candidate_report);
@@ -688,6 +715,9 @@ impl AnalyzerState {
                 digest_deltas,
                 decision.reasons
             );
+            if let Some(vm_shadow_report) = vm_shadow_report.as_ref() {
+                log_vm_runtime_shadow_function_entries(vm_shadow_report);
+            }
             log_phase_checkpoint_delta_entries(&phase_checkpoint_entries);
             log_pipeline_digest_delta_entries(&digest_entries);
             *self = legacy_pipeline.state;
