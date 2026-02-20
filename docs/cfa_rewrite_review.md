@@ -564,6 +564,10 @@ Open technical debt (non-blocking for this branch state):
       - Added native parity tests:
         - `analysis::vm2::tests::vm2_step_shadow_native_handles_relative_jump_table_sequence`
         - `analysis::vm2::tests::vm2_step_shadow_native_handles_lwzx_and_lhzx_parity`
+    - Scripted workflow smoke:
+      - Added `scripts/dc3_cfa_parity_smoke.sh` for one-command `baseline`/`shadow`/`candidate` parity checks.
+      - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r11-smoke` -> `PASS`
+      - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
@@ -583,6 +587,7 @@ Open technical debt (non-blocking for this branch state):
 
 1. **R6 rollout prep (cutover scaffold utilization)**:
    - Run `DTK_CFA_PIPELINE_MODE=shadow` soak across fixture + real-XEX workflows.
+   - Use `scripts/dc3_cfa_parity_smoke.sh` as the standard DC3 regression/parity harness.
    - Start controlled `DTK_CFA_PIPELINE_MODE=candidate` opt-in checks on bounded corpora.
    - Keep default at `legacy` until parity + stability gates are met.
 2. **R7 native VM2 coverage continuation**:

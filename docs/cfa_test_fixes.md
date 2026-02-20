@@ -57,6 +57,9 @@ Follow-up status:
   - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke2` -> `exit=0`
   - Revalidated post COFF/COMDAT edits:
     - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke3` -> `exit=0`
+- Repeatable workflow helper added:
+  - `scripts/dc3_cfa_parity_smoke.sh`
+  - One-command baseline/shadow/candidate split + diff gating (ignores only `config.json`/`dep`).
 - Current debug parity run status:
   - Tracker duplicate-relocation panic is fixed in `src/analysis/tracker.rs`.
   - New regression test: `analysis::tracker::tests::test_process_data_tolerates_existing_source_relocation`.
@@ -73,6 +76,9 @@ Follow-up status:
   - Post native-VM2 jump-table opcode tranche (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) validation:
     - `BASE_RC=0`, `CAND_RC=0` on rerun (`r10b`) with `DTK_CFA_PIPELINE_MODE=candidate` + native VM2 shadow.
     - outputs remained parity-clean (`4448` files, `2223` `.obj`, non-trivial diff count `0`).
+  - Scripted workflow smoke (`r11-smoke`):
+    - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r11-smoke`
+    - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
