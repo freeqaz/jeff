@@ -1459,9 +1459,12 @@ pub fn split_obj(
                 && !sym.name.starts_with("__unwind$")
                 // CRT save/restore stubs use fall-through execution — each entry
                 // saves/restores one register and falls into the next. Extracting
-                // them as individual COMDAT sections breaks this fall-through chain.
-                && !sym.name.starts_with("__savegprlr_")
-                && !sym.name.starts_with("__restgprlr_")
+                // them as COMDAT sections breaks this fall-through chain.
+                // Match both the base name (__savegprlr) and numbered entries (__savegprlr_14).
+                && !sym.name.starts_with("__savegprlr")
+                && !sym.name.starts_with("__restgprlr")
+                && !sym.name.starts_with("__savefpr")
+                && !sym.name.starts_with("__restfpr")
             {
                 comdat_symbols.insert(sym.name.clone());
             }
