@@ -89,6 +89,8 @@ pub struct Vm2 {
     pub current_revision: usize,
     cr_compare: [Option<CrCompareState2>; 8],
     last_modified_cr: u8,
+    reg_revisions: [usize; 32],
+    stack_slot_revisions: BTreeMap<i16, usize>,
 }
 
 impl Default for Vm2 {
@@ -102,6 +104,8 @@ impl Default for Vm2 {
             current_revision: 0,
             cr_compare: std::array::from_fn(|_| None),
             last_modified_cr: 0,
+            reg_revisions: [0; 32],
+            stack_slot_revisions: BTreeMap::new(),
         }
     }
 }
@@ -198,6 +202,7 @@ impl Vm2 {
         let mut vm2 = Self::new();
         for reg in 0..32 {
             vm2.gpr[reg] = Self::fact_from_legacy_gpr(&legacy.gpr[reg]);
+            vm2.reg_revisions[reg] = legacy.gpr[reg].version;
         }
         for crf in 0..8 {
             vm2.cr[crf] = Self::fact_from_legacy_cr(crf, &legacy.cr[crf]);
@@ -209,6 +214,8 @@ impl Vm2 {
             .iter()
             .map(|(&offset, gpr)| (offset, Self::fact_from_legacy_gpr(gpr)))
             .collect();
+        vm2.stack_slot_revisions =
+            legacy.stack_slots.iter().map(|(&offset, gpr)| (offset, gpr.version)).collect();
         vm2.cr_compare =
             std::array::from_fn(|crf| Self::cr_compare_from_legacy_cr(&legacy.cr[crf]));
         vm2.last_modified_cr = legacy.last_modified_cr;
@@ -275,6 +282,11 @@ impl Vm2 {
     fn fact_from_value(value: Value2) -> ValueFact2 {
         let confidence = Self::confidence_for_value(&value);
         ValueFact2 { value, provenance: Provenance2::None, confidence }
+    }
+
+    #[inline]
+    fn bump_reg_revision(&mut self, reg: usize) {
+        self.reg_revisions[reg] = self.reg_revisions[reg].saturating_add(1);
     }
 
     #[inline]
@@ -355,6 +367,7 @@ impl Vm2 {
                     _ => return false,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // addis rD, rA, SIMM
@@ -381,6 +394,7 @@ impl Vm2 {
                     }
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // addi/addic/addic. rD, rA, SIMM
@@ -408,6 +422,7 @@ impl Vm2 {
                     }
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // subf/subfc rD, rA, rB
@@ -423,6 +438,7 @@ impl Vm2 {
                     _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // subfic rD, rA, SIMM
@@ -435,6 +451,7 @@ impl Vm2 {
                     _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // cmp/cmpi/cmpl/cmpli [crfD], [L], rA, rB|IMM
@@ -503,6 +520,7 @@ impl Vm2 {
                     Value2::Top
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // lwzx rD, rA, rB
@@ -526,6 +544,7 @@ impl Vm2 {
                     _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // lbzx rD, rA, rB
@@ -554,6 +573,7 @@ impl Vm2 {
                     _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // lhzx rD, rA, rB
@@ -577,13 +597,29 @@ impl Vm2 {
                     _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
+                true
+            }
+            // lwz rD, offset(r1): mirror native stack-slot reload when a tracked slot exists.
+            Opcode::Lwz if ins.field_ra() == 1 => {
+                let dst = ins.field_rd() as usize;
+                let offset = ins.field_offset() as i16;
+                let Some(mut loaded) = self.read_stack_slot(offset).cloned() else {
+                    return false;
+                };
+                let revision = self.stack_slot_revisions.get(&offset).copied().unwrap_or_default();
+                loaded.provenance = Provenance2::StackSlot { offset, revision };
+                self.gpr[dst] = loaded;
+                self.reg_revisions[dst] = revision.saturating_add(1);
                 true
             }
             // stw rS, offset(r1): track stack-slot writes natively for provenance continuity.
             Opcode::Stw if ins.field_ra() == 1 => {
                 let offset = ins.field_offset() as i16;
+                let source_reg = ins.field_rs() as usize;
                 let source = self.reg(ins.field_rs()).clone();
                 self.write_stack_slot(offset, source);
+                self.stack_slot_revisions.insert(offset, self.reg_revisions[source_reg]);
                 true
             }
             // ori rA, rS, UIMM
@@ -600,16 +636,20 @@ impl Vm2 {
                     }
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // or rA, rS, rB
             Opcode::Or => {
                 // Register-copy form: preserve legacy stack-slot provenance natively when possible.
                 if ins.field_rs() == ins.field_rb() {
+                    let src_reg = ins.field_rs() as usize;
                     let dst = ins.field_ra() as usize;
                     let src = self.reg(ins.field_rs()).clone();
                     if matches!(src.provenance, Provenance2::StackSlot { .. }) {
                         self.gpr[dst] = src;
+                        let source_revision = self.reg_revisions[src_reg];
+                        self.reg_revisions[dst] = source_revision.saturating_add(1);
                         return true;
                     }
                     // Keep bridging for non-stack register copies to preserve legacy provenance parity.
@@ -624,6 +664,7 @@ impl Vm2 {
                     _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // mtspr SPR, rS
@@ -645,6 +686,7 @@ impl Vm2 {
                     _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
+                self.bump_reg_revision(dst);
                 true
             }
             // Non-link branches do not update architectural value state tracked by VM2.
@@ -1003,7 +1045,7 @@ mod tests {
     use serde::{de::Error, Deserialize, Deserializer};
 
     use crate::{
-        analysis::vm::{BranchTarget, StepResult},
+        analysis::vm::{BranchTarget, GprSource, StepResult},
         obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind},
     };
 
@@ -1280,6 +1322,36 @@ mod tests {
     }
 
     #[test]
+    fn vm2_step_shadow_native_handles_stack_load_lwz() {
+        let obj = make_obj_with_words(0x1000, &[0x8121_0050]); // lwz r9, 80(r1)
+        let mut legacy = VM::default();
+        legacy.stack_slots.insert(
+            0x50,
+            Gpr {
+                value: GprValue::Range { min: 0, max: 0x20, step: 1 },
+                source: GprSource {
+                    kind: GprSourceLocation::Register(5),
+                    version: 7,
+                },
+                version: 7,
+                ..Default::default()
+            },
+        );
+
+        let mut vm2 = Vm2::from_legacy_vm(&legacy);
+        let lwz = Ins::new(0x8121_0050, Extensions::xenon());
+        assert!(
+            vm2.step_shadow_native(&obj, SectionAddress::new(0, 0x1000), lwz),
+            "stack load lwz should be handled natively when slot metadata exists"
+        );
+
+        let _ = step(&mut legacy, &obj, 0x1000, 0x8121_0050);
+        let diff = VmShadowDiffReport::from_legacy_pair(&legacy, &vm2);
+        assert_eq!(diff.summary.total(), 0, "{diff:?}");
+        assert!(matches!(vm2.reg(9).provenance, Provenance2::StackSlot { offset: 0x50, .. }));
+    }
+
+    #[test]
     fn runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops() {
         // li r3,4
         // li r4,8
@@ -1322,6 +1394,38 @@ mod tests {
         assert_eq!(
             function_report.bridged_steps, 0,
             "all arithmetic/spr operations in this sequence should be native"
+        );
+        assert_eq!(report.bridged_steps, 0);
+        assert_eq!(function_report.native_steps, function_report.steps_sampled);
+        assert_eq!(report.native_steps, report.steps_sampled);
+        assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_native_mode_handles_stack_store_and_load() {
+        // li r5,1
+        // stw r5,80(r1)
+        // lwz r6,80(r1)
+        // blr
+        let obj = make_obj_with_words(0x1000, &[0x38A0_0001, 0x90A1_0050, 0x80C1_0050, 0x4E80_0020]);
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report_with_mode(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+            true,
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 1);
+        assert_eq!(report.function_reports.len(), 1);
+        let function_report = &report.function_reports[0];
+        assert!(
+            function_report.steps_sampled >= 3,
+            "expected li/stw/lwz sequence to be sampled"
+        );
+        assert_eq!(
+            function_report.bridged_steps, 0,
+            "stack store/load path should now be handled natively"
         );
         assert_eq!(report.bridged_steps, 0);
         assert_eq!(function_report.native_steps, function_report.steps_sampled);
