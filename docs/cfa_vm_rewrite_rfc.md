@@ -4,7 +4,8 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: RFC + spike baseline (pre-implementation)
+- Phase: RFC + spike baseline (initial implementation scaffold merged)
+- Initial scaffold: `src/analysis/vm2.rs`
 
 ## Why this rewrite exists
 

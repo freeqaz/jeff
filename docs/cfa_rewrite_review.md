@@ -229,6 +229,7 @@ Implemented in this branch:
 - **B7 in progress (RFC + baseline complete)**:
   - Added decision-complete VM rewrite RFC (`docs/cfa_vm_rewrite_rfc.md`).
   - Added VM baseline test for relative jump-table base propagation through `lbzx + rlwinm + add + bctr`.
+  - Added VM2 parallel model scaffold in code (`src/analysis/vm2.rs`) with value/provenance/confidence primitives (no behavior switch yet).
 
 - **B8 in progress (RFC + shadow scaffolding complete)**:
   - Added decision-complete pipeline/shadow RFC (`docs/cfa_pipeline_rewrite_rfc.md`).
@@ -253,6 +254,7 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 3 passed
+- `cargo test analysis::vm2::tests::` -> 2 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
 
 Open technical debt (non-blocking for this branch state):

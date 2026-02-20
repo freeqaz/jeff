@@ -43,6 +43,7 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
+  - `cargo test analysis::vm2::tests::` (2/2)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
 - Shared negative fixture asset:
   - `assets/tests/jump_table_negative_snippets.txt`
@@ -55,6 +56,7 @@ Follow-up status:
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
+  - VM2 scaffold module: `src/analysis/vm2.rs`
   - New rewrite-baseline tests:
     - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
     - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`
