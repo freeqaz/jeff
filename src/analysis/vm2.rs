@@ -579,6 +579,13 @@ impl Vm2 {
                 self.gpr[dst] = Self::fact_from_value(value);
                 true
             }
+            // stw rS, offset(r1): track stack-slot writes natively for provenance continuity.
+            Opcode::Stw if ins.field_ra() == 1 => {
+                let offset = ins.field_offset() as i16;
+                let source = self.reg(ins.field_rs()).clone();
+                self.write_stack_slot(offset, source);
+                true
+            }
             // ori rA, rS, UIMM
             Opcode::Ori => {
                 let dst = ins.field_ra() as usize;
@@ -1245,6 +1252,31 @@ mod tests {
         let diff = VmShadowDiffReport::from_legacy_pair(&legacy, &vm2);
         assert_eq!(diff.summary.total(), 0, "{diff:?}");
         assert!(matches!(vm2.reg(9).provenance, Provenance2::StackSlot { offset: 0x50, .. }));
+    }
+
+    #[test]
+    fn vm2_step_shadow_native_handles_stack_store_stw() {
+        let obj = make_obj_with_words(0x1000, &[0x90A1_0050]); // stw r5, 80(r1)
+        let mut legacy = VM::default();
+        legacy.gpr[5].value = GprValue::Range { min: 0, max: 0x40, step: 1 };
+        legacy.gpr[5].source.kind = GprSourceLocation::Stack(0x20);
+        legacy.gpr[5].source.version = 3;
+        legacy.gpr[5].version = 3;
+
+        let mut vm2 = Vm2::from_legacy_vm(&legacy);
+        let stw = Ins::new(0x90A1_0050, Extensions::xenon());
+        assert!(
+            vm2.step_shadow_native(&obj, SectionAddress::new(0, 0x1000), stw),
+            "stack store stw should be handled natively"
+        );
+
+        let _ = step(&mut legacy, &obj, 0x1000, 0x90A1_0050);
+        let diff = VmShadowDiffReport::from_legacy_pair(&legacy, &vm2);
+        assert_eq!(diff.summary.total(), 0, "{diff:?}");
+        let Some(slot) = vm2.read_stack_slot(0x50) else {
+            panic!("expected stack slot write at offset 0x50");
+        };
+        assert_eq!(slot.value, Value2::Range { min: 0, max: 0x40, step: 1 });
     }
 
     #[test]
