@@ -124,6 +124,12 @@ Diff categories:
 - Implement rewritten phase components behind internal feature flags.
 - Compare phase outputs (not only final outputs) for debugging.
 
+### S2a: Candidate phase spike prep (next checkpoint)
+
+- Add candidate phase spike scaffolds behind internal guardrails.
+- Extend run-report comparison checkpoints so phase-level deltas can be surfaced before full digest mismatch.
+- Keep legacy pipeline default until S2a delta categories are understood and documented.
+
 ### S3: rollout
 
 - Candidate engine opt-in for selected corpora.

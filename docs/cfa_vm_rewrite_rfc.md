@@ -103,6 +103,14 @@ Confidence is attached to derived indexed-load and branch-target facts. Consumer
 - Run legacy VM and VM2 side-by-side on selected corpus.
 - Compare emitted branch/jump-table facts and range outcomes.
 
+### M2a: Corpus parity harness (next checkpoint)
+
+- Add reusable VM shadow harness over CFA fixture corpus paths.
+- Emit aggregate `VmShadowDiffSummary` plus per-fixture mismatch reports.
+- Gate policy:
+  - `value/provenance/confidence/presence` deltas must be explicitly categorized.
+  - unresolved deltas above threshold keep VM2 disabled for adoption.
+
 ### M3: Controlled adoption
 
 - Opt-in internal switch for VM2 in CFA.

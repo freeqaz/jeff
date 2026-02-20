@@ -329,3 +329,21 @@ Open technical debt (non-blocking for this branch state):
    - Keep legacy analyzer default until parity and stability gates hold.
 3. **R7: Internal VM2 adoption guardrails**:
    - Add fallback-on-diff hooks so VM2 candidate paths auto-revert to legacy VM when parity fails.
+
+### Immediate Execution Plan (Kickoff: 2026-02-20)
+
+1. **Sprint D1 (R4 remainder, B7)**:
+   - Build a corpus VM shadow harness that runs legacy VM paths and emits `VmShadowDiffReport` per fixture.
+   - Start with targeted CFA fixture subset (`1, 4, 8, 12, 19`) before expanding.
+   - Add aggregate VM shadow summary counters (presence/value/provenance/confidence) and fail on non-zero unresolved deltas.
+2. **Sprint D2 (R6 prep, B8/M3)**:
+   - Add candidate phase spike scaffolds behind internal guards (no default behavior switch).
+   - Wire pipeline run-report checkpoints so candidate phase outputs can be compared against legacy phase boundaries.
+3. **Sprint D3 (R7 prep)**:
+   - Define fallback policy hooks for candidate VM/pipeline paths: if shadow mismatch is above threshold, automatically route to legacy.
+
+Exit criteria for next implementation pass:
+
+- VM shadow corpus harness is in-tree with deterministic results and explicit parity thresholds.
+- Existing CFA suites remain green.
+- Docs/RFC status moves from planning to implementation for D1.
