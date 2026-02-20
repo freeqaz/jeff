@@ -1194,6 +1194,25 @@ mod tests {
         )
     }
 
+    fn make_obj_with_size(base: u32, size: usize) -> ObjInfo {
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base as u64,
+            size: size as u64,
+            data: vec![0u8; size],
+            align: 4,
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "vm-test-sized".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
     fn step(vm: &mut VM, obj: &ObjInfo, addr: u32, code: u32) -> StepResult {
         vm.step(obj, SectionAddress::new(0, addr), Ins::new(code, Extensions::xenon()))
     }
@@ -1236,6 +1255,44 @@ mod tests {
         let mut fallthrough_vm = branches.remove(0).vm;
         let _ = step(&mut fallthrough_vm, &obj, 0x2014, 0x80E1_0050); // lwz r7, 80(r1)
         assert_eq!(fallthrough_vm.gpr[7].value, GprValue::Range { min: 0, max: 0x20, step: 1 });
+    }
+
+    #[test]
+    fn relative_byte_jump_table_base_propagates_to_bctr() {
+        let obj = make_obj_with_size(0x0, 0x400);
+        let mut vm = VM::new_from_obj(&obj);
+        vm.gpr[11].value = GprValue::Range { min: 0, max: 0x10, step: 1 };
+        vm.last_modified_cr = 0;
+        vm.cr[0].right = GprValue::Constant(0x10);
+
+        let _ = step(&mut vm, &obj, 0x0000, 0x3D80_0000); // lis r12, 0
+        let _ = step(&mut vm, &obj, 0x0004, 0x398C_0100); // addi r12, r12, 0x100 (table)
+        let _ = step(&mut vm, &obj, 0x0008, 0x7C0C_58AE); // lbzx r0, r12, r11
+        let _ = step(&mut vm, &obj, 0x000C, 0x5400_103A); // slwi r0, r0, 2
+        let _ = step(&mut vm, &obj, 0x0010, 0x3D80_0000); // lis r12, 0
+        let _ = step(&mut vm, &obj, 0x0014, 0x398C_0200); // addi r12, r12, 0x200 (base)
+        let _ = step(&mut vm, &obj, 0x0018, 0x7D8C_0214); // add r12, r12, r0
+        let _ = step(&mut vm, &obj, 0x001C, 0x7D89_03A6); // mtctr r12
+        let StepResult::Jump(BranchTarget::JumpTable {
+            jump_table_type,
+            jump_table_address,
+            size,
+        }) = step(&mut vm, &obj, 0x0020, 0x4E80_0420) // bctr
+        else {
+            panic!("expected bctr jump-table target");
+        };
+
+        assert_eq!(
+            jump_table_address,
+            RelocationTarget::Address(SectionAddress::new(0, 0x100))
+        );
+        assert_eq!(
+            jump_table_type,
+            JumpTableType::RelativeBytesTimes4(Some(RelocationTarget::Address(
+                SectionAddress::new(0, 0x200),
+            )))
+        );
+        assert_eq!(size, NonZeroU32::new(0x11));
     }
 }
 

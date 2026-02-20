@@ -42,7 +42,7 @@ New regression coverage includes:
 - Core CFA suites currently passing:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
-  - `cargo test analysis::vm::tests::` (2/2)
+  - `cargo test analysis::vm::tests::` (3/3)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
 - Shared negative fixture asset:
   - `assets/tests/jump_table_negative_snippets.txt`
@@ -52,7 +52,13 @@ Follow-up status:
 - `src/util/*` + `src/obj/*` warning backlog has been triaged and reduced.
 - `dc3-decomp` split smoke validation with local release `dtk` succeeded:
   - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke2` -> `exit=0`
-- Next track is rewrite-readiness documentation and RFC kickoff (B7/B8) with parity and rollback gates.
+- Rewrite-readiness kickoff is now active:
+  - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
+  - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
+  - New rewrite-baseline tests:
+    - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
+    - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`
+    - `analysis::cfa::tests::test_validate_invariants_rejects_overlapping_functions`
 
 ## Background: How CFA Detects Jump Tables
 

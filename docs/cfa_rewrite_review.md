@@ -187,6 +187,14 @@ Scoring: 1 (poor) to 5 (strong).
 - Acceptance criteria: RFC defines phase interfaces, confidence contracts, bounded growth policies, and rollout/rollback controls.
 - Rollback/failure signal: Shadow mode shows unresolved boundary/jump-table deltas on core corpus after planned parity milestones.
 
+### B7/B8 Kickoff Artifacts (2026-02-20)
+- VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
+- Pipeline rewrite + shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
+- Code scaffolding merged for rollout gates:
+  - CFA invariant validation hook: `AnalyzerState::validate_invariants` in `src/analysis/cfa.rs`
+  - Shadow digest determinism/diff tests in `src/analysis/cfa.rs` test module
+  - Additional VM relocation/memory-indirection baseline in `src/analysis/vm.rs` tests
+
 ## 2026-02-20 Implementation Update
 
 Implemented in this branch:
@@ -218,6 +226,15 @@ Implemented in this branch:
   - Added register-copy provenance refinement so stack origin survives rename (`or` copy path).
   - Added instruction-gap and register-rename VM tests.
 
+- **B7 in progress (RFC + baseline complete)**:
+  - Added decision-complete VM rewrite RFC (`docs/cfa_vm_rewrite_rfc.md`).
+  - Added VM baseline test for relative jump-table base propagation through `lbzx + rlwinm + add + bctr`.
+
+- **B8 in progress (RFC + shadow scaffolding complete)**:
+  - Added decision-complete pipeline/shadow RFC (`docs/cfa_pipeline_rewrite_rfc.md`).
+  - Added explicit analyzer invariant validation (`AnalyzerState::validate_invariants`) and wired it into `detect_functions`.
+  - Added shadow digest/diff determinism tests for legacy analyzer behavior.
+
 Validation run:
 - `cargo test cfa_tests`
 - `cargo test analysis::slices::tests::tail_call`
@@ -235,7 +252,7 @@ Current observed test state on this branch:
 
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
-- `cargo test analysis::vm::tests::` -> 2 passed
+- `cargo test analysis::vm::tests::` -> 3 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
 
 Open technical debt (non-blocking for this branch state):
@@ -265,8 +282,12 @@ Open technical debt (non-blocking for this branch state):
 
 ### Next Phase Queue
 
-1. **Phase E (docs consolidation + rewrite readiness)**:
-   - Keep this review doc and `docs/cfa_test_fixes.md` synchronized with test/validation outcomes.
-   - Maintain per-phase commit traceability (`implementation + docs` in the same commit).
-2. **Rewrite kickoff (after robustness phases)**:
-   - Start B7/B8 RFC workstreams (VM rewrite spike + CFA pipeline rewrite shadow plan) with explicit parity/rollback gates.
+1. **R1: VM2 interface extraction (B7 implementation start)**:
+   - Add internal VM2 value/provenance types and transfer-function skeleton in a parallel module.
+   - Keep legacy VM as source of truth; no behavior switch.
+2. **R2: CFA phase-split scaffolding (B8 implementation start)**:
+   - Introduce internal phase boundaries for seed discovery, slice exploration, finalize, and apply.
+   - Route legacy analyzer through the same phase interfaces first.
+3. **R3: Shadow corpus and diff gating**:
+   - Expand deterministic shadow digest tests from synthetic unit tests to selected real CFA fixtures.
+   - Gate candidate rewrite phases on zero unresolved high-severity diffs.

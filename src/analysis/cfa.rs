@@ -5,7 +5,7 @@ use std::{
     ops::{Add, AddAssign, BitAnd, Sub},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use itertools::Itertools;
 use powerpc::Opcode;
 
@@ -405,7 +405,77 @@ impl AnalyzerState {
         // Merge tail blocks: small functions that are actually out-of-line code
         // from the preceding function (e.g., loop exit paths placed after .pdata end)
         self.merge_tail_blocks(obj)?;
+        self.validate_invariants(obj)
+            .context("CFA invariant validation failed after detect_functions")?;
 
+        Ok(())
+    }
+
+    /// Validate core post-analysis invariants used by rewrite shadow/parity checks.
+    pub fn validate_invariants(&self, obj: &ObjInfo) -> Result<()> {
+        let mut prev: Option<(SectionAddress, SectionAddress)> = None;
+        for (&start, info) in &self.functions {
+            let Some(end) = info.end else { continue };
+            ensure!(
+                matches!(obj.sections.get(start.section), Some(s) if s.kind == ObjSectionKind::Code),
+                "Function start {} is not in a code section",
+                start
+            );
+            ensure!(
+                start.section == end.section,
+                "Function {} crosses sections (end {})",
+                start,
+                end
+            );
+            ensure!(end.address > start.address, "Function {} has non-positive size", start);
+            let section = &obj.sections[start.section];
+            ensure!(
+                section.contains_range(start.address..end.address),
+                "Function {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
+                start.address,
+                end.address,
+                section.name,
+                section.address,
+                section.address + section.size
+            );
+            if let Some((prev_start, prev_end)) = prev {
+                if prev_start.section == start.section {
+                    ensure!(
+                        start.address >= prev_end.address,
+                        "Overlapping functions in section {}: {}..{} and {}..{}",
+                        start.section,
+                        prev_start,
+                        prev_end,
+                        start,
+                        end
+                    );
+                }
+            }
+            prev = Some((start, end));
+        }
+
+        for (&addr, &size) in &self.jump_tables {
+            ensure!(size > 0, "Jump table at {} has zero size", addr);
+            let end = addr
+                .address
+                .checked_add(size)
+                .ok_or_else(|| anyhow!("Jump table size overflow at {}", addr))?;
+            let section = &obj.sections[addr.section];
+            ensure!(
+                section.contains_range(addr.address..end),
+                "Jump table {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
+                addr.address,
+                end,
+                section.name,
+                section.address,
+                section.address + section.size
+            );
+            ensure!(
+                section.kind != ObjSectionKind::Bss,
+                "Jump table at {} cannot be in BSS",
+                addr
+            );
+        }
         Ok(())
     }
 
@@ -981,7 +1051,7 @@ pub fn locate_sda_bases(obj: &mut ObjInfo) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::analysis::slices::FunctionSlices;
-    use crate::obj::{ObjSection, ObjSectionKind};
+    use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind};
 
     /// Helper to build a minimal ObjSection with hand-crafted PPC instructions.
     /// `base_addr` is the virtual address of the section start.
@@ -997,6 +1067,16 @@ mod tests {
             align: 4,
             ..Default::default()
         }
+    }
+
+    fn make_obj(base_addr: u32, instructions: &[u32]) -> ObjInfo {
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "shadow-cfa-test".into(),
+            vec![],
+            vec![make_code_section(base_addr, instructions)],
+        )
     }
 
     // PPC instruction encoding helpers
@@ -1021,6 +1101,56 @@ mod tests {
 
     /// Encode `bctr` (branch to count register)
     const BCTR: u32 = 0x4E800420;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ShadowDigest {
+        functions: std::collections::BTreeMap<SectionAddress, Option<SectionAddress>>,
+        jump_tables: std::collections::BTreeMap<SectionAddress, u32>,
+    }
+
+    fn shadow_digest(state: &AnalyzerState) -> ShadowDigest {
+        ShadowDigest {
+            functions: state.functions.iter().map(|(&addr, info)| (addr, info.end)).collect(),
+            jump_tables: state.jump_tables.clone(),
+        }
+    }
+
+    fn diff_shadow_digests(expected: &ShadowDigest, actual: &ShadowDigest) -> Vec<String> {
+        let mut diffs = Vec::new();
+        let function_keys = expected
+            .functions
+            .keys()
+            .chain(actual.functions.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for key in function_keys {
+            let e = expected.functions.get(&key);
+            let a = actual.functions.get(&key);
+            if e != a {
+                diffs.push(format!(
+                    "function mismatch at {key}: expected {:?}, actual {:?}",
+                    e, a
+                ));
+            }
+        }
+        let jump_keys = expected
+            .jump_tables
+            .keys()
+            .chain(actual.jump_tables.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for key in jump_keys {
+            let e = expected.jump_tables.get(&key);
+            let a = actual.jump_tables.get(&key);
+            if e != a {
+                diffs.push(format!(
+                    "jump-table mismatch at {key}: expected {:?}, actual {:?}",
+                    e, a
+                ));
+            }
+        }
+        diffs
+    }
 
     /// Test FunctionInfo state detection methods
     #[test]
@@ -1189,6 +1319,85 @@ mod tests {
         // Verify the end comes from slices
         assert!(info.is_analyzed());
         assert_eq!(info.end, slices.end());
+    }
+
+    /// Shadow harness sanity: identical digests must produce no diffs.
+    #[test]
+    fn test_shadow_digest_diff_is_empty_for_identical_state() {
+        let mut state = AnalyzerState::default();
+        let func = SectionAddress::new(0, 0x1000);
+        state.functions.insert(func, FunctionInfo {
+            analyzed: true,
+            end: Some(func + 0x20),
+            slices: Some(FunctionSlices::default()),
+        });
+        state.jump_tables.insert(SectionAddress::new(0, 0x1040), 0x10);
+
+        let digest = shadow_digest(&state);
+        assert!(
+            diff_shadow_digests(&digest, &digest).is_empty(),
+            "identical shadow digests should not differ"
+        );
+    }
+
+    /// Shadow parity baseline: current analyzer should be deterministic on repeated runs.
+    #[test]
+    fn test_shadow_digest_is_deterministic_for_legacy_analyzer() {
+        let obj = make_obj(0x1000, &[NOP, BLR, NOP, NOP, NOP, NOP]);
+        let start = SectionAddress::new(0, 0x1000);
+
+        let mut state_a = AnalyzerState::new(std::collections::BTreeMap::new());
+        state_a.functions.insert(start, FunctionInfo::default());
+        state_a
+            .process_function_at(&obj, start)
+            .expect("first process_function_at run failed");
+        state_a
+            .validate_invariants(&obj)
+            .expect("first invariant validation failed");
+
+        let mut state_b = AnalyzerState::new(std::collections::BTreeMap::new());
+        state_b.functions.insert(start, FunctionInfo::default());
+        state_b
+            .process_function_at(&obj, start)
+            .expect("second process_function_at run failed");
+        state_b
+            .validate_invariants(&obj)
+            .expect("second invariant validation failed");
+
+        let digest_a = shadow_digest(&state_a);
+        let digest_b = shadow_digest(&state_b);
+        let diffs = diff_shadow_digests(&digest_a, &digest_b);
+        assert!(
+            diffs.is_empty(),
+            "legacy analyzer should be deterministic, diffs: {diffs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_invariants_rejects_overlapping_functions() {
+        let obj = make_obj(0x1000, &[NOP, BLR, NOP, NOP, NOP, NOP]);
+        let mut state = AnalyzerState::default();
+
+        let a = SectionAddress::new(0, 0x1000);
+        let b = SectionAddress::new(0, 0x1008);
+        state.functions.insert(a, FunctionInfo {
+            analyzed: true,
+            end: Some(SectionAddress::new(0, 0x1010)),
+            slices: Some(FunctionSlices::default()),
+        });
+        state.functions.insert(b, FunctionInfo {
+            analyzed: true,
+            end: Some(SectionAddress::new(0, 0x1018)),
+            slices: Some(FunctionSlices::default()),
+        });
+
+        let err = state
+            .validate_invariants(&obj)
+            .expect_err("overlapping functions should fail invariant checks");
+        assert!(
+            format!("{err:#}").contains("Overlapping functions"),
+            "expected overlap error, got: {err:#}"
+        );
     }
 
     // =========================================================================
