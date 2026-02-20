@@ -86,12 +86,14 @@ Follow-up status:
     - `analysis::cfa::AnalyzerState::detect_functions_with_shadow_config` now computes live
       phase-checkpoint and pipeline-digest deltas when shadow gates are enabled.
     - New conservative fallback reason: `PipelineDigestMismatch`.
-    - VM2 runtime delta remains temporarily fixed at `0` until VM2 candidate execution wiring lands.
+    - VM2 runtime delta is now sampled live via bounded VM shadow metrics from seed-function linear traces.
     - Shadow gate env controls are available:
       - `DTK_CFA_ENABLE_VM2_SHADOW`
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
       - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
       - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
+      - `DTK_CFA_VM_SHADOW_MAX_FUNCTIONS`
+      - `DTK_CFA_VM_SHADOW_MAX_STEPS`
   - Candidate pipeline lane update:
     - Added `analysis::pipeline::CandidatePipelineEngine` (parity-mirrored implementation stage).
     - Runtime shadow compares legacy vs candidate pipeline engines.
@@ -100,6 +102,12 @@ Follow-up status:
     - Runtime env-gated smoke:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
       - Result: `20/20` pass.
+    - VM-gated env smoke:
+      - `DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=4 DTK_CFA_VM_SHADOW_MAX_STEPS=64 cargo test cfa_tests`
+      - Result: `20/20` pass.
+    - Combined-gates real-XEX smoke:
+      - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-<timestamp>`
+      - Result: `rc=0`, `4448` files, `2223` `.obj`.
   - New VM2 shadow tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`

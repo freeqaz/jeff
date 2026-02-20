@@ -342,15 +342,33 @@ Open technical debt (non-blocking for this branch state):
     - final digest deltas from `PipelineDigest::diff_summary(...)`
   - Fallback routing is now driven by live measured deltas, not only synthetic test injection.
   - Conservative guardrail: any final digest mismatch adds `PipelineDigestMismatch` fallback reason.
-  - Current VM2 runtime delta is explicitly `0` until VM2 candidate execution is wired.
   - Shadow gate env controls now supported for real-XEX parity runs:
     - `DTK_CFA_ENABLE_VM2_SHADOW` (`true/false`, `1/0`, etc.)
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
     - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
     - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
+    - `DTK_CFA_VM_SHADOW_MAX_FUNCTIONS`
+    - `DTK_CFA_VM_SHADOW_MAX_STEPS`
   - Env-gated validation pass:
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
     - Result: `20/20` passing with runtime shadow path enabled.
+
+- **Phase E2 partial complete (R7 VM metric wiring)**: VM shadow delta metric now measured at runtime.
+  - Added bounded runtime VM shadow sampling API in `analysis::vm2`:
+    - `runtime_vm_shadow_summary(...)`
+    - `VmRuntimeShadowConfig`
+  - `AnalyzerState::detect_functions_with_shadow_config` now computes `vm_shadow_deltas` from
+    sampled seed-function linear VM steps when VM shadow gating is enabled.
+  - Added regression tests:
+    - `analysis::vm2::tests::runtime_vm_shadow_summary_is_zero_for_legacy_mapped_candidate`
+    - `analysis::vm2::tests::runtime_vm_shadow_summary_respects_zero_limits`
+    - `analysis::cfa::tests::test_detect_functions_with_shadow_config_vm_gate_uses_runtime_vm_shadow_deltas`
+  - Env-gated VM shadow smoke:
+    - `DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=4 DTK_CFA_VM_SHADOW_MAX_STEPS=64 cargo test cfa_tests`
+    - Result: `20/20` passing.
+  - Real-XEX smoke with both shadow gates enabled:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-<timestamp>`
+    - Result: `rc=0`, `4448` files, `2223` `.obj`.
 
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
@@ -388,7 +406,7 @@ Open technical debt (non-blocking for this branch state):
    - Implement first true candidate phase divergence (seed or slice stage) inside `CandidatePipelineEngine`.
    - Keep legacy analyzer default unless checkpoint + digest parity remain clean.
 2. **R7 implementation: operational fallback routing (B7/B8)**:
-   - Wire VM2 runtime shadow metrics into fallback decisions (replace temporary `vm_shadow_deltas=0`).
+   - Replace mapped-legacy VM shadow baseline with true VM2-executed runtime deltas.
    - Emit structured mismatch logs with actionable fixture-level summaries.
 3. **Real-XEX parity proof loop**:
    - Run shadow parity against real XEX workflows in `~/code/milohax/dc3-decomp` and the executables repo.

@@ -4,10 +4,12 @@ use std::{
 };
 
 use crate::analysis::{
+    disassemble,
     cfa::SectionAddress,
-    vm::{Cr, Gpr, GprSourceLocation, GprValue, JumpTableType, VM},
+    vm::{Cr, Gpr, GprSourceLocation, GprValue, JumpTableType, StepResult, VM},
     RelocationTarget,
 };
+use crate::obj::{ObjInfo, ObjSectionKind};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Confidence2 {
@@ -306,6 +308,24 @@ impl VmCorpusShadowReport {
     }
 }
 
+pub const DEFAULT_RUNTIME_VM_SHADOW_MAX_FUNCTIONS: usize = 16;
+pub const DEFAULT_RUNTIME_VM_SHADOW_MAX_STEPS_PER_FUNCTION: usize = 128;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct VmRuntimeShadowConfig {
+    pub max_functions: usize,
+    pub max_steps_per_function: usize,
+}
+
+impl Default for VmRuntimeShadowConfig {
+    fn default() -> Self {
+        Self {
+            max_functions: DEFAULT_RUNTIME_VM_SHADOW_MAX_FUNCTIONS,
+            max_steps_per_function: DEFAULT_RUNTIME_VM_SHADOW_MAX_STEPS_PER_FUNCTION,
+        }
+    }
+}
+
 impl VmShadowDiffReport {
     fn push(
         &mut self,
@@ -405,6 +425,51 @@ impl VmShadowDiffReport {
     }
 }
 
+pub fn runtime_vm_shadow_summary(
+    obj: &ObjInfo,
+    function_starts: &[SectionAddress],
+    config: VmRuntimeShadowConfig,
+) -> VmShadowDiffSummary {
+    if config.max_functions == 0 || config.max_steps_per_function == 0 {
+        return VmShadowDiffSummary::default();
+    }
+
+    let mut total = VmShadowDiffSummary::default();
+    for &start in function_starts.iter().take(config.max_functions) {
+        let Some(section) = obj.sections.get(start.section) else {
+            continue;
+        };
+        if section.kind != ObjSectionKind::Code || !section.contains(start.address) {
+            continue;
+        }
+
+        let mut vm = VM::new_from_obj(obj);
+        let mut addr = start;
+        for _ in 0..config.max_steps_per_function {
+            if !section.contains(addr.address) {
+                break;
+            }
+            let Some(ins) = disassemble(section, addr.address) else {
+                break;
+            };
+            let result = vm.step(obj, addr, ins);
+
+            // Candidate runtime shadow currently maps from the legacy VM state.
+            let candidate = Vm2::from_legacy_vm(&vm);
+            let diff = VmShadowDiffReport::from_legacy_pair(&vm, &candidate);
+            total.accumulate(&diff.summary);
+
+            match result {
+                StepResult::Continue | StepResult::LoadStore { .. } | StepResult::Branch(_) => {
+                    addr += 4;
+                }
+                StepResult::Illegal | StepResult::Jump(_) => break,
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -480,6 +545,41 @@ mod tests {
         assert_eq!(vm.read_stack_slot(0x50), Some(&fact));
     }
 
+    #[test]
+    fn runtime_vm_shadow_summary_is_zero_for_legacy_mapped_candidate() {
+        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x4E80_0020]);
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let summary = runtime_vm_shadow_summary(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+        );
+        assert_eq!(
+            summary.total(),
+            0,
+            "legacy-vs-mapped candidate runtime shadow should start as zero-delta baseline"
+        );
+    }
+
+    #[test]
+    fn runtime_vm_shadow_summary_respects_zero_limits() {
+        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x4E80_0020]);
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let summary_zero_funcs = runtime_vm_shadow_summary(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 0, max_steps_per_function: 16 },
+        );
+        assert_eq!(summary_zero_funcs.total(), 0);
+
+        let summary_zero_steps = runtime_vm_shadow_summary(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 0 },
+        );
+        assert_eq!(summary_zero_steps.total(), 0);
+    }
+
     fn make_obj_with_size(base: u32, size: usize) -> ObjInfo {
         let section = ObjSection {
             name: ".text".into(),
@@ -487,6 +587,26 @@ mod tests {
             address: base as u64,
             size: size as u64,
             data: vec![0u8; size],
+            align: 4,
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "vm2-shadow-test".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
+    fn make_obj_with_words(base: u32, words: &[u32]) -> ObjInfo {
+        let data: Vec<u8> = words.iter().flat_map(|word| word.to_be_bytes()).collect();
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base as u64,
+            size: data.len() as u64,
+            data,
             align: 4,
             ..Default::default()
         };

@@ -20,6 +20,7 @@ use crate::{
         },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
+        vm2::{runtime_vm_shadow_summary, VmRuntimeShadowConfig},
         RelocationTarget,
     },
     obj::{
@@ -142,6 +143,8 @@ pub(crate) const ENV_ENABLE_VM2_SHADOW: &str = "DTK_CFA_ENABLE_VM2_SHADOW";
 pub(crate) const ENV_ENABLE_PIPELINE_SHADOW: &str = "DTK_CFA_ENABLE_PIPELINE_SHADOW";
 pub(crate) const ENV_MAX_VM_SHADOW_DELTAS: &str = "DTK_CFA_MAX_VM_SHADOW_DELTAS";
 pub(crate) const ENV_MAX_PHASE_CHECKPOINT_DELTAS: &str = "DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS";
+pub(crate) const ENV_VM_SHADOW_MAX_FUNCTIONS: &str = "DTK_CFA_VM_SHADOW_MAX_FUNCTIONS";
+pub(crate) const ENV_VM_SHADOW_MAX_STEPS: &str = "DTK_CFA_VM_SHADOW_MAX_STEPS";
 
 fn parse_shadow_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -577,19 +580,46 @@ impl AnalyzerState {
             return Ok(decision);
         }
 
-        // VM2 candidate execution path is not yet wired into runtime CFA.
-        // Keep metric explicit so fallback thresholds are exercised with live phase data.
-        let vm_shadow_deltas = 0usize;
-
         let skip_ranges = self.skip_ranges.clone();
         let mut legacy_pipeline = LegacyPipelineEngine::new(skip_ranges.clone());
         let legacy_report = legacy_pipeline.run_with_report(obj)?;
         let legacy_digest = legacy_report.digest.clone();
+        let legacy_seed_addresses =
+            legacy_report.seed_discovery.seeds.iter().map(|seed| seed.address).collect_vec();
 
         // Candidate path is isolated behind its own engine type for staged phase rollout.
         let mut candidate_pipeline = CandidatePipelineEngine::new(skip_ranges);
         let candidate_report = candidate_pipeline.run_with_report(obj)?;
         let candidate_digest = candidate_report.digest.clone();
+
+        let vm_shadow_deltas = if gate_config.enable_vm2_shadow {
+            let default_config = VmRuntimeShadowConfig::default();
+            let vm_shadow_config = VmRuntimeShadowConfig {
+                max_functions: read_shadow_usize_env(
+                    ENV_VM_SHADOW_MAX_FUNCTIONS,
+                    default_config.max_functions,
+                ),
+                max_steps_per_function: read_shadow_usize_env(
+                    ENV_VM_SHADOW_MAX_STEPS,
+                    default_config.max_steps_per_function,
+                ),
+            };
+            let vm_shadow_summary =
+                runtime_vm_shadow_summary(obj, &legacy_seed_addresses, vm_shadow_config);
+            log::debug!(
+                "VM shadow summary: total={} (presence={}, value={}, provenance={}, confidence={}) with max_functions={} max_steps={}",
+                vm_shadow_summary.total(),
+                vm_shadow_summary.presence,
+                vm_shadow_summary.value,
+                vm_shadow_summary.provenance,
+                vm_shadow_summary.confidence,
+                vm_shadow_config.max_functions,
+                vm_shadow_config.max_steps_per_function
+            );
+            vm_shadow_summary.total()
+        } else {
+            0
+        };
 
         let phase_checkpoint_summary = compare_phase_checkpoints(&legacy_report, &candidate_report);
         let phase_checkpoint_deltas = phase_checkpoint_summary.total();
@@ -1699,6 +1729,25 @@ mod tests {
             !state.functions.is_empty(),
             "state should be populated by selected candidate pipeline result"
         );
+    }
+
+    #[test]
+    fn test_detect_functions_with_shadow_config_vm_gate_uses_runtime_vm_shadow_deltas() {
+        let obj = make_obj(0x1000, &[NOP, BLR]);
+        let mut state = AnalyzerState::new(std::collections::BTreeMap::new());
+        let gate_config = CandidateShadowGateConfig {
+            enable_vm2_shadow: true,
+            enable_pipeline_shadow: false,
+            max_vm_shadow_deltas: 0,
+            max_phase_checkpoint_deltas: 0,
+        };
+        let decision = state
+            .detect_functions_with_shadow_config(&obj, gate_config)
+            .expect("vm-shadow-gated detect_functions should succeed");
+        assert_eq!(decision.vm_shadow_deltas, 0);
+        assert_eq!(decision.phase_checkpoint_deltas, 0);
+        assert!(!decision.should_fallback());
+        assert!(!state.functions.is_empty(), "state should be populated after analysis");
     }
 
     #[test]
