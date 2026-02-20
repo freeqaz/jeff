@@ -1428,14 +1428,22 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                     }
                     ObjRelocKind::PpcRel24 => {
                         // REL24 (bl/b): displacement in bits [25:2].
-                        // Preserve opcode [31:26] and AA/LK [1:0].
+                        // MSVC PPC linker convention: the linker computes
+                        //   new_disp = (S + A) - section_start_VA
+                        // where A is the existing instruction displacement (addend).
+                        // The compiler sets A = -(offset_in_section) so that:
+                        //   CPU target = instruction_VA + new_disp
+                        //              = (section_start + off) + (S - off - section_start)
+                        //              = S  (correct)
+                        // We must replicate this convention for split objects.
                         if offset + 4 <= data.len() {
                             let insn = u32::from_be_bytes(
                                 data[offset..offset + 4].try_into().unwrap(),
                             );
-                            let zeroed = insn & 0xFC000003;
+                            let neg_offset = (-(offset as i32)) as u32;
+                            let new_insn = (insn & 0xFC000003) | (neg_offset & 0x03FFFFFC);
                             data[offset..offset + 4]
-                                .copy_from_slice(&zeroed.to_be_bytes());
+                                .copy_from_slice(&new_insn.to_be_bytes());
                         }
                     }
                     _ => {}
@@ -1467,7 +1475,30 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                 let start = offset as usize;
                 let end = start + size as usize;
                 if end <= data.len() {
-                    let comdat_data = &data[start..end];
+                    let mut comdat_data = data[start..end].to_vec();
+                    // Re-fix REL24 displacements for COMDAT-relative offsets.
+                    // The parent fixup (above) set displacement = -(offset_in_parent),
+                    // but COMDAT sections need -(offset_in_comdat).
+                    for (raddr, reloc) in sect.relocations.iter() {
+                        let abs_off = raddr as usize;
+                        if abs_off >= start && abs_off < end {
+                            if matches!(reloc.kind, ObjRelocKind::PpcRel24) {
+                                let comdat_off = abs_off - start;
+                                if comdat_off + 4 <= comdat_data.len() {
+                                    let insn = u32::from_be_bytes(
+                                        comdat_data[comdat_off..comdat_off + 4]
+                                            .try_into()
+                                            .unwrap(),
+                                    );
+                                    let neg_offset = (-(comdat_off as i32)) as u32;
+                                    let new_insn =
+                                        (insn & 0xFC000003) | (neg_offset & 0x03FFFFFC);
+                                    comdat_data[comdat_off..comdat_off + 4]
+                                        .copy_from_slice(&new_insn.to_be_bytes());
+                                }
+                            }
+                        }
+                    }
                     // Use .text$x for __unwind$, section-appropriate $dup for others
                     let sym_name = &obj.symbols[sym_idx].name;
                     let (comdat_sect_name, comdat_sect_kind) = if sym_name.starts_with("__unwind$") {
@@ -1487,7 +1518,7 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                     );
                     // Ensure the section has a section symbol (required by COFF COMDAT)
                     cur_coff.section_symbol(comdat_sect_id);
-                    cur_coff.append_section_data(comdat_sect_id, comdat_data, sect.align.max(4));
+                    cur_coff.append_section_data(comdat_sect_id, &comdat_data, sect.align.max(4));
                     comdat_extracted_sections.insert((idx, offset), comdat_sect_id);
                     // Zero out COMDAT bytes in parent section to prevent duplication.
                     // The authoritative copy lives in the COMDAT section; parent section

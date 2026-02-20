@@ -152,6 +152,8 @@ Follow-up status:
   - Active linking/COFF stability update:
     - `src/util/xex.rs` sanitizes relocation-site addends for `Absolute` and `PpcRel24` before
       COFF emission.
+    - `PpcRel24` handling now writes split-linker-compatible addends (`-(offset_in_section)`),
+      and re-fixes extracted COMDAT copies to use COMDAT-relative offsets.
     - `src/util/split.rs` excludes `__savegprlr_*` and `__restgprlr_*` from COMDAT extraction to
       preserve CRT fall-through semantics.
     - Validation: `cargo test util::xex::tests::` remains green (`5/5`).
