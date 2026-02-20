@@ -543,10 +543,21 @@ Open technical debt (non-blocking for this branch state):
     - Determinism check (same commit, second run):
       - no non-trivial diffs (`config.json`/`dep` excluded).
   - Latest debug parity run status (current branch tip):
-    - `DTK_CFA_PIPELINE_MODE=shadow DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-r8-<timestamp>`
-    - Result: `status=101`, panic in `src/analysis/tracker.rs:611` (`Relocation already exists ...`).
-    - Baseline confirmation: plain split run (no shadow env) also hits the same panic.
-    - Current interpretation: relocation-tracker issue is pre-existing and not mode-specific; keep queued as real-XEX blocker.
+    - Tracker duplicate-relocation panic in `src/analysis/tracker.rs` is fixed (now trace + continue in debug/release).
+    - New regression test: `analysis::tracker::tests::test_process_data_tolerates_existing_source_relocation`.
+    - Baseline debug run:
+      - `target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-baseline-r9-<timestamp>`
+      - Result: `status=0`, `4448` total files, `2223` `.obj` files.
+    - Shadow debug run:
+      - `DTK_CFA_PIPELINE_MODE=shadow DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-r9-<timestamp>`
+      - Result: `status=0`, `4448` total files, `2223` `.obj` files.
+    - Candidate debug run:
+      - `DTK_CFA_PIPELINE_MODE=candidate DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-candidate-r9-<timestamp>`
+      - Result: `status=0`, `4448` total files, `2223` `.obj` files.
+    - Baseline vs shadow diff:
+      - only `config.json` and `dep` differ; no other output-tree deltas.
+    - Baseline vs candidate diff:
+      - only `config.json` and `dep` differ; no other output-tree deltas.
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
@@ -571,9 +582,9 @@ Open technical debt (non-blocking for this branch state):
 2. **R7 native VM2 coverage continuation**:
    - Expand parity-safe native handling into the jump-table-heavy path (`rlwinm`, indexed loads, selective branch facts).
    - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
-3. **Real-XEX blocker burn-down**:
-   - Triage/fix `tracker.rs` relocation duplicate panic (`Relocation already exists ...`) observed in both baseline and shadow runs.
-   - Re-establish DC3 split `rc=0` parity smoke before further cutover promotion.
+3. **Real-XEX workflow promotion**:
+   - Run `legacy`/`shadow`/`candidate` split comparisons on DC3 and sample executable-library XEX files.
+   - Keep parity checks strict (exclude only `config.json`/`dep`) before default-mode promotion.
 
 ### Immediate Execution Plan (Kickoff: 2026-02-20, updated post-Phase D)
 
@@ -582,10 +593,10 @@ Open technical debt (non-blocking for this branch state):
 2. **Sprint F2 (native coverage growth)**:
    - Land the next native VM2 opcode tranche with bridge-safe tests and coverage metrics.
 3. **Sprint F3 (real-world stability gate)**:
-   - Resolve relocation-tracker split panic and restore end-to-end split parity evidence.
+   - Expand real-XEX mode parity evidence (`legacy`/`shadow`/`candidate`) and document promotion criteria.
 
 Exit criteria for next implementation pass:
 
 - Candidate execution-mode routing is validated on real workloads.
 - Native VM2 shadow coverage improves without increasing unresolved diff counts.
-- DC3 split panic blocker has a documented fix path (or landed fix) with verification evidence.
+- Real-XEX parity evidence is maintained across `legacy`/`shadow`/`candidate` (excluding `config.json`/`dep` run artifacts).

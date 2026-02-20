@@ -58,11 +58,18 @@ Follow-up status:
   - Revalidated post COFF/COMDAT edits:
     - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke3` -> `exit=0`
 - Current debug parity run status:
-  - `~/code/milohax/jeff/target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-baseline-r8-<timestamp>` -> `exit=101`
-  - panic: `src/analysis/tracker.rs:611` (`Relocation already exists ...`)
-  - shadow-mode confirmation:
-    - `DTK_CFA_PIPELINE_MODE=shadow ... dtk xex split ...` -> same panic.
-  - Interpretation: this is currently a real-XEX blocker, but not specific to new cutover-mode routing.
+  - Tracker duplicate-relocation panic is fixed in `src/analysis/tracker.rs`.
+  - New regression test: `analysis::tracker::tests::test_process_data_tolerates_existing_source_relocation`.
+  - Baseline debug split:
+    - `~/code/milohax/jeff/target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-baseline-r9-<timestamp>` -> `exit=0`
+  - Shadow debug split:
+    - `DTK_CFA_PIPELINE_MODE=shadow DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 ~/code/milohax/jeff/target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-r9-<timestamp>` -> `exit=0`
+  - Candidate debug split:
+    - `DTK_CFA_PIPELINE_MODE=candidate DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 ~/code/milohax/jeff/target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-candidate-r9-<timestamp>` -> `exit=0`
+  - Baseline vs shadow diff (`diff -qr`):
+    - only `config.json` and `dep` differ; no other output-tree deltas.
+  - Baseline vs candidate diff (`diff -qr`):
+    - only `config.json` and `dep` differ; no other output-tree deltas.
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
