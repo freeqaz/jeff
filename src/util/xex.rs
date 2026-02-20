@@ -1408,17 +1408,73 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
             continue;
         }
 
-        // Fix ADDR32 relocation sites: replace stale XEX absolute VAs with correct addend.
-        // COFF IMAGE_REL_PPC_ADDR32 is additive (result = symbol_VA + stored_value), so the
-        // stored value must be the addend (usually 0), not the original XEX VA.
+        // Fix relocation sites: replace stale XEX values with correct addends.
+        // COFF relocations are additive — the linker reads the existing value at each
+        // relocation site and uses it as an addend. If we leave the original XEX values
+        // (absolute VAs, branch displacements, address immediates) in place, they become
+        // spurious addends that corrupt the linked output.
         let mut data = sect.data.clone();
         if sect.kind != ObjSectionKind::Bss {
             for (addr, reloc) in sect.relocations.iter() {
-                if reloc.kind == ObjRelocKind::Absolute {
-                    let offset = addr as usize;
-                    if offset + 4 <= data.len() {
-                        let addend = reloc.addend as i32;
-                        data[offset..offset + 4].copy_from_slice(&addend.to_be_bytes());
+                let offset = addr as usize;
+                match reloc.kind {
+                    ObjRelocKind::Absolute => {
+                        // ADDR32: entire 4-byte value is the address/addend
+                        if offset + 4 <= data.len() {
+                            let addend = reloc.addend as i32;
+                            data[offset..offset + 4]
+                                .copy_from_slice(&addend.to_be_bytes());
+                        }
+                    }
+                    ObjRelocKind::PpcRel24 => {
+                        // REL24 (bl/b): displacement in bits [25:2].
+                        // Preserve opcode [31:26] and AA/LK [1:0].
+                        if offset + 4 <= data.len() {
+                            let insn = u32::from_be_bytes(
+                                data[offset..offset + 4].try_into().unwrap(),
+                            );
+                            let zeroed = insn & 0xFC000003;
+                            data[offset..offset + 4]
+                                .copy_from_slice(&zeroed.to_be_bytes());
+                        }
+                    }
+                    ObjRelocKind::PpcRel14 => {
+                        // REL14 (bc): displacement in bits [15:2].
+                        // Preserve opcode/BO/BI [31:16] and AA/LK [1:0].
+                        if offset + 4 <= data.len() {
+                            let insn = u32::from_be_bytes(
+                                data[offset..offset + 4].try_into().unwrap(),
+                            );
+                            let zeroed = insn & 0xFFFF0003;
+                            data[offset..offset + 4]
+                                .copy_from_slice(&zeroed.to_be_bytes());
+                        }
+                    }
+                    ObjRelocKind::PpcAddr16Ha
+                    | ObjRelocKind::PpcAddr16Hi
+                    | ObjRelocKind::PpcAddr16Lo => {
+                        // ADDR16 (lis/addi/ori): immediate in bits [15:0].
+                        // Preserve opcode and register fields [31:16].
+                        if offset + 4 <= data.len() {
+                            let insn = u32::from_be_bytes(
+                                data[offset..offset + 4].try_into().unwrap(),
+                            );
+                            let zeroed = insn & 0xFFFF0000;
+                            data[offset..offset + 4]
+                                .copy_from_slice(&zeroed.to_be_bytes());
+                        }
+                    }
+                    ObjRelocKind::PpcEmbSda21 => {
+                        // SDA21: immediate in bits [20:0].
+                        // Preserve opcode/register [31:21].
+                        if offset + 4 <= data.len() {
+                            let insn = u32::from_be_bytes(
+                                data[offset..offset + 4].try_into().unwrap(),
+                            );
+                            let zeroed = insn & 0xFFE00000;
+                            data[offset..offset + 4]
+                                .copy_from_slice(&zeroed.to_be_bytes());
+                        }
                     }
                 }
             }

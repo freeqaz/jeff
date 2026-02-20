@@ -437,6 +437,52 @@ impl CandidatePipelineEngine {
             .map(|address| FunctionSeed { address, source: classify_seed_source(obj, address) })
             .collect()
     }
+
+    fn candidate_slice_exploration(
+        &mut self,
+        obj: &ObjInfo,
+        seed: &SeedDiscoveryOutput,
+    ) -> Result<SliceExplorationOutput> {
+        let seed_addrs = seed.seeds.iter().map(|entry| entry.address).collect::<Vec<_>>();
+        for &addr in &seed_addrs {
+            self.state.process_function_at(obj, addr)?;
+
+            // Keep parity with legacy seeded-known-function checks.
+            if let Some(value) = obj.known_functions.get(&addr) {
+                if let Some(func) = self.state.functions.get(&addr) {
+                    if let Some(known_size) = value {
+                        let known_end = addr + *known_size;
+                        assert_eq!(
+                            func.end.is_some(),
+                            true,
+                            "Function at {} has no detected end rather than known end {}. There must be an error in processing!",
+                            addr,
+                            known_end
+                        );
+                        let func_end = func.end.unwrap();
+                        if func_end < known_end {
+                            panic!(
+                                "Function at {} has known end addr {}, but during processing, ending was found to be {} (smaller than expected)!",
+                                addr,
+                                known_end,
+                                func_end
+                            );
+                        } else if func_end != known_end {
+                            log::info!(
+                                "Candidate pipeline function at {} extends beyond pdata end {} to {} (likely tail block inclusion)",
+                                addr,
+                                known_end,
+                                func_end
+                            );
+                        }
+                    }
+                } else {
+                    unreachable!();
+                }
+            }
+        }
+        Ok(SliceExplorationOutput { processed_seed_count: seed_addrs.len() })
+    }
 }
 
 impl CfaPipelineEngine for CandidatePipelineEngine {
@@ -449,9 +495,7 @@ impl CfaPipelineEngine for CandidatePipelineEngine {
         obj: &ObjInfo,
         seed: &SeedDiscoveryOutput,
     ) -> Result<SliceExplorationOutput> {
-        let seed_addrs = seed.seeds.iter().map(|entry| entry.address).collect::<Vec<_>>();
-        self.state.phase_slice_seeded_functions(obj, &seed_addrs)?;
-        Ok(SliceExplorationOutput { processed_seed_count: seed_addrs.len() })
+        self.candidate_slice_exploration(obj, seed)
     }
 
     fn phase_finalization(&mut self, obj: &ObjInfo) -> Result<FinalizationOutput> {
@@ -840,6 +884,40 @@ mod tests {
         assert_eq!(
             candidate_functions, legacy_functions,
             "candidate seed phase should materialize the same initial function map"
+        );
+    }
+
+    #[test]
+    fn candidate_slice_phase_matches_legacy_slice_phase() {
+        let mut obj = make_obj(0x1000, &[NOP, BLR, NOP, BLR]);
+        obj.known_functions.insert(SectionAddress::new(0, 0x1000), Some(8));
+
+        let mut legacy = LegacyPipelineEngine::new(BTreeMap::new());
+        let legacy_seed = legacy
+            .phase_seed_discovery(&obj)
+            .expect("legacy seed phase should succeed");
+        let legacy_slice = legacy
+            .phase_slice_exploration(&obj, &legacy_seed)
+            .expect("legacy slice phase should succeed");
+        let legacy_digest = legacy.digest();
+
+        let mut candidate = CandidatePipelineEngine::new(BTreeMap::new());
+        let candidate_seed = candidate
+            .phase_seed_discovery(&obj)
+            .expect("candidate seed phase should succeed");
+        let candidate_slice = candidate
+            .phase_slice_exploration(&obj, &candidate_seed)
+            .expect("candidate slice phase should succeed");
+        let candidate_digest = candidate.digest();
+
+        assert_eq!(
+            candidate_slice, legacy_slice,
+            "candidate slice output should match legacy during parity stage"
+        );
+        assert_eq!(
+            candidate_digest.diff_summary(&legacy_digest).total(),
+            0,
+            "candidate slice stage should preserve legacy digest parity"
         );
     }
 

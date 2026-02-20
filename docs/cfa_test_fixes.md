@@ -101,6 +101,7 @@ Follow-up status:
     - Added parity test:
       - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
       - `analysis::pipeline::tests::candidate_seed_phase_matches_legacy_seed_phase`
+      - `analysis::pipeline::tests::candidate_slice_phase_matches_legacy_slice_phase`
     - Runtime env-gated smoke:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
       - Result: `20/20` pass.
@@ -126,6 +127,13 @@ Follow-up status:
       - `dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
       - `dc1/TU0/default.xex`
       - `gh2/360 TU0 Strum Limit Fix/default.xex`
+  - Active linking/COFF stability update:
+    - `src/util/xex.rs` now sanitizes relocation-site addends for additional PPC relocation kinds
+      (`PpcRel24`, `PpcRel14`, `PpcAddr16*`, `PpcEmbSda21`) in addition to absolute relocations.
+    - Validation: `cargo test util::xex::tests::` remains green (`5/5`).
+    - Real-XEX smoke after relocation rewrite:
+      - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-mixed-<timestamp>`
+      - Result: `rc=0`, `4448` files, `2223` `.obj`.
   - Useful local XEX paths:
     - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
     - `/home/free/code/milohax/milo-executable-library/dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
