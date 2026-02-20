@@ -171,6 +171,112 @@ pub struct PipelineRunReport {
     pub digest: PipelineDigest,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub struct PhaseCheckpointDigest {
+    pub seed_count: usize,
+    pub processed_seed_count: usize,
+    pub function_count: usize,
+    pub jump_table_count: usize,
+}
+
+impl PhaseCheckpointDigest {
+    pub fn from_run_report(report: &PipelineRunReport) -> Self {
+        Self {
+            seed_count: report.seed_discovery.seeds.len(),
+            processed_seed_count: report.slice_exploration.processed_seed_count,
+            function_count: report.finalization.function_count,
+            jump_table_count: report.finalization.jump_table_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PhaseCheckpointDiffKind {
+    SeedCount,
+    ProcessedSeedCount,
+    FunctionCount,
+    JumpTableCount,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PhaseCheckpointDiffEntry {
+    pub kind: PhaseCheckpointDiffKind,
+    pub left: usize,
+    pub right: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct PhaseCheckpointDiffSummary {
+    pub seed_count: usize,
+    pub processed_seed_count: usize,
+    pub function_count: usize,
+    pub jump_table_count: usize,
+}
+
+impl PhaseCheckpointDiffSummary {
+    pub fn total(&self) -> usize {
+        self.seed_count + self.processed_seed_count + self.function_count + self.jump_table_count
+    }
+}
+
+pub fn phase_checkpoint_diff_entries(
+    left: &PipelineRunReport,
+    right: &PipelineRunReport,
+) -> Vec<PhaseCheckpointDiffEntry> {
+    let left_digest = PhaseCheckpointDigest::from_run_report(left);
+    let right_digest = PhaseCheckpointDigest::from_run_report(right);
+    let mut diffs = Vec::new();
+
+    if left_digest.seed_count != right_digest.seed_count {
+        diffs.push(PhaseCheckpointDiffEntry {
+            kind: PhaseCheckpointDiffKind::SeedCount,
+            left: left_digest.seed_count,
+            right: right_digest.seed_count,
+        });
+    }
+    if left_digest.processed_seed_count != right_digest.processed_seed_count {
+        diffs.push(PhaseCheckpointDiffEntry {
+            kind: PhaseCheckpointDiffKind::ProcessedSeedCount,
+            left: left_digest.processed_seed_count,
+            right: right_digest.processed_seed_count,
+        });
+    }
+    if left_digest.function_count != right_digest.function_count {
+        diffs.push(PhaseCheckpointDiffEntry {
+            kind: PhaseCheckpointDiffKind::FunctionCount,
+            left: left_digest.function_count,
+            right: right_digest.function_count,
+        });
+    }
+    if left_digest.jump_table_count != right_digest.jump_table_count {
+        diffs.push(PhaseCheckpointDiffEntry {
+            kind: PhaseCheckpointDiffKind::JumpTableCount,
+            left: left_digest.jump_table_count,
+            right: right_digest.jump_table_count,
+        });
+    }
+
+    diffs
+}
+
+pub fn compare_phase_checkpoints(
+    left: &PipelineRunReport,
+    right: &PipelineRunReport,
+) -> PhaseCheckpointDiffSummary {
+    phase_checkpoint_diff_entries(left, right).into_iter().fold(
+        PhaseCheckpointDiffSummary::default(),
+        |mut out, diff| {
+            match diff.kind {
+                PhaseCheckpointDiffKind::SeedCount => out.seed_count += 1,
+                PhaseCheckpointDiffKind::ProcessedSeedCount => out.processed_seed_count += 1,
+                PhaseCheckpointDiffKind::FunctionCount => out.function_count += 1,
+                PhaseCheckpointDiffKind::JumpTableCount => out.jump_table_count += 1,
+            }
+            out
+        },
+    )
+}
+
 pub trait CfaPipelineEngine {
     fn phase_seed_discovery(&mut self, obj: &ObjInfo) -> Result<SeedDiscoveryOutput>;
 
@@ -514,6 +620,79 @@ mod tests {
         assert_eq!(summary.jump_table_size, 1);
         assert_eq!(summary.jump_table_presence, 2);
         assert_eq!(summary.total(), 5);
+    }
+
+    #[test]
+    fn phase_checkpoint_diff_is_empty_for_identical_reports() {
+        let report = PipelineRunReport {
+            seed_discovery: SeedDiscoveryOutput {
+                seeds: vec![
+                    FunctionSeed {
+                        address: SectionAddress::new(0, 0x1000),
+                        source: SeedSource::KnownFunction,
+                    },
+                    FunctionSeed {
+                        address: SectionAddress::new(0, 0x2000),
+                        source: SeedSource::Discovered,
+                    },
+                ],
+            },
+            slice_exploration: SliceExplorationOutput { processed_seed_count: 2 },
+            finalization: FinalizationOutput { function_count: 4, jump_table_count: 1 },
+            digest: PipelineDigest::default(),
+        };
+
+        let summary = compare_phase_checkpoints(&report, &report);
+        assert_eq!(summary.total(), 0, "identical reports should have zero checkpoint diffs");
+        assert!(phase_checkpoint_diff_entries(&report, &report).is_empty());
+    }
+
+    #[test]
+    fn phase_checkpoint_diff_summary_categorizes_delta_types() {
+        let left = PipelineRunReport {
+            seed_discovery: SeedDiscoveryOutput {
+                seeds: vec![
+                    FunctionSeed {
+                        address: SectionAddress::new(0, 0x1000),
+                        source: SeedSource::KnownFunction,
+                    },
+                    FunctionSeed {
+                        address: SectionAddress::new(0, 0x2000),
+                        source: SeedSource::SectionStart,
+                    },
+                ],
+            },
+            slice_exploration: SliceExplorationOutput { processed_seed_count: 2 },
+            finalization: FinalizationOutput { function_count: 6, jump_table_count: 3 },
+            digest: PipelineDigest::default(),
+        };
+        let right = PipelineRunReport {
+            seed_discovery: SeedDiscoveryOutput {
+                seeds: vec![FunctionSeed {
+                    address: SectionAddress::new(0, 0x1000),
+                    source: SeedSource::KnownFunction,
+                }],
+            },
+            slice_exploration: SliceExplorationOutput { processed_seed_count: 1 },
+            finalization: FinalizationOutput { function_count: 5, jump_table_count: 1 },
+            digest: PipelineDigest::default(),
+        };
+
+        let summary = compare_phase_checkpoints(&left, &right);
+        assert_eq!(summary.seed_count, 1);
+        assert_eq!(summary.processed_seed_count, 1);
+        assert_eq!(summary.function_count, 1);
+        assert_eq!(summary.jump_table_count, 1);
+        assert_eq!(summary.total(), 4);
+
+        let entries = phase_checkpoint_diff_entries(&left, &right);
+        assert_eq!(entries.len(), 4);
+        assert!(entries.iter().any(|entry| entry.kind == PhaseCheckpointDiffKind::SeedCount));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.kind == PhaseCheckpointDiffKind::ProcessedSeedCount));
+        assert!(entries.iter().any(|entry| entry.kind == PhaseCheckpointDiffKind::FunctionCount));
+        assert!(entries.iter().any(|entry| entry.kind == PhaseCheckpointDiffKind::JumpTableCount));
     }
 
     #[test]

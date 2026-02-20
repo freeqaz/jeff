@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: S1 complete, S2 corpus-gated shadow parity active
+- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete
 - Initial scaffold: `src/analysis/pipeline.rs`
 
 Current implementation snapshot:
@@ -12,6 +12,10 @@ Current implementation snapshot:
 - `analysis::pipeline` now exposes phase outputs and a run report model.
 - Digest comparison now includes categorized diff entries and summary counters.
 - Full CFA fixture shadow parity gate is active with zero-diff totals and per-fixture reporting.
+- Phase-level checkpoint diffing is now available via:
+  - `PhaseCheckpointDigest`
+  - `PhaseCheckpointDiffEntry` / `PhaseCheckpointDiffSummary`
+  - `compare_phase_checkpoints`
 
 ## Problem statement
 
@@ -124,7 +128,7 @@ Diff categories:
 - Implement rewritten phase components behind internal feature flags.
 - Compare phase outputs (not only final outputs) for debugging.
 
-### S2a: Candidate phase spike prep (next checkpoint)
+### S2a: Candidate phase spike prep (complete baseline)
 
 - Add candidate phase spike scaffolds behind internal guardrails.
 - Extend run-report comparison checkpoints so phase-level deltas can be surfaced before full digest mismatch.

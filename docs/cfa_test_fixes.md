@@ -43,9 +43,9 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
-  - `cargo test analysis::vm2::tests::` (6/6)
+  - `cargo test analysis::vm2::tests::` (9/9)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
-  - `cargo test analysis::pipeline::tests::` (6/6)
+  - `cargo test analysis::pipeline::tests::` (8/8)
   - `cargo test util::xex::tests::` (5/5)
 - Shared negative fixture asset:
   - `assets/tests/jump_table_negative_snippets.txt`
@@ -71,6 +71,17 @@ Follow-up status:
     - `analysis::vm2::VmShadowDiffReport::from_legacy_pair`
     - `analysis::vm2::tests::vm2_shadow_diff_report_is_empty_for_exact_legacy_mapping`
     - `analysis::vm2::tests::vm2_shadow_diff_report_categorizes_mismatch_types`
+  - VM corpus shadow parity gates:
+    - `analysis::vm2::tests::vm2_shadow_selected_corpus_has_zero_unresolved_deltas`
+    - `analysis::vm2::tests::vm2_shadow_full_corpus_has_zero_unresolved_deltas`
+  - Pipeline phase checkpoint diff scaffolding and tests:
+    - `analysis::pipeline::PhaseCheckpointDigest`
+    - `analysis::pipeline::tests::phase_checkpoint_diff_is_empty_for_identical_reports`
+    - `analysis::pipeline::tests::phase_checkpoint_diff_summary_categorizes_delta_types`
+  - CFA fallback guardrail prep with threshold decisions and digest-preserving fallback selection:
+    - `analysis::cfa::evaluate_candidate_shadow_decision`
+    - `analysis::cfa::select_candidate_or_legacy`
+    - `analysis::cfa::tests::test_candidate_shadow_*`
   - New VM2 shadow tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
@@ -78,6 +89,15 @@ Follow-up status:
     - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
     - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`
     - `analysis::cfa::tests::test_validate_invariants_rejects_overlapping_functions`
+  - Real-XEX parity smoke checks (external corpus):
+    - `dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-<timestamp>` -> `status=0`, `2223` split `.obj` files
+    - Determinism check: rerun to second `/tmp` target produced same `4448` files / `2223` `.obj` files
+    - `diff -qr` between runs only differed in generated `config.json` + `dep`; excluding those, no file deltas
+    - `.obj` SHA256 manifests were exact match (`2223/2223`)
+    - `dtk xex info` succeeds for:
+      - `dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
+      - `dc1/TU0/default.xex`
+      - `gh2/360 TU0 Strum Limit Fix/default.xex`
 
 ## Background: How CFA Detects Jump Tables
 

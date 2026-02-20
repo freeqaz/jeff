@@ -261,12 +261,49 @@ impl VmShadowDiffSummary {
     pub fn total(&self) -> usize {
         self.presence + self.value + self.provenance + self.confidence
     }
+
+    pub fn accumulate(&mut self, other: &Self) {
+        self.presence += other.presence;
+        self.value += other.value;
+        self.provenance += other.provenance;
+        self.confidence += other.confidence;
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct VmShadowDiffReport {
     pub entries: Vec<VmShadowDiffEntry>,
     pub summary: VmShadowDiffSummary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct VmCorpusShadowFixtureResult {
+    pub test_id: u32,
+    pub summary: VmShadowDiffSummary,
+    pub entries: Vec<VmShadowDiffEntry>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct VmCorpusShadowReport {
+    pub fixture_count: usize,
+    pub mismatch_count: usize,
+    pub totals: VmShadowDiffSummary,
+    pub fixtures: Vec<VmCorpusShadowFixtureResult>,
+}
+
+impl VmCorpusShadowReport {
+    pub fn total_diffs(&self) -> usize {
+        self.totals.total()
+    }
+
+    pub fn push_fixture(&mut self, fixture: VmCorpusShadowFixtureResult) {
+        if fixture.summary.total() != 0 {
+            self.mismatch_count += 1;
+        }
+        self.totals.accumulate(&fixture.summary);
+        self.fixtures.push(fixture);
+        self.fixture_count = self.fixtures.len();
+    }
 }
 
 impl VmShadowDiffReport {
@@ -370,13 +407,57 @@ impl VmShadowDiffReport {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
     use super::*;
     use powerpc::{Extensions, Ins};
+    use serde::{de::Error, Deserialize, Deserializer};
 
     use crate::{
         analysis::vm::{BranchTarget, StepResult},
         obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind},
     };
+
+    const MAX_VM_SHADOW_STEPS_PER_FIXTURE: usize = 256;
+
+    fn bytestr_to_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_str = String::deserialize(deserializer)?;
+        if hex_str.len() % 2 != 0 {
+            return Err(D::Error::custom("hex string must have even length"));
+        }
+        (0..hex_str.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()
+            .map_err(D::Error::custom)
+    }
+
+    fn get_fn_start<'de, D>(deserializer: D) -> Result<u32, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_str = String::deserialize(deserializer)?;
+        if hex_str.len() != 8 {
+            return Err(D::Error::custom(format!("expected 8 hex chars, got {}", hex_str.len())));
+        }
+        u32::from_str_radix(&hex_str, 16).map_err(D::Error::custom)
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ShadowFixture {
+        test_id: u32,
+        #[serde(deserialize_with = "get_fn_start")]
+        function_start: u32,
+        #[serde(deserialize_with = "bytestr_to_bytes")]
+        function_bytes: Vec<u8>,
+        #[serde(deserialize_with = "get_fn_start")]
+        jump_table_start: u32,
+        #[serde(deserialize_with = "bytestr_to_bytes")]
+        jump_table_bytes: Vec<u8>,
+    }
 
     #[test]
     fn vm2_defaults_to_top_values() {
@@ -416,6 +497,111 @@ mod tests {
             vec![],
             vec![section],
         )
+    }
+
+    fn make_code_section_bytes(base_addr: u32, data: &[u8]) -> ObjSection {
+        ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base_addr as u64,
+            size: data.len() as u64,
+            data: data.to_vec(),
+            align: 0x10000,
+            ..Default::default()
+        }
+    }
+
+    fn make_data_section_bytes(base_addr: u32, data: &[u8]) -> ObjSection {
+        ObjSection {
+            name: ".rdata".into(),
+            kind: ObjSectionKind::ReadOnlyData,
+            address: base_addr as u64,
+            size: data.len() as u64,
+            data: data.to_vec(),
+            align: 0x10000,
+            ..Default::default()
+        }
+    }
+
+    fn fixture_obj(fixture: &ShadowFixture) -> ObjInfo {
+        let code = make_code_section_bytes(fixture.function_start, &fixture.function_bytes);
+        let sections = if fixture.jump_table_start != 0 {
+            vec![make_data_section_bytes(fixture.jump_table_start, &fixture.jump_table_bytes), code]
+        } else {
+            vec![code]
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            format!("vm2-shadow-fixture-{}", fixture.test_id),
+            vec![],
+            sections,
+        )
+    }
+
+    fn collect_linear_vm_samples(
+        obj: &ObjInfo,
+        function_start: SectionAddress,
+        max_steps: usize,
+    ) -> Vec<VM> {
+        let mut vm = VM::new_from_obj(obj);
+        let mut samples = vec![(*vm).clone()];
+        let mut addr = function_start;
+        let section = &obj.sections[function_start.section];
+
+        for _ in 0..max_steps {
+            if !section.contains(addr.address) {
+                break;
+            }
+            let Some(ins) = crate::analysis::disassemble(section, addr.address) else {
+                break;
+            };
+            let result = vm.step(obj, addr, ins);
+            samples.push((*vm).clone());
+            match result {
+                StepResult::Continue | StepResult::LoadStore { .. } | StepResult::Branch(_) => {
+                    addr += 4;
+                }
+                StepResult::Illegal | StepResult::Jump(_) => break,
+            }
+        }
+
+        samples
+    }
+
+    fn run_vm_shadow_for_fixture(fixture: &ShadowFixture) -> VmCorpusShadowFixtureResult {
+        let obj = fixture_obj(fixture);
+        let (section_index, _) =
+            obj.sections.at_address(fixture.function_start).unwrap_or_else(|e| {
+                panic!("failed to locate function start for {}: {e:#}", fixture.test_id)
+            });
+        let function_start = SectionAddress::new(section_index, fixture.function_start);
+        let samples =
+            collect_linear_vm_samples(&obj, function_start, MAX_VM_SHADOW_STEPS_PER_FIXTURE);
+
+        let mut result =
+            VmCorpusShadowFixtureResult { test_id: fixture.test_id, ..Default::default() };
+        for sample in samples {
+            let vm2 = Vm2::from_legacy_vm(&sample);
+            let diff = VmShadowDiffReport::from_legacy_pair(&sample, &vm2);
+            result.summary.accumulate(&diff.summary);
+            result.entries.extend(diff.entries);
+        }
+        result
+    }
+
+    fn run_vm_shadow_corpus(
+        fixtures: &[ShadowFixture],
+        selected: Option<&[u32]>,
+    ) -> VmCorpusShadowReport {
+        let mut report = VmCorpusShadowReport::default();
+        for fixture in fixtures
+            .iter()
+            .filter(|entry| selected.map_or(true, |ids| ids.contains(&entry.test_id)))
+        {
+            report.push_fixture(run_vm_shadow_for_fixture(fixture));
+        }
+        report
     }
 
     fn step(vm: &mut VM, obj: &ObjInfo, addr: u32, code: u32) -> StepResult {
@@ -567,5 +753,88 @@ mod tests {
             .iter()
             .any(|entry| entry.location == VmShadowLocation::StackSlot(0x20)
                 && entry.kind == VmShadowDiffKind::Presence));
+    }
+
+    #[test]
+    fn vm_corpus_shadow_report_accumulates_fixture_summaries() {
+        let mut report = VmCorpusShadowReport::default();
+        report.push_fixture(VmCorpusShadowFixtureResult {
+            test_id: 1,
+            summary: VmShadowDiffSummary { value: 2, ..Default::default() },
+            entries: vec![],
+        });
+        report.push_fixture(VmCorpusShadowFixtureResult {
+            test_id: 2,
+            summary: VmShadowDiffSummary { presence: 1, confidence: 3, ..Default::default() },
+            entries: vec![],
+        });
+        report.push_fixture(VmCorpusShadowFixtureResult {
+            test_id: 3,
+            summary: VmShadowDiffSummary::default(),
+            entries: vec![],
+        });
+
+        assert_eq!(report.fixture_count, 3);
+        assert_eq!(report.mismatch_count, 2);
+        assert_eq!(report.totals.presence, 1);
+        assert_eq!(report.totals.value, 2);
+        assert_eq!(report.totals.provenance, 0);
+        assert_eq!(report.totals.confidence, 3);
+        assert_eq!(report.total_diffs(), 6);
+    }
+
+    #[test]
+    fn vm2_shadow_selected_corpus_has_zero_unresolved_deltas() {
+        let fixtures: Vec<ShadowFixture> =
+            serde_yaml::from_reader(File::open("assets/tests/cfa_tests.yml").unwrap())
+                .expect("failed to read CFA fixture corpus");
+        let selected = [1u32, 4u32, 8u32, 12u32, 19u32];
+        let expected_fixture_count =
+            fixtures.iter().filter(|fixture| selected.contains(&fixture.test_id)).count();
+
+        let report = run_vm_shadow_corpus(&fixtures, Some(&selected));
+        assert_eq!(report.fixture_count, expected_fixture_count);
+        assert_eq!(
+            report.mismatch_count,
+            0,
+            "vm selected corpus has mismatched fixtures: {:?}",
+            report
+                .fixtures
+                .iter()
+                .filter(|fixture| fixture.summary.total() != 0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.total_diffs(),
+            0,
+            "vm selected corpus diff totals should be zero: {:?}",
+            report
+        );
+    }
+
+    #[test]
+    fn vm2_shadow_full_corpus_has_zero_unresolved_deltas() {
+        let fixtures: Vec<ShadowFixture> =
+            serde_yaml::from_reader(File::open("assets/tests/cfa_tests.yml").unwrap())
+                .expect("failed to read CFA fixture corpus");
+        let report = run_vm_shadow_corpus(&fixtures, None);
+
+        assert_eq!(report.fixture_count, fixtures.len());
+        assert_eq!(
+            report.mismatch_count,
+            0,
+            "vm full corpus has mismatched fixtures: {:?}",
+            report
+                .fixtures
+                .iter()
+                .filter(|fixture| fixture.summary.total() != 0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.total_diffs(),
+            0,
+            "vm full corpus diff totals should be zero: {:?}",
+            report
+        );
     }
 }

@@ -274,7 +274,7 @@ Validation run:
 
 - Branch: `cfa_fix`
 - Version: `1.9.2`
-- Working tree: roadmap execution active (`R2 complete`, `R3 complete`, `R5 complete`)
+- Working tree: roadmap execution active (`R2 complete`, `R3 complete`, `R4 complete`, `R5 complete`, `R6 prep complete`, `R7 prep complete`)
 - Dev branch delta: only one version-bump commit (`1.9.1`) remains on `dev`, superseded by `1.9.2` here
 
 Current observed test state on this branch:
@@ -282,9 +282,9 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 3 passed
-- `cargo test analysis::vm2::tests::` -> 6 passed
+- `cargo test analysis::vm2::tests::` -> 9 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
-- `cargo test analysis::pipeline::tests::` -> 6 passed
+- `cargo test analysis::pipeline::tests::` -> 8 passed
 - `cargo test util::xex::tests::` -> 5 passed
 
 Open technical debt (non-blocking for this branch state):
@@ -319,31 +319,59 @@ Open technical debt (non-blocking for this branch state):
   - Structured VM shadow-diff report for legacy-vs-VM2 comparisons with typed categories.
   - Added regression tests for zero-diff parity and category-specific mismatch reporting.
 
+- **Phase D complete**: VM corpus harness + phase checkpoint scaffolding + fallback-prep hooks.
+  - VM corpus shadow harness runs across selected fixtures (`1, 4, 8, 12, 19`) and full CFA fixture corpus with zero-diff gates.
+  - Added aggregate VM corpus report types:
+    - `VmCorpusShadowFixtureResult`
+    - `VmCorpusShadowReport`
+  - Added pipeline phase-level checkpoint digest/diff model:
+    - `PhaseCheckpointDigest`
+    - `PhaseCheckpointDiffEntry` / `PhaseCheckpointDiffSummary`
+  - Added fallback decision scaffolding in CFA:
+    - candidate shadow gate config constants and threshold evaluation,
+    - structured fallback decision model and legacy-selection helper.
+  - Added fallback regression tests validating:
+    - VM threshold fallback trigger,
+    - phase checkpoint threshold fallback trigger,
+    - digest-preserving fallback selection.
+
+- **Phase E validation complete**: real-XEX parity smoke on external corpora.
+  - Built release `dtk` from current branch and ran real DC3 split flow to `/tmp`:
+    - `dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-<timestamp>`
+    - Result: `status=0`, generated `2223` split `.obj` files.
+  - Re-ran the same DC3 split into a second `/tmp` target and compared outputs:
+    - Both runs produced `4448` total files and `2223` `.obj` files.
+    - `diff -qr` reported only expected run-specific deltas in `config.json` and `dep`.
+    - Excluding those files, tree diff is empty; `.obj` SHA256 manifests match exactly (`2223/2223`).
+  - Verified parser compatibility on multiple real XEX files from executable library:
+    - `dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
+    - `dc1/TU0/default.xex`
+    - `gh2/360 TU0 Strum Limit Fix/default.xex`
+  - Result: `dtk xex info` succeeded for all sampled titles.
+
 ### Next Phase Queue
 
-1. **R4 remainder: VM2 corpus shadow execution hooks (B7)**:
-   - Drive `VmShadowDiffReport` across selected CFA corpus paths (not just unit-crafted traces).
-   - Define zero-diff acceptance thresholds for per-location VM parity categories.
-2. **R6: Candidate phase implementation spikes (B8/M3 prep)**:
-   - Start rewritten phase component experiments behind internal guardrails.
-   - Keep legacy analyzer default until parity and stability gates hold.
-3. **R7: Internal VM2 adoption guardrails**:
-   - Add fallback-on-diff hooks so VM2 candidate paths auto-revert to legacy VM when parity fails.
+1. **R6 implementation: candidate phase component spikes (B8)**:
+   - Implement first candidate phase components behind existing checkpoint diff scaffolds.
+   - Keep legacy analyzer default until checkpoint and final digest parity hold.
+2. **R7 implementation: operational fallback routing (B7/B8)**:
+   - Connect fallback decision hooks to real candidate outputs (VM and pipeline checkpoints).
+   - Emit structured mismatch logs with actionable fixture-level summaries.
+3. **Real-XEX parity proof loop**:
+   - Run shadow parity against real XEX workflows in `~/code/milohax/dc3-decomp` and the executables repo.
+   - Track unresolved deltas as blockers for candidate-path rollout.
 
-### Immediate Execution Plan (Kickoff: 2026-02-20)
+### Immediate Execution Plan (Kickoff: 2026-02-20, updated post-Phase D)
 
-1. **Sprint D1 (R4 remainder, B7)**:
-   - Build a corpus VM shadow harness that runs legacy VM paths and emits `VmShadowDiffReport` per fixture.
-   - Start with targeted CFA fixture subset (`1, 4, 8, 12, 19`) before expanding.
-   - Add aggregate VM shadow summary counters (presence/value/provenance/confidence) and fail on non-zero unresolved deltas.
-2. **Sprint D2 (R6 prep, B8/M3)**:
-   - Add candidate phase spike scaffolds behind internal guards (no default behavior switch).
-   - Wire pipeline run-report checkpoints so candidate phase outputs can be compared against legacy phase boundaries.
-3. **Sprint D3 (R7 prep)**:
-   - Define fallback policy hooks for candidate VM/pipeline paths: if shadow mismatch is above threshold, automatically route to legacy.
+1. **Sprint E1 (R6 implementation)**:
+   - Implement first candidate phase path(s) and compare against legacy using checkpoint + digest summaries.
+2. **Sprint E2 (R7 integration)**:
+   - Bind fallback hooks to candidate path output deltas for automatic legacy routing on threshold breach.
+3. **Sprint E3 (external parity evidence)**:
+   - Run real-XEX parity checks in `dc3-decomp` and executables repo, then document unresolved deltas.
 
 Exit criteria for next implementation pass:
 
-- VM shadow corpus harness is in-tree with deterministic results and explicit parity thresholds.
-- Existing CFA suites remain green.
-- Docs/RFC status moves from planning to implementation for D1.
+- Candidate phase path produces measurable checkpoint/digest parity reports.
+- Fallback hooks are exercised by real candidate deltas (not only synthetic tests).
+- Real-XEX parity evidence is documented with concrete pass/fail fixtures.

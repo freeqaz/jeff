@@ -43,7 +43,9 @@ impl Display for SectionAddress {
 }
 
 impl SectionAddress {
-    pub fn new(section: SectionIndex, address: u32) -> Self { Self { section, address } }
+    pub fn new(section: SectionIndex, address: u32) -> Self {
+        Self { section, address }
+    }
 
     pub fn offset(self, offset: i32) -> Self {
         Self { section: self.section, address: self.address.wrapping_add_signed(offset) }
@@ -57,7 +59,9 @@ impl SectionAddress {
         Self { section: self.section, address: self.address & !(align - 1) }
     }
 
-    pub fn is_aligned(self, align: u32) -> bool { self.address & (align - 1) == 0 }
+    pub fn is_aligned(self, align: u32) -> bool {
+        self.address & (align - 1) == 0
+    }
 
     pub fn wrapping_add(self, rhs: u32) -> Self {
         Self { section: self.section, address: self.address.wrapping_add(rhs) }
@@ -81,7 +85,9 @@ impl Sub<u32> for SectionAddress {
 }
 
 impl AddAssign<u32> for SectionAddress {
-    fn add_assign(&mut self, rhs: u32) { self.address += rhs; }
+    fn add_assign(&mut self, rhs: u32) {
+        self.address += rhs;
+    }
 }
 
 impl UpperHex for SectionAddress {
@@ -93,7 +99,9 @@ impl UpperHex for SectionAddress {
 impl BitAnd<u32> for SectionAddress {
     type Output = u32;
 
-    fn bitand(self, rhs: u32) -> Self::Output { self.address & rhs }
+    fn bitand(self, rhs: u32) -> Self::Output {
+        self.address & rhs
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -104,7 +112,9 @@ pub struct FunctionInfo {
 }
 
 impl FunctionInfo {
-    pub fn is_analyzed(&self) -> bool { self.analyzed }
+    pub fn is_analyzed(&self) -> bool {
+        self.analyzed
+    }
 
     pub fn is_function(&self) -> bool {
         self.analyzed && self.end.is_some() && self.slices.is_some()
@@ -116,6 +126,79 @@ impl FunctionInfo {
 
     pub fn is_unfinalized(&self) -> bool {
         self.analyzed && self.end.is_none() && self.slices.is_some()
+    }
+}
+
+pub(crate) const ENABLE_VM2_CANDIDATE_SHADOW: bool = false;
+pub(crate) const ENABLE_PIPELINE_CANDIDATE_SHADOW: bool = false;
+pub(crate) const MAX_ALLOWED_VM_SHADOW_DELTAS: usize = 0;
+pub(crate) const MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS: usize = 0;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct CandidateShadowGateConfig {
+    pub enable_vm2_shadow: bool,
+    pub enable_pipeline_shadow: bool,
+    pub max_vm_shadow_deltas: usize,
+    pub max_phase_checkpoint_deltas: usize,
+}
+
+impl CandidateShadowGateConfig {
+    pub(crate) const fn defaults() -> Self {
+        Self {
+            enable_vm2_shadow: ENABLE_VM2_CANDIDATE_SHADOW,
+            enable_pipeline_shadow: ENABLE_PIPELINE_CANDIDATE_SHADOW,
+            max_vm_shadow_deltas: MAX_ALLOWED_VM_SHADOW_DELTAS,
+            max_phase_checkpoint_deltas: MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum CandidateFallbackReason {
+    VmShadowDeltasExceeded,
+    PhaseCheckpointDeltasExceeded,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub(crate) struct CandidateShadowDecision {
+    pub vm_shadow_deltas: usize,
+    pub phase_checkpoint_deltas: usize,
+    pub reasons: Vec<CandidateFallbackReason>,
+}
+
+impl CandidateShadowDecision {
+    pub fn should_fallback(&self) -> bool {
+        !self.reasons.is_empty()
+    }
+}
+
+pub(crate) fn evaluate_candidate_shadow_decision(
+    vm_shadow_deltas: usize,
+    phase_checkpoint_deltas: usize,
+    gate_config: CandidateShadowGateConfig,
+) -> CandidateShadowDecision {
+    let mut reasons = Vec::new();
+    if gate_config.enable_vm2_shadow && vm_shadow_deltas > gate_config.max_vm_shadow_deltas {
+        reasons.push(CandidateFallbackReason::VmShadowDeltasExceeded);
+    }
+    if gate_config.enable_pipeline_shadow
+        && phase_checkpoint_deltas > gate_config.max_phase_checkpoint_deltas
+    {
+        reasons.push(CandidateFallbackReason::PhaseCheckpointDeltasExceeded);
+    }
+    CandidateShadowDecision { vm_shadow_deltas, phase_checkpoint_deltas, reasons }
+}
+
+#[allow(dead_code)]
+pub(crate) fn select_candidate_or_legacy<T: Clone>(
+    legacy_result: &T,
+    candidate_result: &T,
+    decision: &CandidateShadowDecision,
+) -> T {
+    if decision.should_fallback() {
+        legacy_result.clone()
+    } else {
+        candidate_result.clone()
     }
 }
 
@@ -188,11 +271,8 @@ impl AnalyzerState {
                     ) {
                         let existing = &obj.symbols[index];
                         if existing.size != new_size {
-                            let symbol = ObjSymbol {
-                                size: new_size,
-                                size_known: true,
-                                ..existing.clone()
-                            };
+                            let symbol =
+                                ObjSymbol { size: new_size, size_known: true, ..existing.clone() };
                             obj.symbols.replace(index, symbol)?;
                         }
                     }
@@ -307,22 +387,24 @@ impl AnalyzerState {
     pub(crate) fn phase_seed_discovery(&mut self, obj: &ObjInfo) -> Result<Vec<SectionAddress>> {
         // Apply known functions from pdata/import data
         for (&addr, &size) in &obj.known_functions {
-            self.functions.insert(addr, FunctionInfo {
-                analyzed: false,
-                end: size.map(|size| addr + size),
-                slices: None,
-            });
+            self.functions.insert(
+                addr,
+                FunctionInfo { analyzed: false, end: size.map(|size| addr + size), slices: None },
+            );
         }
 
         // Apply known functions from symbols
         for (_, symbol) in obj.symbols.by_kind(ObjSymbolKind::Function) {
             let Some(section_index) = symbol.section else { continue };
             let addr_ref = SectionAddress::new(section_index, symbol.address as u32);
-            self.functions.insert(addr_ref, FunctionInfo {
-                analyzed: false,
-                end: if symbol.size_known { Some(addr_ref + symbol.size as u32) } else { None },
-                slices: None,
-            });
+            self.functions.insert(
+                addr_ref,
+                FunctionInfo {
+                    analyzed: false,
+                    end: if symbol.size_known { Some(addr_ref + symbol.size as u32) } else { None },
+                    slices: None,
+                },
+            );
         }
 
         // Also check the beginning of every code section
@@ -370,7 +452,9 @@ impl AnalyzerState {
                             log::info!(
                                 "Function at {} extends beyond pdata end {} to {} \
                                  (likely tail block inclusion)",
-                                addr, known_end, func_end
+                                addr,
+                                known_end,
+                                func_end
                             );
                         }
                     }
@@ -424,12 +508,50 @@ impl AnalyzerState {
         Ok(())
     }
 
-    pub fn detect_functions(&mut self, obj: &ObjInfo) -> Result<()> {
+    fn detect_functions_legacy(&mut self, obj: &ObjInfo) -> Result<()> {
         let seed_addrs = self.phase_seed_discovery(obj)?;
         self.phase_slice_seeded_functions(obj, &seed_addrs)?;
         self.phase_discover_remaining_functions(obj)?;
         self.phase_finalize_and_validate(obj)?;
+        Ok(())
+    }
 
+    fn detect_functions_with_shadow_config(
+        &mut self,
+        obj: &ObjInfo,
+        vm_shadow_deltas: usize,
+        phase_checkpoint_deltas: usize,
+        gate_config: CandidateShadowGateConfig,
+    ) -> Result<CandidateShadowDecision> {
+        let decision = evaluate_candidate_shadow_decision(
+            vm_shadow_deltas,
+            phase_checkpoint_deltas,
+            gate_config,
+        );
+        if decision.should_fallback() {
+            log::debug!(
+                "Candidate shadow mismatch exceeded threshold (vm_deltas={}, phase_deltas={}, reasons={:?}), using legacy analyzer",
+                vm_shadow_deltas,
+                phase_checkpoint_deltas,
+                decision.reasons
+            );
+            self.detect_functions_legacy(obj)?;
+            return Ok(decision);
+        }
+        if gate_config.enable_vm2_shadow || gate_config.enable_pipeline_shadow {
+            log::debug!(
+                "Candidate shadow gates enabled with vm_deltas={} and phase_deltas={}, candidate execution path not yet active; using legacy analyzer",
+                vm_shadow_deltas,
+                phase_checkpoint_deltas
+            );
+        }
+        self.detect_functions_legacy(obj)?;
+        Ok(decision)
+    }
+
+    pub fn detect_functions(&mut self, obj: &ObjInfo) -> Result<()> {
+        let gate_config = CandidateShadowGateConfig::defaults();
+        let _decision = self.detect_functions_with_shadow_config(obj, 0, 0, gate_config)?;
         Ok(())
     }
 
@@ -492,11 +614,7 @@ impl AnalyzerState {
                 section.address,
                 section.address + section.size
             );
-            ensure!(
-                section.kind != ObjSectionKind::Bss,
-                "Jump table at {} cannot be in BSS",
-                addr
-            );
+            ensure!(section.kind != ObjSectionKind::Bss, "Jump table at {} cannot be in BSS", addr);
         }
         Ok(())
     }
@@ -712,16 +830,17 @@ impl AnalyzerState {
                     if sym.flags.scope() == ObjSymbolScope::Global {
                         log::info!(
                             "Skipping tail block merge of {:#010X} (global-scope symbol '{}')",
-                            func_addr, sym.name,
+                            func_addr,
+                            sym.name,
                         );
                         continue;
                     }
                 }
 
                 // Check if this function is a tail block
-                if let Some(_tail_end) = Self::check_tail_block(
-                    section, *func_addr, func_end, *prev_addr, prev_end,
-                ) {
+                if let Some(_tail_end) =
+                    Self::check_tail_block(section, *func_addr, func_end, *prev_addr, prev_end)
+                {
                     log::info!(
                         "Merging tail block function {:#010X}-{:#010X} into {:#010X} (extending from {:#010X})",
                         func_addr, func_end, prev_addr, prev_end,
@@ -796,7 +915,8 @@ impl AnalyzerState {
                     let Some(ins) = disassemble(section, addr.address) else { break };
                     addr += 4;
                     // blr (unconditional return) or end of gap
-                    if ins.op == Opcode::Bclr && !ins.field_lk()
+                    if ins.op == Opcode::Bclr
+                        && !ins.field_lk()
                         && (ins.field_bo() & 0b10100 == 0b10100)
                     {
                         return Some(addr);
@@ -835,9 +955,7 @@ impl AnalyzerState {
                 // bl (function call) — tail blocks don't call other functions
                 Opcode::B | Opcode::Bc if ins.field_lk() => return None,
                 // blr — return instruction
-                Opcode::Bclr
-                    if !ins.field_lk() && (ins.field_bo() & 0b10100 == 0b10100) =>
-                {
+                Opcode::Bclr if !ins.field_lk() && (ins.field_bo() & 0b10100 == 0b10100) => {
                     ends_with_blr = true;
                 }
                 // bctr — indirect branch, not typical for a tail block
@@ -887,9 +1005,9 @@ impl AnalyzerState {
                             }
 
                             // Check if this gap is a tail block of the preceding function
-                            if let Some(tail_end) = Self::check_tail_block(
-                                section, addr, second, first, first_end,
-                            ) {
+                            if let Some(tail_end) =
+                                Self::check_tail_block(section, addr, second, first, first_end)
+                            {
                                 log::info!(
                                     "Detected tail block @ {:#010X}-{:#010X} of function {:#010X}, extending function end from {:#010X}",
                                     addr, tail_end, first, first_end,
@@ -919,7 +1037,11 @@ impl AnalyzerState {
                             if addr < section_end {
                                 // Check if this gap is a tail block of the last function
                                 if let Some(tail_end) = Self::check_tail_block(
-                                    section, addr, section_end, last, last_end,
+                                    section,
+                                    addr,
+                                    section_end,
+                                    last,
+                                    last_end,
                                 ) {
                                     log::info!(
                                         "Detected tail block @ {:#010X}-{:#010X} of function {:#010X}, extending function end from {:#010X}",
@@ -1149,10 +1271,7 @@ mod tests {
             let e = expected.functions.get(&key);
             let a = actual.functions.get(&key);
             if e != a {
-                diffs.push(format!(
-                    "function mismatch at {key}: expected {:?}, actual {:?}",
-                    e, a
-                ));
+                diffs.push(format!("function mismatch at {key}: expected {:?}, actual {:?}", e, a));
             }
         }
         let jump_keys = expected
@@ -1185,33 +1304,23 @@ mod tests {
         assert!(!default_info.is_unfinalized());
 
         // Analyzed with known end but no slices (shouldn't happen normally)
-        let known_end_only = FunctionInfo {
-            analyzed: true,
-            end: Some(SectionAddress::new(0, 0x100)),
-            slices: None,
-        };
+        let known_end_only =
+            FunctionInfo { analyzed: true, end: Some(SectionAddress::new(0, 0x100)), slices: None };
         assert!(known_end_only.is_analyzed());
         assert!(!known_end_only.is_function()); // needs slices
         assert!(!known_end_only.is_non_function()); // has end
         assert!(!known_end_only.is_unfinalized()); // has end
 
         // Analyzed as non-function (no end, no slices)
-        let non_function = FunctionInfo {
-            analyzed: true,
-            end: None,
-            slices: None,
-        };
+        let non_function = FunctionInfo { analyzed: true, end: None, slices: None };
         assert!(non_function.is_analyzed());
         assert!(!non_function.is_function());
         assert!(non_function.is_non_function());
         assert!(!non_function.is_unfinalized());
 
         // Unfinalized: analyzed, no end, has slices
-        let unfinalized = FunctionInfo {
-            analyzed: true,
-            end: None,
-            slices: Some(FunctionSlices::default()),
-        };
+        let unfinalized =
+            FunctionInfo { analyzed: true, end: None, slices: Some(FunctionSlices::default()) };
         assert!(unfinalized.is_analyzed());
         assert!(!unfinalized.is_function());
         assert!(!unfinalized.is_non_function());
@@ -1243,7 +1352,7 @@ mod tests {
         let known_end = SectionAddress::new(0, 0x100);
         let info = FunctionInfo {
             analyzed: true,
-            end: Some(known_end), // preserved from pdata
+            end: Some(known_end),                    // preserved from pdata
             slices: Some(FunctionSlices::default()), // slices that couldn't finalize
         };
 
@@ -1265,11 +1374,9 @@ mod tests {
         let func_size = 0x50u32;
         let func_end = func_addr + func_size;
 
-        state.functions.insert(func_addr, FunctionInfo {
-            analyzed: false,
-            end: Some(func_end),
-            slices: None,
-        });
+        state
+            .functions
+            .insert(func_addr, FunctionInfo { analyzed: false, end: Some(func_end), slices: None });
 
         // Verify the function was added with the correct end
         let info = state.functions.get(&func_addr).unwrap();
@@ -1290,11 +1397,10 @@ mod tests {
         let func_addr = SectionAddress::new(0, 0x1000);
         let known_end = SectionAddress::new(0, 0x1050);
 
-        state.functions.insert(func_addr, FunctionInfo {
-            analyzed: false,
-            end: Some(known_end),
-            slices: None,
-        });
+        state.functions.insert(
+            func_addr,
+            FunctionInfo { analyzed: false, end: Some(known_end), slices: None },
+        );
 
         // Simulate what process_function_at does when slices can't finalize:
         // With the fix, it should preserve the existing end
@@ -1348,11 +1454,14 @@ mod tests {
     fn test_shadow_digest_diff_is_empty_for_identical_state() {
         let mut state = AnalyzerState::default();
         let func = SectionAddress::new(0, 0x1000);
-        state.functions.insert(func, FunctionInfo {
-            analyzed: true,
-            end: Some(func + 0x20),
-            slices: Some(FunctionSlices::default()),
-        });
+        state.functions.insert(
+            func,
+            FunctionInfo {
+                analyzed: true,
+                end: Some(func + 0x20),
+                slices: Some(FunctionSlices::default()),
+            },
+        );
         state.jump_tables.insert(SectionAddress::new(0, 0x1040), 0x10);
 
         let digest = shadow_digest(&state);
@@ -1370,28 +1479,98 @@ mod tests {
 
         let mut state_a = AnalyzerState::new(std::collections::BTreeMap::new());
         state_a.functions.insert(start, FunctionInfo::default());
-        state_a
-            .process_function_at(&obj, start)
-            .expect("first process_function_at run failed");
-        state_a
-            .validate_invariants(&obj)
-            .expect("first invariant validation failed");
+        state_a.process_function_at(&obj, start).expect("first process_function_at run failed");
+        state_a.validate_invariants(&obj).expect("first invariant validation failed");
 
         let mut state_b = AnalyzerState::new(std::collections::BTreeMap::new());
         state_b.functions.insert(start, FunctionInfo::default());
-        state_b
-            .process_function_at(&obj, start)
-            .expect("second process_function_at run failed");
-        state_b
-            .validate_invariants(&obj)
-            .expect("second invariant validation failed");
+        state_b.process_function_at(&obj, start).expect("second process_function_at run failed");
+        state_b.validate_invariants(&obj).expect("second invariant validation failed");
 
         let digest_a = shadow_digest(&state_a);
         let digest_b = shadow_digest(&state_b);
         let diffs = diff_shadow_digests(&digest_a, &digest_b);
-        assert!(
-            diffs.is_empty(),
-            "legacy analyzer should be deterministic, diffs: {diffs:?}"
+        assert!(diffs.is_empty(), "legacy analyzer should be deterministic, diffs: {diffs:?}");
+    }
+
+    #[test]
+    fn test_candidate_shadow_decision_triggers_vm_threshold_fallback() {
+        let config = CandidateShadowGateConfig {
+            enable_vm2_shadow: true,
+            enable_pipeline_shadow: false,
+            max_vm_shadow_deltas: 0,
+            max_phase_checkpoint_deltas: 0,
+        };
+        let decision = evaluate_candidate_shadow_decision(1, 0, config);
+        assert!(decision.should_fallback());
+        assert_eq!(decision.reasons, vec![CandidateFallbackReason::VmShadowDeltasExceeded]);
+    }
+
+    #[test]
+    fn test_candidate_shadow_decision_triggers_phase_threshold_fallback() {
+        let config = CandidateShadowGateConfig {
+            enable_vm2_shadow: false,
+            enable_pipeline_shadow: true,
+            max_vm_shadow_deltas: 0,
+            max_phase_checkpoint_deltas: 0,
+        };
+        let decision = evaluate_candidate_shadow_decision(0, 1, config);
+        assert!(decision.should_fallback());
+        assert_eq!(decision.reasons, vec![CandidateFallbackReason::PhaseCheckpointDeltasExceeded]);
+    }
+
+    #[test]
+    fn test_candidate_shadow_decision_respects_gate_flags_and_thresholds() {
+        let disabled = CandidateShadowGateConfig {
+            enable_vm2_shadow: false,
+            enable_pipeline_shadow: false,
+            max_vm_shadow_deltas: 0,
+            max_phase_checkpoint_deltas: 0,
+        };
+        let decision_disabled = evaluate_candidate_shadow_decision(10, 10, disabled);
+        assert!(!decision_disabled.should_fallback());
+
+        let enabled = CandidateShadowGateConfig {
+            enable_vm2_shadow: true,
+            enable_pipeline_shadow: true,
+            max_vm_shadow_deltas: 2,
+            max_phase_checkpoint_deltas: 3,
+        };
+        let decision_enabled = evaluate_candidate_shadow_decision(2, 3, enabled);
+        assert!(!decision_enabled.should_fallback());
+    }
+
+    #[test]
+    fn test_candidate_shadow_fallback_preserves_legacy_output_digest() {
+        let mut legacy_state = AnalyzerState::default();
+        let func_start = SectionAddress::new(0, 0x1000);
+        legacy_state.functions.insert(
+            func_start,
+            FunctionInfo {
+                analyzed: true,
+                end: Some(func_start + 0x20),
+                slices: Some(FunctionSlices::default()),
+            },
+        );
+        legacy_state.jump_tables.insert(SectionAddress::new(0, 0x1040), 0x10);
+        let fallback_digest = shadow_digest(&legacy_state);
+
+        let candidate_digest = ShadowDigest {
+            functions: std::collections::BTreeMap::new(),
+            jump_tables: std::collections::BTreeMap::new(),
+        };
+        let decision = CandidateShadowDecision {
+            vm_shadow_deltas: 1,
+            phase_checkpoint_deltas: 0,
+            reasons: vec![CandidateFallbackReason::VmShadowDeltasExceeded],
+        };
+        assert!(decision.should_fallback());
+
+        let selected_digest =
+            select_candidate_or_legacy(&fallback_digest, &candidate_digest, &decision);
+        assert_eq!(
+            selected_digest, fallback_digest,
+            "fallback path should preserve legacy output digest exactly"
         );
     }
 
@@ -1402,16 +1581,22 @@ mod tests {
 
         let a = SectionAddress::new(0, 0x1000);
         let b = SectionAddress::new(0, 0x1008);
-        state.functions.insert(a, FunctionInfo {
-            analyzed: true,
-            end: Some(SectionAddress::new(0, 0x1010)),
-            slices: Some(FunctionSlices::default()),
-        });
-        state.functions.insert(b, FunctionInfo {
-            analyzed: true,
-            end: Some(SectionAddress::new(0, 0x1018)),
-            slices: Some(FunctionSlices::default()),
-        });
+        state.functions.insert(
+            a,
+            FunctionInfo {
+                analyzed: true,
+                end: Some(SectionAddress::new(0, 0x1010)),
+                slices: Some(FunctionSlices::default()),
+            },
+        );
+        state.functions.insert(
+            b,
+            FunctionInfo {
+                analyzed: true,
+                end: Some(SectionAddress::new(0, 0x1018)),
+                slices: Some(FunctionSlices::default()),
+            },
+        );
 
         let err = state
             .validate_invariants(&obj)
@@ -1434,21 +1619,26 @@ mod tests {
     fn test_tail_block_case1_backward_branch_then_blr() {
         // Preceding function: nop, nop, nop, nop  (0x1000..0x1010)
         // Gap/tail block: b -0xC (-> 0x1004), addi r3, blr  (0x1010..0x101C)
-        let section = make_code_section(0x1000, &[
-            NOP, NOP, NOP, NOP,             // preceding func body
-            ppc_b(-0xC),                     // b 0x1004 (back into preceding)
-            ADDI_R3,                         // addi r3, r3, 1
-            BLR,                             // blr
-        ]);
+        let section = make_code_section(
+            0x1000,
+            &[
+                NOP,
+                NOP,
+                NOP,
+                NOP,         // preceding func body
+                ppc_b(-0xC), // b 0x1004 (back into preceding)
+                ADDI_R3,     // addi r3, r3, 1
+                BLR,         // blr
+            ],
+        );
 
         let gap_start = SectionAddress::new(0, 0x1010);
         let gap_end = SectionAddress::new(0, 0x101C);
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, Some(SectionAddress::new(0, 0x101C)));
     }
 
@@ -1458,61 +1648,76 @@ mod tests {
     ///   0x1010-0x101C: gap (addi r3; bne -0x14 (-> 0x1004); blr)
     #[test]
     fn test_tail_block_case2_conditional_backward_branch_with_blr() {
-        let section = make_code_section(0x1000, &[
-            NOP, NOP, NOP, NOP,             // preceding func
-            ADDI_R3,                         // 0x1010: some work
-            ppc_bne(-0x14),                  // 0x1014: bne -> 0x1004 (back into preceding)
-            BLR,                             // 0x1018: blr
-        ]);
+        let section = make_code_section(
+            0x1000,
+            &[
+                NOP,
+                NOP,
+                NOP,
+                NOP,            // preceding func
+                ADDI_R3,        // 0x1010: some work
+                ppc_bne(-0x14), // 0x1014: bne -> 0x1004 (back into preceding)
+                BLR,            // 0x1018: blr
+            ],
+        );
 
         let gap_start = SectionAddress::new(0, 0x1010);
         let gap_end = SectionAddress::new(0, 0x101C);
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, Some(gap_end));
     }
 
     /// Not a tail block: gap contains a function call (bl).
     #[test]
     fn test_not_tail_block_contains_call() {
-        let section = make_code_section(0x1000, &[
-            NOP, NOP, NOP, NOP,             // preceding func
-            ppc_bl(0x100),                   // 0x1010: bl 0x1110 (function call)
-            BLR,                             // 0x1014: blr
-        ]);
+        let section = make_code_section(
+            0x1000,
+            &[
+                NOP,
+                NOP,
+                NOP,
+                NOP,           // preceding func
+                ppc_bl(0x100), // 0x1010: bl 0x1110 (function call)
+                BLR,           // 0x1014: blr
+            ],
+        );
 
         let gap_start = SectionAddress::new(0, 0x1010);
         let gap_end = SectionAddress::new(0, 0x1018);
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
     /// Not a tail block: gap branches forward to another function (not back into predecessor).
     #[test]
     fn test_not_tail_block_forward_branch() {
-        let section = make_code_section(0x1000, &[
-            NOP, NOP, NOP, NOP,             // preceding func
-            ppc_b(0x100),                    // 0x1010: b 0x1110 (forward to other code)
-            BLR,                             // 0x1014: blr
-        ]);
+        let section = make_code_section(
+            0x1000,
+            &[
+                NOP,
+                NOP,
+                NOP,
+                NOP,          // preceding func
+                ppc_b(0x100), // 0x1010: b 0x1110 (forward to other code)
+                BLR,          // 0x1014: blr
+            ],
+        );
 
         let gap_start = SectionAddress::new(0, 0x1010);
         let gap_end = SectionAddress::new(0, 0x1018);
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
@@ -1529,49 +1734,55 @@ mod tests {
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
     /// Not a tail block: has backward branch but no blr (no return).
     #[test]
     fn test_not_tail_block_no_blr() {
-        let section = make_code_section(0x1000, &[
-            NOP, NOP, NOP, NOP,             // preceding func
-            ADDI_R3,                         // 0x1010
-            ppc_bne(-0x14),                  // 0x1014: bne -> 0x1004
-            NOP,                             // 0x1018: no blr, just nop
-        ]);
+        let section = make_code_section(
+            0x1000,
+            &[
+                NOP,
+                NOP,
+                NOP,
+                NOP,            // preceding func
+                ADDI_R3,        // 0x1010
+                ppc_bne(-0x14), // 0x1014: bne -> 0x1004
+                NOP,            // 0x1018: no blr, just nop
+            ],
+        );
 
         let gap_start = SectionAddress::new(0, 0x1010);
         let gap_end = SectionAddress::new(0, 0x101C);
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
     /// Not a tail block: contains bctr (indirect branch).
     #[test]
     fn test_not_tail_block_indirect_branch() {
-        let section = make_code_section(0x1000, &[
-            NOP, NOP, NOP, NOP,             // preceding func
-            BCTR,                            // 0x1010: bctr
-        ]);
+        let section = make_code_section(
+            0x1000,
+            &[
+                NOP, NOP, NOP, NOP,  // preceding func
+                BCTR, // 0x1010: bctr
+            ],
+        );
 
         let gap_start = SectionAddress::new(0, 0x1010);
         let gap_end = SectionAddress::new(0, 0x1014);
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
@@ -1579,9 +1790,7 @@ mod tests {
     /// This ensures the linker can resolve cross-object jumptable references.
     #[test]
     fn test_jump_table_symbols_are_global() {
-        use crate::obj::{
-            ObjArchitecture, ObjInfo, ObjKind, ObjSectionKind, ObjSymbolScope,
-        };
+        use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSectionKind, ObjSymbolScope};
 
         // Create a minimal ObjInfo with a .rodata section covering the jump table
         let section = ObjSection {
@@ -1632,21 +1841,26 @@ mod tests {
     /// The tail block is shorter than the full gap.
     #[test]
     fn test_tail_block_case1_blr_before_gap_end() {
-        let section = make_code_section(0x1000, &[
-            NOP, NOP, NOP, NOP,             // preceding func (0x1000..0x1010)
-            ppc_b(-0xC),                     // 0x1010: b 0x1004
-            BLR,                             // 0x1014: blr
-            NOP,                             // 0x1018: padding (within gap but after blr)
-        ]);
+        let section = make_code_section(
+            0x1000,
+            &[
+                NOP,
+                NOP,
+                NOP,
+                NOP,         // preceding func (0x1000..0x1010)
+                ppc_b(-0xC), // 0x1010: b 0x1004
+                BLR,         // 0x1014: blr
+                NOP,         // 0x1018: padding (within gap but after blr)
+            ],
+        );
 
         let gap_start = SectionAddress::new(0, 0x1010);
         let gap_end = SectionAddress::new(0, 0x101C); // gap extends past blr
         let func_start = SectionAddress::new(0, 0x1000);
         let func_end = SectionAddress::new(0, 0x1010);
 
-        let result = AnalyzerState::check_tail_block(
-            &section, gap_start, gap_end, func_start, func_end,
-        );
+        let result =
+            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         // Should detect tail block ending at 0x1018 (right after blr at 0x1014)
         assert_eq!(result, Some(SectionAddress::new(0, 0x1018)));
     }

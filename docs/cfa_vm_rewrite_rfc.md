@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: M1 complete, M2 structured shadow-diff baseline active
+- Phase: M1 complete, M2a corpus shadow harness complete, M3 guardrail prep active
 - Initial scaffold: `src/analysis/vm2.rs`
 
 Current implementation snapshot:
@@ -13,6 +13,12 @@ Current implementation snapshot:
 - Legacy provenance is mapped into VM2 provenance (`register`, `stack slot`, legacy memory forms).
 - New VM2 parity tests include relative jump-table propagation from real legacy VM execution.
 - Structured VM shadow diff reporting is available via `VmShadowDiffReport::from_legacy_pair`.
+- VM corpus shadow reporting now includes:
+  - `VmCorpusShadowFixtureResult`
+  - `VmCorpusShadowReport`
+- Zero-diff gates now run for:
+  - selected fixture subset (`1, 4, 8, 12, 19`)
+  - full CFA fixture corpus
 
 ## Why this rewrite exists
 
@@ -103,13 +109,19 @@ Confidence is attached to derived indexed-load and branch-target facts. Consumer
 - Run legacy VM and VM2 side-by-side on selected corpus.
 - Compare emitted branch/jump-table facts and range outcomes.
 
-### M2a: Corpus parity harness (next checkpoint)
+### M2a: Corpus parity harness (complete)
 
 - Add reusable VM shadow harness over CFA fixture corpus paths.
 - Emit aggregate `VmShadowDiffSummary` plus per-fixture mismatch reports.
 - Gate policy:
   - `value/provenance/confidence/presence` deltas must be explicitly categorized.
   - unresolved deltas above threshold keep VM2 disabled for adoption.
+
+### M3a: Guardrail prep (baseline complete)
+
+- Added candidate shadow threshold config and decision model in CFA.
+- Added fallback-selection helper that preserves legacy result on threshold breach.
+- Added regression tests for VM/phase threshold triggers and digest-preserving fallback behavior.
 
 ### M3: Controlled adoption
 
