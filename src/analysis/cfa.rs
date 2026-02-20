@@ -21,7 +21,9 @@ use crate::{
         },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
-        vm2::{runtime_vm_shadow_report, VmRuntimeShadowConfig, VmRuntimeShadowReport},
+        vm2::{
+            runtime_vm_shadow_report_with_mode, VmRuntimeShadowConfig, VmRuntimeShadowReport,
+        },
         RelocationTarget,
     },
     obj::{
@@ -146,6 +148,7 @@ pub(crate) const ENV_MAX_VM_SHADOW_DELTAS: &str = "DTK_CFA_MAX_VM_SHADOW_DELTAS"
 pub(crate) const ENV_MAX_PHASE_CHECKPOINT_DELTAS: &str = "DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS";
 pub(crate) const ENV_VM_SHADOW_MAX_FUNCTIONS: &str = "DTK_CFA_VM_SHADOW_MAX_FUNCTIONS";
 pub(crate) const ENV_VM_SHADOW_MAX_STEPS: &str = "DTK_CFA_VM_SHADOW_MAX_STEPS";
+pub(crate) const ENV_VM_SHADOW_NATIVE_VM2: &str = "DTK_CFA_VM_SHADOW_NATIVE_VM2";
 pub(crate) const ENV_CANDIDATE_STRICT_CODE_SEEDS: &str = "DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS";
 const MAX_LOGGED_SHADOW_DELTA_ENTRIES: usize = 8;
 
@@ -222,14 +225,16 @@ fn log_vm_runtime_shadow_function_entries(report: &VmRuntimeShadowReport) {
     log::warn!("VM shadow function deltas (showing {} of {}):", shown, mismatched.len());
     for function_report in mismatched.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
         log::warn!(
-            "  {}: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) sampled_steps={}",
+            "  {}: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) sampled_steps={} native_steps={} bridged_steps={}",
             function_report.start,
             function_report.total_diffs(),
             function_report.summary.presence,
             function_report.summary.value,
             function_report.summary.provenance,
             function_report.summary.confidence,
-            function_report.steps_sampled
+            function_report.steps_sampled,
+            function_report.native_steps,
+            function_report.bridged_steps
         );
     }
 }
@@ -668,10 +673,15 @@ impl AnalyzerState {
                     default_config.max_steps_per_function,
                 ),
             };
-            let vm_shadow_report =
-                runtime_vm_shadow_report(obj, &legacy_seed_addresses, vm_shadow_config);
+            let vm_shadow_native_vm2 = read_shadow_bool_env(ENV_VM_SHADOW_NATIVE_VM2, false);
+            let vm_shadow_report = runtime_vm_shadow_report_with_mode(
+                obj,
+                &legacy_seed_addresses,
+                vm_shadow_config,
+                vm_shadow_native_vm2,
+            );
             log::debug!(
-                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} mismatched_functions={} max_functions={} max_steps={}",
+                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} native_steps={} bridged_steps={} mismatched_functions={} native_vm2={} max_functions={} max_steps={}",
                 vm_shadow_report.total_diffs(),
                 vm_shadow_report.summary.presence,
                 vm_shadow_report.summary.value,
@@ -680,7 +690,10 @@ impl AnalyzerState {
                 vm_shadow_report.functions_requested,
                 vm_shadow_report.functions_sampled,
                 vm_shadow_report.steps_sampled,
+                vm_shadow_report.native_steps,
+                vm_shadow_report.bridged_steps,
                 vm_shadow_report.functions_with_diffs(),
+                vm_shadow_native_vm2,
                 vm_shadow_config.max_functions,
                 vm_shadow_config.max_steps_per_function
             );

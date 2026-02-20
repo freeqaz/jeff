@@ -95,11 +95,14 @@ Follow-up status:
       - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
       - `DTK_CFA_VM_SHADOW_MAX_FUNCTIONS`
       - `DTK_CFA_VM_SHADOW_MAX_STEPS`
+      - `DTK_CFA_VM_SHADOW_NATIVE_VM2`
     - Runtime VM coverage diagnostics:
       - `analysis::vm2::VmRuntimeShadowReport`
       - `analysis::vm2::VmRuntimeShadowFunctionReport`
       - `analysis::vm2::runtime_vm_shadow_report(...)`
+      - `analysis::vm2::runtime_vm_shadow_report_with_mode(...)`
       - CFA fallback path now logs bounded mismatched function summaries.
+      - Runtime report now tracks `native_steps` and `bridged_steps` (total + per-function).
   - Candidate pipeline lane update:
     - Added `analysis::pipeline::CandidatePipelineEngine` (parity-mirrored implementation stage).
     - Runtime shadow compares legacy vs candidate pipeline engines.
@@ -116,6 +119,9 @@ Follow-up status:
       - Result: `20/20` pass.
     - VM-gated env smoke:
       - `DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=4 DTK_CFA_VM_SHADOW_MAX_STEPS=64 cargo test cfa_tests`
+      - Result: `20/20` pass.
+    - Native-VM2-gated env smoke:
+      - `DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=4 DTK_CFA_VM_SHADOW_MAX_STEPS=64 cargo test cfa_tests`
       - Result: `20/20` pass.
     - Combined-gates real-XEX smoke:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-<timestamp>`
@@ -148,8 +154,8 @@ Follow-up status:
     - Post-E2d shadow-gated rerun:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-e2d-<timestamp>`
       - Result: `rc=0`, `4448` files, `2223` `.obj`.
-      - Compared to older baseline, only `config.json`, `dep`, and `obj/xdk/LIBCMT/crtgpr.obj`
-        changed; `crtgpr.obj` change matches the COMDAT CRT stub policy update.
+      - Compared to older baseline, only `config.json`, `dep`, `obj/xdk/LIBCMT/crtgpr.obj`, and
+        `obj/xdk/LIBCMT/crtfpr.obj` changed; these match the COMDAT CRT stub policy update.
       - Same-commit rerun is deterministic (no non-trivial diffs excluding `config.json`/`dep`).
   - Useful local XEX paths:
     - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`

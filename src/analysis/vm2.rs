@@ -3,6 +3,8 @@ use std::{
     num::NonZeroU32,
 };
 
+use powerpc::{Ins, Opcode};
+
 use crate::analysis::{
     disassemble,
     cfa::SectionAddress,
@@ -217,6 +219,21 @@ impl Vm2 {
     pub fn read_stack_slot(&self, offset: i16) -> Option<&ValueFact2> {
         self.stack_slots.get(&offset)
     }
+
+    /// Best-effort native VM2 runtime-shadow step.
+    /// Returns `true` when the opcode is handled natively; callers should bridge from legacy VM
+    /// state when `false`.
+    pub fn step_shadow_native(&mut self, ins: Ins) -> bool {
+        match ins.op {
+            // `ori rX, rX, 0` / `nop`: no semantic state change.
+            Opcode::Ori if ins.field_uimm() == 0 && ins.field_ra() == ins.field_rs() => true,
+            // Non-link branches do not update architectural value state tracked by VM2.
+            Opcode::B | Opcode::Bc | Opcode::Bcctr | Opcode::Bclr if !ins.field_lk() => true,
+            // Illegal decode terminates execution in both VMs without mutating tracked facts.
+            Opcode::Illegal => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -330,6 +347,8 @@ impl Default for VmRuntimeShadowConfig {
 pub struct VmRuntimeShadowFunctionReport {
     pub start: SectionAddress,
     pub steps_sampled: usize,
+    pub native_steps: usize,
+    pub bridged_steps: usize,
     pub summary: VmShadowDiffSummary,
 }
 
@@ -345,6 +364,8 @@ pub struct VmRuntimeShadowReport {
     pub functions_requested: usize,
     pub functions_sampled: usize,
     pub steps_sampled: usize,
+    pub native_steps: usize,
+    pub bridged_steps: usize,
     pub function_reports: Vec<VmRuntimeShadowFunctionReport>,
 }
 
@@ -462,6 +483,15 @@ pub fn runtime_vm_shadow_report(
     function_starts: &[SectionAddress],
     config: VmRuntimeShadowConfig,
 ) -> VmRuntimeShadowReport {
+    runtime_vm_shadow_report_with_mode(obj, function_starts, config, false)
+}
+
+pub fn runtime_vm_shadow_report_with_mode(
+    obj: &ObjInfo,
+    function_starts: &[SectionAddress],
+    config: VmRuntimeShadowConfig,
+    native_vm2: bool,
+) -> VmRuntimeShadowReport {
     let mut report = VmRuntimeShadowReport::default();
     if config.max_functions == 0 || config.max_steps_per_function == 0 {
         return report;
@@ -478,10 +508,16 @@ pub fn runtime_vm_shadow_report(
             continue;
         }
         report.functions_sampled += 1;
-        let mut function_report =
-            VmRuntimeShadowFunctionReport { start, steps_sampled: 0, summary: Default::default() };
+        let mut function_report = VmRuntimeShadowFunctionReport {
+            start,
+            steps_sampled: 0,
+            native_steps: 0,
+            bridged_steps: 0,
+            summary: Default::default(),
+        };
 
         let mut vm = VM::new_from_obj(obj);
+        let mut vm2_native = native_vm2.then(Vm2::new);
         let mut addr = start;
         for _ in 0..config.max_steps_per_function {
             if !section.contains(addr.address) {
@@ -492,12 +528,30 @@ pub fn runtime_vm_shadow_report(
             };
             function_report.steps_sampled += 1;
             report.steps_sampled += 1;
-            let result = vm.step(obj, addr, ins);
 
-            // Candidate runtime shadow currently maps from the legacy VM state.
-            let candidate = Vm2::from_legacy_vm(&vm);
-            let diff = VmShadowDiffReport::from_legacy_pair(&vm, &candidate);
-            function_report.summary.accumulate(&diff.summary);
+            let native_handled = if let Some(vm2) = vm2_native.as_mut() {
+                vm2.step_shadow_native(ins)
+            } else {
+                false
+            };
+            let result = vm.step(obj, addr, ins);
+            if let Some(vm2) = vm2_native.as_mut() {
+                if native_handled {
+                    function_report.native_steps += 1;
+                    report.native_steps += 1;
+                } else {
+                    *vm2 = Vm2::from_legacy_vm(&vm);
+                    function_report.bridged_steps += 1;
+                    report.bridged_steps += 1;
+                }
+                let diff = VmShadowDiffReport::from_legacy_pair(&vm, vm2);
+                function_report.summary.accumulate(&diff.summary);
+            } else {
+                // Baseline mode maps candidate facts from legacy VM state.
+                let candidate = Vm2::from_legacy_vm(&vm);
+                let diff = VmShadowDiffReport::from_legacy_pair(&vm, &candidate);
+                function_report.summary.accumulate(&diff.summary);
+            }
 
             match result {
                 StepResult::Continue | StepResult::LoadStore { .. } | StepResult::Branch(_) => {
@@ -517,7 +571,7 @@ pub fn runtime_vm_shadow_summary(
     function_starts: &[SectionAddress],
     config: VmRuntimeShadowConfig,
 ) -> VmShadowDiffSummary {
-    runtime_vm_shadow_report(obj, function_starts, config).summary
+    runtime_vm_shadow_report_with_mode(obj, function_starts, config, false).summary
 }
 
 #[cfg(test)]
@@ -648,7 +702,38 @@ mod tests {
             "runtime shadow report should record at least one sampled step"
         );
         assert_eq!(report.function_reports[0].steps_sampled, report.steps_sampled);
+        assert_eq!(report.native_steps, 0);
+        assert_eq!(report.bridged_steps, 0);
+        assert_eq!(report.function_reports[0].native_steps, 0);
+        assert_eq!(report.function_reports[0].bridged_steps, 0);
         assert_eq!(report.functions_with_diffs(), 0);
+        assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_native_mode_tracks_native_and_bridged_steps() {
+        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x3860_0001, 0x4E80_0020]);
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report_with_mode(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+            true,
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 1);
+        assert_eq!(report.function_reports.len(), 1);
+        let function_report = &report.function_reports[0];
+        assert!(
+            function_report.native_steps >= 1,
+            "expected at least one natively handled step in native mode"
+        );
+        assert!(
+            function_report.bridged_steps >= 1,
+            "expected at least one bridged step in native mode"
+        );
+        assert_eq!(report.native_steps, function_report.native_steps);
+        assert_eq!(report.bridged_steps, function_report.bridged_steps);
         assert_eq!(report.total_diffs(), 0);
     }
 
@@ -679,6 +764,8 @@ mod tests {
         assert_eq!(report.functions_requested, 1);
         assert_eq!(report.functions_sampled, 0);
         assert_eq!(report.steps_sampled, 0);
+        assert_eq!(report.native_steps, 0);
+        assert_eq!(report.bridged_steps, 0);
         assert!(report.function_reports.is_empty());
         assert_eq!(report.total_diffs(), 0);
     }

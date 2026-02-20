@@ -397,6 +397,25 @@ Open technical debt (non-blocking for this branch state):
     - `analysis::vm2::tests::runtime_vm_shadow_report_skips_non_code_functions`
     - updated `analysis::vm2::tests::runtime_vm_shadow_report_tracks_sampling_counts`
 
+- **Phase E2e complete (R7 native VM2 shadow scaffold)**: runtime VM shadow can now execute VM2 natively with safe bridging.
+  - Added `runtime_vm_shadow_report_with_mode(..., native_vm2)` in `analysis::vm2`.
+  - Added conservative native opcode handling (`nop`/no-op `ori`, non-link branches, illegal).
+  - Unsupported opcodes bridge VM2 state from legacy VM for deterministic fallback-safe shadowing.
+  - Runtime reports now include native/bridged step counters:
+    - total: `VmRuntimeShadowReport::{native_steps, bridged_steps}`
+    - per-function: `VmRuntimeShadowFunctionReport::{native_steps, bridged_steps}`
+  - Added runtime gate:
+    - `DTK_CFA_VM_SHADOW_NATIVE_VM2`
+  - Added regression:
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_tracks_native_and_bridged_steps`
+  - Env-gated test pass:
+    - `DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=4 DTK_CFA_VM_SHADOW_MAX_STEPS=64 cargo test cfa_tests`
+    - Result: `20/20` passing.
+  - Real-XEX smoke with native VM2 shadow gate:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-vm2native-<timestamp>`
+    - Result: `rc=0`, `4448` files, `2223` `.obj`.
+    - Same-commit rerun deterministic (no non-trivial diffs excluding `config.json`/`dep`).
+
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
   - Runtime shadow now compares `LegacyPipelineEngine` vs `CandidatePipelineEngine`.
@@ -467,8 +486,8 @@ Open technical debt (non-blocking for this branch state):
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-e2d-<timestamp>`
     - Result: `status=0`, `4448` total files, `2223` `.obj` files.
     - Compared to earlier `vmreport` baseline:
-      - only `config.json`, `dep`, and `obj/xdk/LIBCMT/crtgpr.obj` differed.
-      - `crtgpr.obj` delta aligns with current COMDAT fall-through handling for `__savegprlr_*`/`__restgprlr_*`.
+      - only `config.json`, `dep`, `obj/xdk/LIBCMT/crtgpr.obj`, and `obj/xdk/LIBCMT/crtfpr.obj` differed.
+      - CRT object deltas align with current COMDAT fall-through handling for `__savegprlr*`/`__restgprlr*` and `__savefpr*`/`__restfpr*`.
     - Determinism check (same commit, second run):
       - no non-trivial diffs (`config.json`/`dep` excluded).
 
@@ -488,7 +507,8 @@ Open technical debt (non-blocking for this branch state):
      (seed/slice/finalization micro-change with parity proof and rollback path).
    - Keep legacy analyzer default unless checkpoint + digest parity remain clean.
 2. **R7 implementation: operational fallback routing (B7/B8)**:
-   - Replace mapped-legacy VM shadow baseline with true VM2-executed runtime deltas.
+   - Expand native VM2 opcode coverage in runtime shadow to reduce bridge dependency.
+   - Keep bridge fallback deterministic and bounded while coverage grows.
    - Emit structured mismatch logs with actionable fixture-level summaries.
 3. **Real-XEX parity proof loop**:
    - Run shadow parity against real XEX workflows in `~/code/milohax/dc3-decomp` and the executables repo.

@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: M1 complete, M2a corpus shadow harness complete, M3 guardrail prep active (runtime VM deltas baseline wired)
+- Phase: M1 complete, M2a corpus shadow harness complete, M3 guardrail prep active (native runtime shadow scaffold + bridge fallback wired)
 - Initial scaffold: `src/analysis/vm2.rs`
 
 Current implementation snapshot:
@@ -22,19 +22,24 @@ Current implementation snapshot:
 - Runtime note:
   - CFA shadow fallback now uses live pipeline checkpoint/digest deltas.
   - VM shadow delta baseline is now measured at runtime from bounded linear seed-function traces.
-  - Current runtime metric compares legacy VM to mapped VM2 state (expected zero-delta baseline).
+  - Runtime mode options:
+    - mapped baseline (`runtime_vm_shadow_report(...)`)
+    - native VM2 shadow with legacy bridge fallback (`runtime_vm_shadow_report_with_mode(..., true)`)
   - Runtime sampling API:
     - `runtime_vm_shadow_summary(...)`
     - `runtime_vm_shadow_report(...)`
+    - `runtime_vm_shadow_report_with_mode(...)`
     - `VmRuntimeShadowConfig`
     - `VmRuntimeShadowReport`
     - `VmRuntimeShadowFunctionReport`
-  - Runtime VM shadow reports now include per-function sampled-step and categorized diff summaries.
+  - Runtime VM shadow reports now include per-function sampled-step/categorized diff summaries
+    plus native-vs-bridged coverage counters.
   - Runtime gate controls already available for VM rollout:
     - `DTK_CFA_ENABLE_VM2_SHADOW`
     - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
     - `DTK_CFA_VM_SHADOW_MAX_FUNCTIONS`
     - `DTK_CFA_VM_SHADOW_MAX_STEPS`
+    - `DTK_CFA_VM_SHADOW_NATIVE_VM2`
 
 ## Why this rewrite exists
 
