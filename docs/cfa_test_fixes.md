@@ -87,6 +87,11 @@ Follow-up status:
       phase-checkpoint and pipeline-digest deltas when shadow gates are enabled.
     - New conservative fallback reason: `PipelineDigestMismatch`.
     - VM2 runtime delta remains temporarily fixed at `0` until VM2 candidate execution wiring lands.
+    - Shadow gate env controls are available:
+      - `DTK_CFA_ENABLE_VM2_SHADOW`
+      - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
+      - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
+      - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
   - Candidate pipeline lane update:
     - Added `analysis::pipeline::CandidatePipelineEngine` (parity-mirrored implementation stage).
     - Runtime shadow compares legacy vs candidate pipeline engines.

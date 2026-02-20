@@ -1,6 +1,7 @@
 use std::{
     cmp::min,
     collections::{BTreeMap, BTreeSet},
+    env,
     fmt::{Debug, Display, Formatter, UpperHex},
     ops::{Add, AddAssign, BitAnd, Sub},
 };
@@ -137,6 +138,38 @@ pub(crate) const ENABLE_VM2_CANDIDATE_SHADOW: bool = false;
 pub(crate) const ENABLE_PIPELINE_CANDIDATE_SHADOW: bool = false;
 pub(crate) const MAX_ALLOWED_VM_SHADOW_DELTAS: usize = 0;
 pub(crate) const MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS: usize = 0;
+pub(crate) const ENV_ENABLE_VM2_SHADOW: &str = "DTK_CFA_ENABLE_VM2_SHADOW";
+pub(crate) const ENV_ENABLE_PIPELINE_SHADOW: &str = "DTK_CFA_ENABLE_PIPELINE_SHADOW";
+pub(crate) const ENV_MAX_VM_SHADOW_DELTAS: &str = "DTK_CFA_MAX_VM_SHADOW_DELTAS";
+pub(crate) const ENV_MAX_PHASE_CHECKPOINT_DELTAS: &str = "DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS";
+
+fn parse_shadow_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn read_shadow_bool_env(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(raw) => parse_shadow_bool(&raw).unwrap_or_else(|| {
+            log::warn!("Invalid {} value '{}', using default {}", name, raw, default);
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+fn read_shadow_usize_env(name: &str, default: usize) -> usize {
+    match env::var(name) {
+        Ok(raw) => raw.parse::<usize>().unwrap_or_else(|_| {
+            log::warn!("Invalid {} value '{}', using default {}", name, raw, default);
+            default
+        }),
+        Err(_) => default,
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct CandidateShadowGateConfig {
@@ -147,12 +180,24 @@ pub(crate) struct CandidateShadowGateConfig {
 }
 
 impl CandidateShadowGateConfig {
-    pub(crate) const fn defaults() -> Self {
+    pub(crate) fn defaults() -> Self {
         Self {
-            enable_vm2_shadow: ENABLE_VM2_CANDIDATE_SHADOW,
-            enable_pipeline_shadow: ENABLE_PIPELINE_CANDIDATE_SHADOW,
-            max_vm_shadow_deltas: MAX_ALLOWED_VM_SHADOW_DELTAS,
-            max_phase_checkpoint_deltas: MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS,
+            enable_vm2_shadow: read_shadow_bool_env(
+                ENV_ENABLE_VM2_SHADOW,
+                ENABLE_VM2_CANDIDATE_SHADOW,
+            ),
+            enable_pipeline_shadow: read_shadow_bool_env(
+                ENV_ENABLE_PIPELINE_SHADOW,
+                ENABLE_PIPELINE_CANDIDATE_SHADOW,
+            ),
+            max_vm_shadow_deltas: read_shadow_usize_env(
+                ENV_MAX_VM_SHADOW_DELTAS,
+                MAX_ALLOWED_VM_SHADOW_DELTAS,
+            ),
+            max_phase_checkpoint_deltas: read_shadow_usize_env(
+                ENV_MAX_PHASE_CHECKPOINT_DELTAS,
+                MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS,
+            ),
         }
     }
 }
@@ -1545,6 +1590,25 @@ mod tests {
         let decision = evaluate_candidate_shadow_decision(1, 0, config);
         assert!(decision.should_fallback());
         assert_eq!(decision.reasons, vec![CandidateFallbackReason::VmShadowDeltasExceeded]);
+    }
+
+    #[test]
+    fn test_parse_shadow_bool_accepts_common_values() {
+        assert_eq!(parse_shadow_bool("1"), Some(true));
+        assert_eq!(parse_shadow_bool("true"), Some(true));
+        assert_eq!(parse_shadow_bool("YES"), Some(true));
+        assert_eq!(parse_shadow_bool("on"), Some(true));
+        assert_eq!(parse_shadow_bool("0"), Some(false));
+        assert_eq!(parse_shadow_bool("false"), Some(false));
+        assert_eq!(parse_shadow_bool("No"), Some(false));
+        assert_eq!(parse_shadow_bool("off"), Some(false));
+    }
+
+    #[test]
+    fn test_parse_shadow_bool_rejects_invalid_values() {
+        assert_eq!(parse_shadow_bool(""), None);
+        assert_eq!(parse_shadow_bool("2"), None);
+        assert_eq!(parse_shadow_bool("maybe"), None);
     }
 
     #[test]

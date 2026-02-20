@@ -343,6 +343,11 @@ Open technical debt (non-blocking for this branch state):
   - Fallback routing is now driven by live measured deltas, not only synthetic test injection.
   - Conservative guardrail: any final digest mismatch adds `PipelineDigestMismatch` fallback reason.
   - Current VM2 runtime delta is explicitly `0` until VM2 candidate execution is wired.
+  - Shadow gate env controls now supported for real-XEX parity runs:
+    - `DTK_CFA_ENABLE_VM2_SHADOW` (`true/false`, `1/0`, etc.)
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
+    - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
+    - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
 
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.

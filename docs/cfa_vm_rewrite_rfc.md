@@ -22,6 +22,9 @@ Current implementation snapshot:
 - Runtime note:
   - CFA shadow fallback now uses live pipeline checkpoint/digest deltas.
   - VM2 runtime shadow metric is still temporarily fixed at `0` until VM2 execution is wired into CFA.
+  - Runtime gate controls already available for VM rollout:
+    - `DTK_CFA_ENABLE_VM2_SHADOW`
+    - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
 
 ## Why this rewrite exists
 
