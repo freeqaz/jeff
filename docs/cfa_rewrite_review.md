@@ -377,6 +377,14 @@ Open technical debt (non-blocking for this branch state):
     - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
   - Full fixture shadow corpus parity test remains green with candidate lane active.
 
+- **Phase E1b complete (R6 first true divergence)**: candidate seed phase now has independent implementation.
+  - `CandidatePipelineEngine::phase_seed_discovery` now runs a candidate-owned seed pass
+    (known functions, symbol starts, section starts) instead of calling
+    `AnalyzerState::phase_seed_discovery`.
+  - Added parity regression:
+    - `analysis::pipeline::tests::candidate_seed_phase_matches_legacy_seed_phase`
+  - Candidate-vs-legacy digest parity remains clean across full fixture shadow corpus.
+
 - **Phase E validation complete**: real-XEX parity smoke on external corpora.
   - Built release `dtk` from current branch and ran real DC3 split flow to `/tmp`:
     - `dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-<timestamp>`
@@ -403,7 +411,7 @@ Open technical debt (non-blocking for this branch state):
 ### Next Phase Queue
 
 1. **R6 implementation: candidate phase component spikes (B8)**:
-   - Implement first true candidate phase divergence (seed or slice stage) inside `CandidatePipelineEngine`.
+   - Implement first candidate slice/finalization divergence inside `CandidatePipelineEngine`.
    - Keep legacy analyzer default unless checkpoint + digest parity remain clean.
 2. **R7 implementation: operational fallback routing (B7/B8)**:
    - Replace mapped-legacy VM shadow baseline with true VM2-executed runtime deltas.

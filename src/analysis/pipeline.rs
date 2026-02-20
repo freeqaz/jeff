@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 
 use crate::{
-    analysis::cfa::{AnalyzerState, SectionAddress},
+    analysis::cfa::{AnalyzerState, FunctionInfo, SectionAddress},
     obj::{ObjInfo, ObjSectionKind, ObjSymbolKind},
 };
 
@@ -392,21 +392,56 @@ impl CandidatePipelineEngine {
     pub fn new(skip_ranges: BTreeMap<SectionAddress, SectionAddress>) -> Self {
         Self { state: AnalyzerState::new(skip_ranges) }
     }
+
+    fn candidate_seed_discovery(&mut self, obj: &ObjInfo) -> Vec<FunctionSeed> {
+        // Candidate path intentionally owns this phase implementation so future seed
+        // heuristics can diverge without touching legacy analyzer internals.
+        for (&addr, &size) in &obj.known_functions {
+            self.state.functions.insert(
+                addr,
+                FunctionInfo { analyzed: false, end: size.map(|known_size| addr + known_size), slices: None },
+            );
+        }
+
+        for (_, symbol) in obj.symbols.by_kind(ObjSymbolKind::Function) {
+            let Some(section_index) = symbol.section else { continue };
+            let start = SectionAddress::new(section_index, symbol.address as u32);
+            self.state.functions.insert(
+                start,
+                FunctionInfo {
+                    analyzed: false,
+                    end: if symbol.size_known { Some(start + symbol.size as u32) } else { None },
+                    slices: None,
+                },
+            );
+        }
+
+        for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
+            let section_start = SectionAddress::new(section_index, section.address as u32);
+            if obj
+                .symbols
+                .by_name(&format!("except_data_{:08X}", section_start.address + 8))
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            self.state.functions.entry(section_start).or_default();
+        }
+
+        self.state
+            .functions
+            .keys()
+            .copied()
+            .map(|address| FunctionSeed { address, source: classify_seed_source(obj, address) })
+            .collect()
+    }
 }
 
 impl CfaPipelineEngine for CandidatePipelineEngine {
     fn phase_seed_discovery(&mut self, obj: &ObjInfo) -> Result<SeedDiscoveryOutput> {
-        // Candidate phase hook: currently mirrors legacy semantics to enforce parity-first rollout.
-        let seeds = self
-            .state
-            .phase_seed_discovery(obj)?
-            .into_iter()
-            .map(|address| FunctionSeed {
-                address,
-                source: classify_seed_source(obj, address),
-            })
-            .collect();
-        Ok(SeedDiscoveryOutput { seeds })
+        Ok(SeedDiscoveryOutput { seeds: self.candidate_seed_discovery(obj) })
     }
 
     fn phase_slice_exploration(
@@ -767,6 +802,44 @@ mod tests {
                 .iter()
                 .any(|entry| entry.address == known && entry.source == SeedSource::KnownFunction),
             "known function seed should preserve provenance"
+        );
+    }
+
+    #[test]
+    fn candidate_seed_phase_matches_legacy_seed_phase() {
+        let mut obj = make_obj(0x1000, &[NOP, BLR, NOP, BLR]);
+        obj.known_functions.insert(SectionAddress::new(0, 0x1000), Some(8));
+
+        let mut legacy = LegacyPipelineEngine::new(BTreeMap::new());
+        let legacy_seed = legacy
+            .phase_seed_discovery(&obj)
+            .expect("legacy seed phase should succeed");
+
+        let mut candidate = CandidatePipelineEngine::new(BTreeMap::new());
+        let candidate_seed = candidate
+            .phase_seed_discovery(&obj)
+            .expect("candidate seed phase should succeed");
+
+        assert_eq!(
+            candidate_seed, legacy_seed,
+            "candidate seed output must match legacy output during parity stage"
+        );
+
+        let legacy_functions = legacy
+            .state
+            .functions
+            .iter()
+            .map(|(&addr, info)| (addr, info.end))
+            .collect::<BTreeMap<_, _>>();
+        let candidate_functions = candidate
+            .state
+            .functions
+            .iter()
+            .map(|(&addr, info)| (addr, info.end))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            candidate_functions, legacy_functions,
+            "candidate seed phase should materialize the same initial function map"
         );
     }
 
