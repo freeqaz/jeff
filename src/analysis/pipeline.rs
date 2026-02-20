@@ -43,6 +43,36 @@ pub struct ApplyOutput {
     pub jump_table_symbol_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PipelineDiffKind {
+    FunctionPresence,
+    FunctionEnd,
+    JumpTablePresence,
+    JumpTableSize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PipelineDiffEntry {
+    pub kind: PipelineDiffKind,
+    pub address: SectionAddress,
+    pub left: String,
+    pub right: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct PipelineDiffSummary {
+    pub function_presence: usize,
+    pub function_end: usize,
+    pub jump_table_presence: usize,
+    pub jump_table_size: usize,
+}
+
+impl PipelineDiffSummary {
+    pub fn total(&self) -> usize {
+        self.function_presence + self.function_end + self.jump_table_presence + self.jump_table_size
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct PipelineDigest {
     pub functions: BTreeMap<SectionAddress, Option<SectionAddress>>,
@@ -57,7 +87,7 @@ impl PipelineDigest {
         }
     }
 
-    pub fn diff(&self, other: &Self) -> Vec<String> {
+    pub fn diff_entries(&self, other: &Self) -> Vec<PipelineDiffEntry> {
         let mut diffs = Vec::new();
 
         let function_keys =
@@ -66,10 +96,16 @@ impl PipelineDigest {
             let left = self.functions.get(&key);
             let right = other.functions.get(&key);
             if left != right {
-                diffs.push(format!(
-                    "function mismatch at {key}: left {:?}, right {:?}",
-                    left, right
-                ));
+                let kind = match (left, right) {
+                    (Some(_), Some(_)) => PipelineDiffKind::FunctionEnd,
+                    _ => PipelineDiffKind::FunctionPresence,
+                };
+                diffs.push(PipelineDiffEntry {
+                    kind,
+                    address: key,
+                    left: format!("{left:?}"),
+                    right: format!("{right:?}"),
+                });
             }
         }
 
@@ -83,14 +119,44 @@ impl PipelineDigest {
             let left = self.jump_tables.get(&key);
             let right = other.jump_tables.get(&key);
             if left != right {
-                diffs.push(format!(
-                    "jump-table mismatch at {key}: left {:?}, right {:?}",
-                    left, right
-                ));
+                let kind = match (left, right) {
+                    (Some(_), Some(_)) => PipelineDiffKind::JumpTableSize,
+                    _ => PipelineDiffKind::JumpTablePresence,
+                };
+                diffs.push(PipelineDiffEntry {
+                    kind,
+                    address: key,
+                    left: format!("{left:?}"),
+                    right: format!("{right:?}"),
+                });
             }
         }
 
         diffs
+    }
+
+    pub fn diff_summary(&self, other: &Self) -> PipelineDiffSummary {
+        self.diff_entries(other).into_iter().fold(PipelineDiffSummary::default(), |mut out, diff| {
+            match diff.kind {
+                PipelineDiffKind::FunctionPresence => out.function_presence += 1,
+                PipelineDiffKind::FunctionEnd => out.function_end += 1,
+                PipelineDiffKind::JumpTablePresence => out.jump_table_presence += 1,
+                PipelineDiffKind::JumpTableSize => out.jump_table_size += 1,
+            }
+            out
+        })
+    }
+
+    pub fn diff(&self, other: &Self) -> Vec<String> {
+        self.diff_entries(other)
+            .into_iter()
+            .map(|entry| {
+                format!(
+                    "{:?} mismatch at {}: left {}, right {}",
+                    entry.kind, entry.address, entry.left, entry.right
+                )
+            })
+            .collect()
     }
 }
 
@@ -236,10 +302,97 @@ fn make_obj(base_addr: u32, instructions: &[u32]) -> ObjInfo {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use serde::{Deserialize, Deserializer, de::Error};
+
     use super::*;
+    use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection};
 
     const NOP: u32 = 0x60000000;
     const BLR: u32 = 0x4E800020;
+
+    fn bytestr_to_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_str = String::deserialize(deserializer)?;
+        if hex_str.len() % 2 != 0 {
+            return Err(D::Error::custom("hex string must have even length"));
+        }
+        (0..hex_str.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()
+            .map_err(D::Error::custom)
+    }
+
+    fn get_fn_start<'de, D>(deserializer: D) -> Result<u32, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_str = String::deserialize(deserializer)?;
+        if hex_str.len() != 8 {
+            return Err(D::Error::custom(format!("expected 8 hex chars, got {}", hex_str.len())));
+        }
+        u32::from_str_radix(&hex_str, 16).map_err(D::Error::custom)
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ShadowFixture {
+        test_id: u32,
+        #[serde(deserialize_with = "get_fn_start")]
+        function_start: u32,
+        #[serde(deserialize_with = "bytestr_to_bytes")]
+        function_bytes: Vec<u8>,
+        #[serde(deserialize_with = "get_fn_start")]
+        jump_table_start: u32,
+        #[serde(deserialize_with = "bytestr_to_bytes")]
+        jump_table_bytes: Vec<u8>,
+    }
+
+    fn make_code_section_bytes(base_addr: u32, data: &[u8]) -> ObjSection {
+        ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base_addr as u64,
+            size: data.len() as u64,
+            data: data.to_vec(),
+            align: 0x10000,
+            ..Default::default()
+        }
+    }
+
+    fn make_data_section_bytes(base_addr: u32, data: &[u8]) -> ObjSection {
+        ObjSection {
+            name: ".rdata".into(),
+            kind: ObjSectionKind::ReadOnlyData,
+            address: base_addr as u64,
+            size: data.len() as u64,
+            data: data.to_vec(),
+            align: 0x10000,
+            ..Default::default()
+        }
+    }
+
+    fn fixture_obj(fixture: &ShadowFixture) -> ObjInfo {
+        let code = make_code_section_bytes(fixture.function_start, &fixture.function_bytes);
+        let sections = if fixture.jump_table_start != 0 {
+            vec![
+                make_data_section_bytes(fixture.jump_table_start, &fixture.jump_table_bytes),
+                code,
+            ]
+        } else {
+            vec![code]
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            format!("pipeline-shadow-fixture-{}", fixture.test_id),
+            vec![],
+            sections,
+        )
+    }
 
     #[test]
     fn pipeline_digest_diff_is_empty_for_identical_inputs() {
@@ -270,6 +423,27 @@ mod tests {
 
         let diffs = left.diff(&right);
         assert_eq!(diffs.len(), 2, "expected one function and one jump-table delta");
+    }
+
+    #[test]
+    fn pipeline_digest_diff_summary_categorizes_delta_types() {
+        let mut left = PipelineDigest::default();
+        left.functions.insert(SectionAddress::new(0, 0x1000), Some(SectionAddress::new(0, 0x1020)));
+        left.functions.insert(SectionAddress::new(0, 0x1100), Some(SectionAddress::new(0, 0x1120)));
+        left.jump_tables.insert(SectionAddress::new(0, 0x2000), 0x30);
+        left.jump_tables.insert(SectionAddress::new(0, 0x2100), 0x10);
+
+        let mut right = PipelineDigest::default();
+        right.functions.insert(SectionAddress::new(0, 0x1000), Some(SectionAddress::new(0, 0x101C)));
+        right.jump_tables.insert(SectionAddress::new(0, 0x2000), 0x40);
+        right.jump_tables.insert(SectionAddress::new(0, 0x2200), 0x08);
+
+        let summary = left.diff_summary(&right);
+        assert_eq!(summary.function_end, 1);
+        assert_eq!(summary.function_presence, 1);
+        assert_eq!(summary.jump_table_size, 1);
+        assert_eq!(summary.jump_table_presence, 2);
+        assert_eq!(summary.total(), 5);
     }
 
     #[test]
@@ -308,5 +482,37 @@ mod tests {
             diffs.is_empty(),
             "pipeline run should match manual phase execution, diffs: {diffs:?}"
         );
+    }
+
+    #[test]
+    fn shadow_corpus_selected_fixtures_match_legacy_pipeline_digest() {
+        let fixtures: Vec<ShadowFixture> =
+            serde_yaml::from_reader(File::open("assets/tests/cfa_tests.yml").unwrap())
+                .expect("failed to read CFA fixture corpus");
+        let selected = [0u32, 4u32, 8u32, 12u32, 16u32];
+
+        for fixture in fixtures.iter().filter(|entry| selected.contains(&entry.test_id)) {
+            let obj = fixture_obj(fixture);
+
+            let mut baseline = AnalyzerState::new(BTreeMap::new());
+            baseline
+                .detect_functions(&obj)
+                .unwrap_or_else(|e| panic!("baseline detect_functions failed for {}: {e:#}", fixture.test_id));
+            let baseline_digest = PipelineDigest::from_state(&baseline);
+
+            let mut pipeline = LegacyPipelineEngine::new(BTreeMap::new());
+            let pipeline_digest = pipeline
+                .run(&obj)
+                .unwrap_or_else(|e| panic!("legacy pipeline run failed for {}: {e:#}", fixture.test_id));
+
+            let summary = baseline_digest.diff_summary(&pipeline_digest);
+            assert_eq!(
+                summary.total(),
+                0,
+                "shadow parity mismatch for fixture {}: {:?}",
+                fixture.test_id,
+                baseline_digest.diff(&pipeline_digest)
+            );
+        }
     }
 }

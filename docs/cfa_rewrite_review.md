@@ -236,18 +236,28 @@ Implemented in this branch:
   - Added explicit analyzer invariant validation (`AnalyzerState::validate_invariants`) and wired it into `detect_functions`.
   - Added shadow digest/diff determinism tests for legacy analyzer behavior.
   - Added initial pipeline interface scaffold (`src/analysis/pipeline.rs`) including legacy engine wrapper and digest/diff model.
+  - Split legacy analyzer flow into explicit phase methods:
+    - `phase_seed_discovery`
+    - `phase_slice_seeded_functions`
+    - `phase_discover_remaining_functions`
+    - `phase_finalize_and_validate`
+  - Expanded pipeline contracts with phase outputs (`seed`, `slice`, `finalize`, `apply`) and run report support.
+  - Added structured digest diff categorization (`function presence/end`, `jump-table presence/size`) and summary model.
+  - Added selected real-fixture shadow corpus parity gate:
+    - `analysis::pipeline::tests::shadow_corpus_selected_fixtures_match_legacy_pipeline_digest`
 
 Validation run:
 - `cargo test cfa_tests`
 - `cargo test analysis::slices::tests::tail_call`
 - `cargo test analysis::tests::`
 - `cargo test analysis::vm::tests::`
+- `cargo test analysis::pipeline::tests::`
 
 ## Current Status Snapshot (2026-02-20)
 
 - Branch: `cfa_fix`
 - Version: `1.9.2`
-- Working tree: Phase A/B follow-up in progress (`util/obj` warning triage + shared negative fixtures)
+- Working tree: roadmap execution active (`R2 complete`, `R3 shadow gating baseline complete`)
 - Dev branch delta: only one version-bump commit (`1.9.1`) remains on `dev`, superseded by `1.9.2` here
 
 Current observed test state on this branch:
@@ -257,6 +267,7 @@ Current observed test state on this branch:
 - `cargo test analysis::vm::tests::` -> 3 passed
 - `cargo test analysis::vm2::tests::` -> 2 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
+- `cargo test analysis::pipeline::tests::` -> 6 passed
 
 Open technical debt (non-blocking for this branch state):
 
@@ -273,6 +284,8 @@ Open technical debt (non-blocking for this branch state):
   - Rebuilt release `dtk` and ran:
     - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke2`
   - Result: split completed successfully (`exit=0`), confirming split pipeline is operational for `dc3-decomp`.
+  - Revalidated after concurrent COFF/COMDAT linking edits:
+    - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke3` -> `exit=0`
 
 - **Phase B complete**: added shared negative jump-table fixtures and unit coverage.
   - New asset: `assets/tests/jump_table_negative_snippets.txt`
@@ -285,12 +298,12 @@ Open technical debt (non-blocking for this branch state):
 
 ### Next Phase Queue
 
-1. **R1: VM2 interface extraction (B7 implementation start)**:
-   - Add internal VM2 value/provenance types and transfer-function skeleton in a parallel module.
-   - Keep legacy VM as source of truth; no behavior switch.
-2. **R2: CFA phase-split scaffolding (B8 implementation start)**:
-   - Expand `analysis::pipeline` from digest wrapper into explicit phase I/O contracts for seed, slice, finalize, and apply.
-   - Route legacy analyzer through those phase boundaries without behavior change.
-3. **R3: Shadow corpus and diff gating**:
-   - Expand deterministic shadow digest tests from synthetic unit tests to selected real CFA fixtures.
-   - Gate candidate rewrite phases on zero unresolved high-severity diffs.
+1. **R4: VM2 shadow execution hooks (B7)**:
+   - Execute VM2 in parallel (shadow-only) on selected switch fixtures.
+   - Compare VM2-derived jump-table provenance against legacy VM facts.
+2. **R5: Shadow corpus expansion + CI-style gate (B8)**:
+   - Expand selected fixture set for digest parity.
+   - Keep diff-summary gate at zero unresolved deltas.
+3. **R6: Candidate phase implementation spikes**:
+   - Start rewritten phase component experiments behind internal guardrails.
+   - Keep legacy analyzer default until parity and stability gates hold.

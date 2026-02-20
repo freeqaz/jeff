@@ -1470,6 +1470,11 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                     cur_coff.section_symbol(comdat_sect_id);
                     cur_coff.append_section_data(comdat_sect_id, comdat_data, sect.align.max(4));
                     comdat_extracted_sections.insert((idx, offset), comdat_sect_id);
+                    // Zero out COMDAT bytes in parent section to prevent duplication.
+                    // The authoritative copy lives in the COMDAT section; parent section
+                    // bytes become dead space. Relocations from this region are also
+                    // skipped in the parent (see relocation loop below).
+                    data[start..end].fill(0);
                 }
             }
         }
@@ -1689,30 +1694,41 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                 }
             }
 
-            // Always add to main section (all relocations stay in .text)
-            cur_coff.add_relocation(
-                sect_map.get(&sect_idx).unwrap().clone(),
-                object::write::Relocation {
-                    offset: addr as u64,
-                    symbol: sym_id.clone(),
-                    addend: 0,
-                    flags: RelocationFlags::Coff { typ: reloc.to_coff() },
-                },
-            )?;
-            // MSVC requires an extra relocation to pair up high and low ones
-            match reloc.kind {
-                ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
-                    cur_coff.add_relocation(
-                        sect_map.get(&sect_idx).unwrap().clone(),
-                        object::write::Relocation {
-                            offset: addr as u64,
-                            symbol: sym_id.clone(),
-                            addend: 0,
-                            flags: RelocationFlags::Coff { typ: object::pe::IMAGE_REL_PPC_PAIR },
-                        },
-                    )?;
+            // Add to main section ONLY if not from a COMDAT region.
+            // COMDAT regions are zeroed in parent section data; their relocations
+            // live exclusively in the COMDAT section to avoid patching dead bytes.
+            let in_comdat = comdat_regions
+                .range(..=(sect_idx, addr as u64))
+                .rev()
+                .next()
+                .map_or(false, |(&(si, start), &(_, sz))| {
+                    si == sect_idx && (addr as u64) >= start && (addr as u64) < start + sz
+                });
+            if !in_comdat {
+                cur_coff.add_relocation(
+                    sect_map.get(&sect_idx).unwrap().clone(),
+                    object::write::Relocation {
+                        offset: addr as u64,
+                        symbol: sym_id.clone(),
+                        addend: 0,
+                        flags: RelocationFlags::Coff { typ: reloc.to_coff() },
+                    },
+                )?;
+                // MSVC requires an extra relocation to pair up high and low ones
+                match reloc.kind {
+                    ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
+                        cur_coff.add_relocation(
+                            sect_map.get(&sect_idx).unwrap().clone(),
+                            object::write::Relocation {
+                                offset: addr as u64,
+                                symbol: sym_id.clone(),
+                                addend: 0,
+                                flags: RelocationFlags::Coff { typ: object::pe::IMAGE_REL_PPC_PAIR },
+                            },
+                        )?;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -1998,6 +2014,127 @@ mod tests {
         assert_eq!(
             *storage_class, IMAGE_SYM_CLASS_EXTERNAL,
             "Global+Function should be EXTERNAL (2), got {storage_class}"
+        );
+    }
+
+    /// Parse COFF section headers, returning (name, raw_data_offset, raw_data_size) tuples.
+    fn parse_coff_sections(coff_data: &[u8]) -> Vec<(String, usize, usize)> {
+        let num_sections = u16::from_le_bytes(coff_data[2..4].try_into().unwrap()) as usize;
+        let mut sections = Vec::new();
+        for i in 0..num_sections {
+            let off = 20 + i * 40;
+            let name = String::from_utf8_lossy(&coff_data[off..off + 8])
+                .trim_end_matches('\0')
+                .to_string();
+            let raw_data_size =
+                u32::from_le_bytes(coff_data[off + 16..off + 20].try_into().unwrap()) as usize;
+            let raw_data_offset =
+                u32::from_le_bytes(coff_data[off + 20..off + 24].try_into().unwrap()) as usize;
+            sections.push((name, raw_data_offset, raw_data_size));
+        }
+        sections
+    }
+
+    /// COMDAT-marked function bytes are zeroed in parent .text section
+    /// and preserved only in the COMDAT .text$dup section (no duplication).
+    #[test]
+    fn test_comdat_bytes_not_duplicated_in_parent_section() {
+        // Create a .text section with two functions:
+        // - func_a at offset 0 (8 bytes, normal)
+        // - func_b at offset 8 (8 bytes, COMDAT)
+        let func_a_bytes = [0x7C, 0x08, 0x02, 0xA6, 0x4E, 0x80, 0x00, 0x20]; // mflr r0; blr
+        let func_b_bytes = [0x38, 0x60, 0x00, 0x01, 0x4E, 0x80, 0x00, 0x20]; // li r3,1; blr
+        let mut text_data = Vec::new();
+        text_data.extend_from_slice(&func_a_bytes);
+        text_data.extend_from_slice(&func_b_bytes);
+
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0,
+            size: 16,
+            data: text_data,
+            align: 4,
+            elf_index: 0,
+            relocations: ObjRelocations::default(),
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+
+        let sym_a = ObjSymbol {
+            name: "func_a".into(),
+            address: 0,
+            section: Some(0),
+            size: 8,
+            size_known: true,
+            flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+            kind: ObjSymbolKind::Function,
+            ..Default::default()
+        };
+        let sym_b = ObjSymbol {
+            name: "func_b".into(),
+            address: 8,
+            section: Some(0),
+            size: 8,
+            size_known: true,
+            flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+            kind: ObjSymbolKind::Function,
+            ..Default::default()
+        };
+
+        let mut obj = ObjInfo::new(
+            ObjKind::Relocatable,
+            ObjArchitecture::PowerPc,
+            "test.obj".into(),
+            vec![],
+            vec![section],
+        );
+        obj.symbols.add_direct(sym_a).unwrap();
+        obj.symbols.add_direct(sym_b).unwrap();
+        // Mark func_b as COMDAT
+        obj.comdat_symbols.insert("func_b".into());
+
+        let coff_data = write_coff(&obj).unwrap();
+
+        // Parse sections
+        let sections = parse_coff_sections(&coff_data);
+
+        // Find .text section — should have func_b's bytes zeroed
+        let (_, text_offset, text_size) = sections
+            .iter()
+            .find(|(name, _, _)| name == ".text")
+            .expect(".text section not found");
+        assert_eq!(*text_size, 16, ".text should still be 16 bytes");
+        let text_bytes = &coff_data[*text_offset..*text_offset + *text_size];
+        // func_a bytes (offset 0..8) should be preserved
+        assert_eq!(
+            &text_bytes[0..8], &func_a_bytes,
+            "func_a bytes should be preserved in .text"
+        );
+        // func_b bytes (offset 8..16) should be zeroed (extracted to COMDAT)
+        assert_eq!(
+            &text_bytes[8..16], &[0u8; 8],
+            "func_b bytes should be zeroed in parent .text (moved to COMDAT)"
+        );
+
+        // Find COMDAT payload section (name may be truncated/indirected in COFF),
+        // then verify it contains func_b bytes.
+        let (_, dup_offset, dup_size) = sections
+            .iter()
+            .find(|(name, off, size)| {
+                let section_bytes = &coff_data[*off..*off + *size];
+                (name.starts_with(".text$") || name.starts_with('/'))
+                    && *size == 8
+                    && section_bytes == func_b_bytes
+            })
+            .expect("COMDAT payload section for func_b not found");
+        assert_eq!(*dup_size, 8, "COMDAT payload section should be 8 bytes (func_b only)");
+        let dup_bytes = &coff_data[*dup_offset..*dup_offset + *dup_size];
+        assert_eq!(
+            dup_bytes, &func_b_bytes,
+            "func_b bytes should be in the COMDAT payload section"
         );
     }
 }

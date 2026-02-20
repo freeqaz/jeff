@@ -45,6 +45,8 @@ New regression coverage includes:
   - `cargo test analysis::vm::tests::` (3/3)
   - `cargo test analysis::vm2::tests::` (2/2)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
+  - `cargo test analysis::pipeline::tests::` (6/6)
+  - `cargo test util::xex::tests::` (5/5)
 - Shared negative fixture asset:
   - `assets/tests/jump_table_negative_snippets.txt`
 
@@ -53,11 +55,17 @@ Follow-up status:
 - `src/util/*` + `src/obj/*` warning backlog has been triaged and reduced.
 - `dc3-decomp` split smoke validation with local release `dtk` succeeded:
   - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke2` -> `exit=0`
+  - Revalidated post COFF/COMDAT edits:
+    - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke3` -> `exit=0`
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
   - VM2 scaffold module: `src/analysis/vm2.rs`
   - Pipeline interface scaffold module: `src/analysis/pipeline.rs`
+  - Legacy analyzer phase extraction (`seed/slice/finalize/validate`) wired for shadowable execution.
+  - Shadow diff categorization + summary and selected fixture parity gate:
+    - `analysis::pipeline::tests::pipeline_digest_diff_summary_categorizes_delta_types`
+    - `analysis::pipeline::tests::shadow_corpus_selected_fixtures_match_legacy_pipeline_digest`
   - New rewrite-baseline tests:
     - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
     - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`

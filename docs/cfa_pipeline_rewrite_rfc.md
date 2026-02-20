@@ -4,8 +4,14 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: RFC + shadow scaffolding baseline
+- Phase: S1 complete, S2 shadow-gating baseline active
 - Initial scaffold: `src/analysis/pipeline.rs`
+
+Current implementation snapshot:
+- Legacy analyzer routed through explicit phase methods in `AnalyzerState`.
+- `analysis::pipeline` now exposes phase outputs and a run report model.
+- Digest comparison now includes categorized diff entries and summary counters.
+- Selected real-fixture shadow parity test is active with zero-diff gate.
 
 ## Problem statement
 
@@ -108,12 +114,12 @@ Diff categories:
 - Introduce deterministic digest/diff tests for legacy analyzer behavior.
 - Add explicit invariant validation hook to analyzer lifecycle.
 
-### S1: split interfaces
+### S1: split interfaces (complete)
 
 - Extract per-phase structs/interfaces from monolithic state mutations.
 - Keep legacy implementation under these interfaces.
 
-### S2: rewritten phase shadowing
+### S2: rewritten phase shadowing (baseline in progress)
 
 - Implement rewritten phase components behind internal feature flags.
 - Compare phase outputs (not only final outputs) for debugging.
