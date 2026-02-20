@@ -63,6 +63,9 @@ Follow-up status:
   - Supports strict candidate-gate rehearsal:
     - `--strict-code-seeds`
     - `--strict-symbol-size`
+- Consolidated cutover gate helper added:
+  - `scripts/cfa_cutover_gate.sh`
+  - Runs baseline/shadow/native-VM2 `cfa_tests` + default/strict DC3 parity smokes.
 - Current debug parity run status:
   - Tracker duplicate-relocation panic is fixed in `src/analysis/tracker.rs`.
   - New regression test: `analysis::tracker::tests::test_process_data_tolerates_existing_source_relocation`.
@@ -94,6 +97,10 @@ Follow-up status:
   - Scripted strict-gate smoke (`r15-strict`) with candidate strict envs enabled:
     - `scripts/dc3_cfa_parity_smoke.sh --no-build --strict-code-seeds --strict-symbol-size --run-id r15-strict`
     - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
+  - Consolidated cutover gate smoke (`r16-cutover`) after native stack-load + strict parity expansion:
+    - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r16-cutover`
+    - `cfa_tests` baseline/shadow/native-VM2 gates all passed (`20/20` each).
+    - default + strict DC3 parity legs both passed with non-trivial diff counts `0`.
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`

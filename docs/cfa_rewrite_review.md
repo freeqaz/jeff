@@ -569,6 +569,9 @@ Open technical debt (non-blocking for this branch state):
       - Supports strict candidate rehearsal flags:
         - `--strict-code-seeds`
         - `--strict-symbol-size`
+      - Added `scripts/cfa_cutover_gate.sh` for consolidated cutover gating:
+        - baseline/shadow/native-VM2 `cfa_tests`
+        - default + strict DC3 parity runs
       - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r11-smoke` -> `PASS`
       - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
       - Post stack-provenance OR native handling rerun:
@@ -583,6 +586,9 @@ Open technical debt (non-blocking for this branch state):
       - Post strict-gate rehearsal rerun:
         - `scripts/dc3_cfa_parity_smoke.sh --no-build --strict-code-seeds --strict-symbol-size --run-id r15-strict` -> `PASS`
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
+      - Consolidated cutover gate rerun:
+        - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r16-cutover` -> `PASS`
+        - baseline/shadow/native-VM2 `cfa_tests` all `20/20`, then default + strict parity both passed.
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
