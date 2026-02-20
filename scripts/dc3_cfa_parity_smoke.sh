@@ -9,6 +9,8 @@ DTK_BIN="$REPO_ROOT/target/debug/dtk"
 CFG_REL="config/373307D9/config.yml"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 BUILD_BIN=1
+STRICT_CODE_SEEDS=0
+STRICT_SYMBOL_SIZE=0
 
 usage() {
     cat <<'EOF'
@@ -19,6 +21,9 @@ Options:
   --dtk <path>        Path to dtk binary (default: ./target/debug/dtk from this repo)
   --run-id <id>       Override run-id suffix for /tmp output folders
   --no-build          Skip `cargo build --bin dtk`
+  --strict-code-seeds Enable `DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1` for shadow/candidate runs
+  --strict-symbol-size
+                     Enable `DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1` for shadow/candidate runs
   -h, --help          Show this help
 
 The script runs:
@@ -49,6 +54,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-build)
             BUILD_BIN=0
+            shift
+            ;;
+        --strict-code-seeds)
+            STRICT_CODE_SEEDS=1
+            shift
+            ;;
+        --strict-symbol-size)
+            STRICT_SYMBOL_SIZE=1
             shift
             ;;
         -h|--help)
@@ -98,6 +111,14 @@ split_cmd() {
     )
 }
 
+SHARED_STRICT_ENV=()
+if [[ $STRICT_CODE_SEEDS -eq 1 ]]; then
+    SHARED_STRICT_ENV+=(DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1)
+fi
+if [[ $STRICT_SYMBOL_SIZE -eq 1 ]]; then
+    SHARED_STRICT_ENV+=(DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1)
+fi
+
 echo "[dc3-parity] Running baseline split..."
 BASE_RC=0
 split_cmd "$BASE_DIR" >"$BASE_LOG" 2>&1 || BASE_RC=$?
@@ -114,6 +135,7 @@ split_cmd \
     DTK_CFA_MAX_VM_SHADOW_DELTAS=0 \
     DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 \
     DTK_CFA_VM_SHADOW_MAX_STEPS=64 \
+    "${SHARED_STRICT_ENV[@]}" \
     >"$SHADOW_LOG" 2>&1 || SHADOW_RC=$?
 
 echo "[dc3-parity] Running candidate split..."
@@ -128,6 +150,7 @@ split_cmd \
     DTK_CFA_MAX_VM_SHADOW_DELTAS=0 \
     DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 \
     DTK_CFA_VM_SHADOW_MAX_STEPS=64 \
+    "${SHARED_STRICT_ENV[@]}" \
     >"$CAND_LOG" 2>&1 || CAND_RC=$?
 
 BASE_FILES="$(find "$BASE_DIR" -type f | wc -l | tr -d ' ')"
@@ -159,6 +182,8 @@ DIFF_NONTRIV_BASE_CAND="$(
 
 echo "[dc3-parity] Summary"
 echo "  run_id: $RUN_ID"
+echo "  strict_code_seeds: $STRICT_CODE_SEEDS"
+echo "  strict_symbol_size: $STRICT_SYMBOL_SIZE"
 echo "  baseline_rc: $BASE_RC"
 echo "  shadow_rc: $SHADOW_RC"
 echo "  candidate_rc: $CAND_RC"

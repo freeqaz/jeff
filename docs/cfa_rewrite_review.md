@@ -566,6 +566,9 @@ Open technical debt (non-blocking for this branch state):
         - `analysis::vm2::tests::vm2_step_shadow_native_handles_lwzx_and_lhzx_parity`
     - Scripted workflow smoke:
       - Added `scripts/dc3_cfa_parity_smoke.sh` for one-command `baseline`/`shadow`/`candidate` parity checks.
+      - Supports strict candidate rehearsal flags:
+        - `--strict-code-seeds`
+        - `--strict-symbol-size`
       - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r11-smoke` -> `PASS`
       - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
       - Post stack-provenance OR native handling rerun:
@@ -576,6 +579,9 @@ Open technical debt (non-blocking for this branch state):
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
       - Post native stack-load (`lwz`) + revision-tracked slot provenance rerun:
         - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r14-lwz` -> `PASS`
+        - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
+      - Post strict-gate rehearsal rerun:
+        - `scripts/dc3_cfa_parity_smoke.sh --no-build --strict-code-seeds --strict-symbol-size --run-id r15-strict` -> `PASS`
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
