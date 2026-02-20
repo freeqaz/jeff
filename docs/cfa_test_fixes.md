@@ -86,6 +86,7 @@ Follow-up status:
     - `analysis::cfa::AnalyzerState::detect_functions_with_shadow_config` now computes live
       phase-checkpoint and pipeline-digest deltas when shadow gates are enabled.
     - New conservative fallback reason: `PipelineDigestMismatch`.
+    - Fallback telemetry now logs bounded phase/digest mismatch entries for triage.
     - VM2 runtime delta is now sampled live via bounded VM shadow metrics from seed-function linear traces.
     - Shadow gate env controls are available:
       - `DTK_CFA_ENABLE_VM2_SHADOW`

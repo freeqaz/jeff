@@ -25,6 +25,7 @@ Current implementation snapshot:
   `AnalyzerState::detect_functions_with_shadow_config`.
   - Dual pipeline reports are compared at runtime when shadow gates are enabled.
   - Any pipeline digest mismatch forces conservative fallback to legacy state.
+  - Fallback path emits bounded checkpoint/digest delta entries for triage.
   - Runtime gate controls:
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
     - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`

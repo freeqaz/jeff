@@ -370,6 +370,12 @@ Open technical debt (non-blocking for this branch state):
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-<timestamp>`
     - Result: `rc=0`, `4448` files, `2223` `.obj`.
 
+- **Phase E2b complete (R7 telemetry)**: structured fallback mismatch logging is now active.
+  - On fallback, CFA now logs bounded detail entries for:
+    - phase checkpoint deltas (`PhaseCheckpointDiffEntry`)
+    - pipeline digest deltas (`PipelineDiffEntry`)
+  - Logging is capped (`MAX_LOGGED_SHADOW_DELTA_ENTRIES`) to avoid noisy/expensive dumps.
+
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
   - Runtime shadow now compares `LegacyPipelineEngine` vs `CandidatePipelineEngine`.

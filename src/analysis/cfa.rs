@@ -15,8 +15,8 @@ use crate::{
         disassemble,
         executor::{ExecCbData, ExecCbResult, Executor},
         pipeline::{
-            compare_phase_checkpoints, CandidatePipelineEngine, CfaPipelineEngine,
-            LegacyPipelineEngine,
+            compare_phase_checkpoints, phase_checkpoint_diff_entries, CandidatePipelineEngine,
+            CfaPipelineEngine, LegacyPipelineEngine, PhaseCheckpointDiffEntry, PipelineDiffEntry,
         },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
@@ -145,6 +145,7 @@ pub(crate) const ENV_MAX_VM_SHADOW_DELTAS: &str = "DTK_CFA_MAX_VM_SHADOW_DELTAS"
 pub(crate) const ENV_MAX_PHASE_CHECKPOINT_DELTAS: &str = "DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS";
 pub(crate) const ENV_VM_SHADOW_MAX_FUNCTIONS: &str = "DTK_CFA_VM_SHADOW_MAX_FUNCTIONS";
 pub(crate) const ENV_VM_SHADOW_MAX_STEPS: &str = "DTK_CFA_VM_SHADOW_MAX_STEPS";
+const MAX_LOGGED_SHADOW_DELTA_ENTRIES: usize = 8;
 
 fn parse_shadow_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -171,6 +172,38 @@ fn read_shadow_usize_env(name: &str, default: usize) -> usize {
             default
         }),
         Err(_) => default,
+    }
+}
+
+fn log_phase_checkpoint_delta_entries(entries: &[PhaseCheckpointDiffEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    let shown = entries.len().min(MAX_LOGGED_SHADOW_DELTA_ENTRIES);
+    log::warn!(
+        "Phase checkpoint deltas (showing {} of {}):",
+        shown,
+        entries.len()
+    );
+    for entry in entries.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
+        log::warn!("  {:?}: legacy={} candidate={}", entry.kind, entry.left, entry.right);
+    }
+}
+
+fn log_pipeline_digest_delta_entries(entries: &[PipelineDiffEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    let shown = entries.len().min(MAX_LOGGED_SHADOW_DELTA_ENTRIES);
+    log::warn!("Pipeline digest deltas (showing {} of {}):", shown, entries.len());
+    for entry in entries.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
+        log::warn!(
+            "  {:?} @ {}: legacy={} candidate={}",
+            entry.kind,
+            entry.address,
+            entry.left,
+            entry.right
+        );
     }
 }
 
@@ -622,9 +655,10 @@ impl AnalyzerState {
         };
 
         let phase_checkpoint_summary = compare_phase_checkpoints(&legacy_report, &candidate_report);
+        let phase_checkpoint_entries = phase_checkpoint_diff_entries(&legacy_report, &candidate_report);
         let phase_checkpoint_deltas = phase_checkpoint_summary.total();
-        let digest_summary = legacy_digest.diff_summary(&candidate_digest);
-        let digest_deltas = digest_summary.total();
+        let digest_entries = legacy_digest.diff_entries(&candidate_digest);
+        let digest_deltas = digest_entries.len();
 
         let mut decision = evaluate_candidate_shadow_decision(
             vm_shadow_deltas,
@@ -645,6 +679,8 @@ impl AnalyzerState {
                 digest_deltas,
                 decision.reasons
             );
+            log_phase_checkpoint_delta_entries(&phase_checkpoint_entries);
+            log_pipeline_digest_delta_entries(&digest_entries);
             *self = legacy_pipeline.state;
         } else {
             log::debug!(
