@@ -82,6 +82,16 @@ Follow-up status:
     - `analysis::cfa::evaluate_candidate_shadow_decision`
     - `analysis::cfa::select_candidate_or_legacy`
     - `analysis::cfa::tests::test_candidate_shadow_*`
+  - Runtime shadow routing update:
+    - `analysis::cfa::AnalyzerState::detect_functions_with_shadow_config` now computes live
+      phase-checkpoint and pipeline-digest deltas when shadow gates are enabled.
+    - New conservative fallback reason: `PipelineDigestMismatch`.
+    - VM2 runtime delta remains temporarily fixed at `0` until VM2 candidate execution wiring lands.
+  - Candidate pipeline lane update:
+    - Added `analysis::pipeline::CandidatePipelineEngine` (parity-mirrored implementation stage).
+    - Runtime shadow compares legacy vs candidate pipeline engines.
+    - Added parity test:
+      - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
   - New VM2 shadow tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
@@ -98,6 +108,11 @@ Follow-up status:
       - `dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
       - `dc1/TU0/default.xex`
       - `gh2/360 TU0 Strum Limit Fix/default.xex`
+  - Useful local XEX paths:
+    - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
+    - `/home/free/code/milohax/milo-executable-library/dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
+    - `/home/free/code/milohax/milo-executable-library/dc1/TU0/default.xex`
+    - `/home/free/code/milohax/milo-executable-library/gh2/360 TU0 Strum Limit Fix/default.xex`
 
 ## Background: How CFA Detects Jump Tables
 

@@ -13,6 +13,10 @@ use crate::{
     analysis::{
         disassemble,
         executor::{ExecCbData, ExecCbResult, Executor},
+        pipeline::{
+            compare_phase_checkpoints, CandidatePipelineEngine, CfaPipelineEngine,
+            LegacyPipelineEngine,
+        },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
         RelocationTarget,
@@ -157,6 +161,7 @@ impl CandidateShadowGateConfig {
 pub(crate) enum CandidateFallbackReason {
     VmShadowDeltasExceeded,
     PhaseCheckpointDeltasExceeded,
+    PipelineDigestMismatch,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
@@ -189,7 +194,6 @@ pub(crate) fn evaluate_candidate_shadow_decision(
     CandidateShadowDecision { vm_shadow_deltas, phase_checkpoint_deltas, reasons }
 }
 
-#[allow(dead_code)]
 pub(crate) fn select_candidate_or_legacy<T: Clone>(
     legacy_result: &T,
     candidate_result: &T,
@@ -519,39 +523,76 @@ impl AnalyzerState {
     fn detect_functions_with_shadow_config(
         &mut self,
         obj: &ObjInfo,
-        vm_shadow_deltas: usize,
-        phase_checkpoint_deltas: usize,
         gate_config: CandidateShadowGateConfig,
     ) -> Result<CandidateShadowDecision> {
-        let decision = evaluate_candidate_shadow_decision(
+        let shadow_enabled = gate_config.enable_vm2_shadow || gate_config.enable_pipeline_shadow;
+        if !shadow_enabled {
+            let decision = evaluate_candidate_shadow_decision(0, 0, gate_config);
+            self.detect_functions_legacy(obj)?;
+            return Ok(decision);
+        }
+
+        // VM2 candidate execution path is not yet wired into runtime CFA.
+        // Keep metric explicit so fallback thresholds are exercised with live phase data.
+        let vm_shadow_deltas = 0usize;
+
+        let skip_ranges = self.skip_ranges.clone();
+        let mut legacy_pipeline = LegacyPipelineEngine::new(skip_ranges.clone());
+        let legacy_report = legacy_pipeline.run_with_report(obj)?;
+        let legacy_digest = legacy_report.digest.clone();
+
+        // Candidate path is isolated behind its own engine type for staged phase rollout.
+        let mut candidate_pipeline = CandidatePipelineEngine::new(skip_ranges);
+        let candidate_report = candidate_pipeline.run_with_report(obj)?;
+        let candidate_digest = candidate_report.digest.clone();
+
+        let phase_checkpoint_summary = compare_phase_checkpoints(&legacy_report, &candidate_report);
+        let phase_checkpoint_deltas = phase_checkpoint_summary.total();
+        let digest_summary = legacy_digest.diff_summary(&candidate_digest);
+        let digest_deltas = digest_summary.total();
+
+        let mut decision = evaluate_candidate_shadow_decision(
             vm_shadow_deltas,
             phase_checkpoint_deltas,
             gate_config,
         );
+        if digest_deltas > 0 {
+            decision.reasons.push(CandidateFallbackReason::PipelineDigestMismatch);
+        }
+
+        let selected_digest =
+            select_candidate_or_legacy(&legacy_digest, &candidate_digest, &decision);
         if decision.should_fallback() {
-            log::debug!(
-                "Candidate shadow mismatch exceeded threshold (vm_deltas={}, phase_deltas={}, reasons={:?}), using legacy analyzer",
+            log::warn!(
+                "Candidate shadow mismatch exceeded threshold (vm_deltas={}, phase_deltas={}, digest_deltas={}, reasons={:?}); using legacy analyzer",
                 vm_shadow_deltas,
                 phase_checkpoint_deltas,
+                digest_deltas,
                 decision.reasons
             );
-            self.detect_functions_legacy(obj)?;
-            return Ok(decision);
-        }
-        if gate_config.enable_vm2_shadow || gate_config.enable_pipeline_shadow {
+            *self = legacy_pipeline.state;
+        } else {
             log::debug!(
-                "Candidate shadow gates enabled with vm_deltas={} and phase_deltas={}, candidate execution path not yet active; using legacy analyzer",
+                "Candidate shadow parity clean (vm_deltas={}, phase_deltas={}, digest_deltas={}); using candidate pipeline state",
                 vm_shadow_deltas,
-                phase_checkpoint_deltas
+                phase_checkpoint_deltas,
+                digest_deltas
             );
+            *self = candidate_pipeline.state;
         }
-        self.detect_functions_legacy(obj)?;
+
+        let selected_state_digest =
+            crate::analysis::pipeline::PipelineDigest::from_state(self);
+        debug_assert_eq!(
+            selected_state_digest, selected_digest,
+            "selected state digest must match selected pipeline digest",
+        );
         Ok(decision)
     }
 
     pub fn detect_functions(&mut self, obj: &ObjInfo) -> Result<()> {
         let gate_config = CandidateShadowGateConfig::defaults();
-        let _decision = self.detect_functions_with_shadow_config(obj, 0, 0, gate_config)?;
+        let _decision = self.detect_functions_with_shadow_config(obj, gate_config)?;
         Ok(())
     }
 
@@ -1571,6 +1612,28 @@ mod tests {
         assert_eq!(
             selected_digest, fallback_digest,
             "fallback path should preserve legacy output digest exactly"
+        );
+    }
+
+    #[test]
+    fn test_detect_functions_with_shadow_config_pipeline_gate_uses_live_phase_deltas() {
+        let obj = make_obj(0x1000, &[NOP, BLR]);
+        let mut state = AnalyzerState::new(std::collections::BTreeMap::new());
+        let gate_config = CandidateShadowGateConfig {
+            enable_vm2_shadow: false,
+            enable_pipeline_shadow: true,
+            max_vm_shadow_deltas: 0,
+            max_phase_checkpoint_deltas: 0,
+        };
+        let decision = state
+            .detect_functions_with_shadow_config(&obj, gate_config)
+            .expect("shadow-gated detect_functions should succeed");
+        assert_eq!(decision.vm_shadow_deltas, 0);
+        assert_eq!(decision.phase_checkpoint_deltas, 0);
+        assert!(!decision.should_fallback());
+        assert!(
+            !state.functions.is_empty(),
+            "state should be populated by selected candidate pipeline result"
         );
     }
 

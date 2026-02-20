@@ -4,18 +4,24 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete
+- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete, S2b runtime shadow routing active
 - Initial scaffold: `src/analysis/pipeline.rs`
 
 Current implementation snapshot:
 - Legacy analyzer routed through explicit phase methods in `AnalyzerState`.
+- Candidate pipeline lane is now explicit via `CandidatePipelineEngine` (parity-mirrored stage).
 - `analysis::pipeline` now exposes phase outputs and a run report model.
 - Digest comparison now includes categorized diff entries and summary counters.
 - Full CFA fixture shadow parity gate is active with zero-diff totals and per-fixture reporting.
+- Shadow corpus parity test now runs through candidate pipeline engine against baseline analyzer digest.
 - Phase-level checkpoint diffing is now available via:
   - `PhaseCheckpointDigest`
   - `PhaseCheckpointDiffEntry` / `PhaseCheckpointDiffSummary`
   - `compare_phase_checkpoints`
+- Runtime CFA shadow routing now consumes live pipeline deltas in
+  `AnalyzerState::detect_functions_with_shadow_config`.
+  - Dual pipeline reports are compared at runtime when shadow gates are enabled.
+  - Any pipeline digest mismatch forces conservative fallback to legacy state.
 
 ## Problem statement
 

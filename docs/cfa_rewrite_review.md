@@ -335,6 +335,22 @@ Open technical debt (non-blocking for this branch state):
     - phase checkpoint threshold fallback trigger,
     - digest-preserving fallback selection.
 
+- **Phase D+ complete**: live pipeline shadow comparison wired into runtime fallback path.
+  - `AnalyzerState::detect_functions_with_shadow_config` now runs dual pipeline reports when
+    shadow gates are enabled and computes:
+    - phase checkpoint deltas from `compare_phase_checkpoints(...)`
+    - final digest deltas from `PipelineDigest::diff_summary(...)`
+  - Fallback routing is now driven by live measured deltas, not only synthetic test injection.
+  - Conservative guardrail: any final digest mismatch adds `PipelineDigestMismatch` fallback reason.
+  - Current VM2 runtime delta is explicitly `0` until VM2 candidate execution is wired.
+
+- **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
+  - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
+  - Runtime shadow now compares `LegacyPipelineEngine` vs `CandidatePipelineEngine`.
+  - Added candidate-vs-legacy digest parity test:
+    - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
+  - Full fixture shadow corpus parity test remains green with candidate lane active.
+
 - **Phase E validation complete**: real-XEX parity smoke on external corpora.
   - Built release `dtk` from current branch and ran real DC3 split flow to `/tmp`:
     - `dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-<timestamp>`
@@ -349,13 +365,22 @@ Open technical debt (non-blocking for this branch state):
     - `gh2/360 TU0 Strum Limit Fix/default.xex`
   - Result: `dtk xex info` succeeded for all sampled titles.
 
+#### Useful XEX Links (Local Workspace)
+
+- `dc3-decomp` split source:
+  - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
+- Executable-library parity samples:
+  - `/home/free/code/milohax/milo-executable-library/dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
+  - `/home/free/code/milohax/milo-executable-library/dc1/TU0/default.xex`
+  - `/home/free/code/milohax/milo-executable-library/gh2/360 TU0 Strum Limit Fix/default.xex`
+
 ### Next Phase Queue
 
 1. **R6 implementation: candidate phase component spikes (B8)**:
-   - Implement first candidate phase components behind existing checkpoint diff scaffolds.
-   - Keep legacy analyzer default until checkpoint and final digest parity hold.
+   - Implement first true candidate phase divergence (seed or slice stage) inside `CandidatePipelineEngine`.
+   - Keep legacy analyzer default unless checkpoint + digest parity remain clean.
 2. **R7 implementation: operational fallback routing (B7/B8)**:
-   - Connect fallback decision hooks to real candidate outputs (VM and pipeline checkpoints).
+   - Wire VM2 runtime shadow metrics into fallback decisions (replace temporary `vm_shadow_deltas=0`).
    - Emit structured mismatch logs with actionable fixture-level summaries.
 3. **Real-XEX parity proof loop**:
    - Run shadow parity against real XEX workflows in `~/code/milohax/dc3-decomp` and the executables repo.

@@ -309,32 +309,32 @@ pub struct LegacyPipelineEngine {
     pub state: AnalyzerState,
 }
 
+fn classify_seed_source(obj: &ObjInfo, address: SectionAddress) -> SeedSource {
+    if obj.known_functions.contains_key(&address) {
+        return SeedSource::KnownFunction;
+    }
+    if obj
+        .symbols
+        .kind_at_section_address(address.section, address.address, ObjSymbolKind::Function)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return SeedSource::Symbol;
+    }
+    if matches!(
+        obj.sections.get(address.section),
+        Some(section)
+            if section.kind == ObjSectionKind::Code && section.address as u32 == address.address
+    ) {
+        return SeedSource::SectionStart;
+    }
+    SeedSource::Discovered
+}
+
 impl LegacyPipelineEngine {
     pub fn new(skip_ranges: BTreeMap<SectionAddress, SectionAddress>) -> Self {
         Self { state: AnalyzerState::new(skip_ranges) }
-    }
-
-    fn classify_seed_source(obj: &ObjInfo, address: SectionAddress) -> SeedSource {
-        if obj.known_functions.contains_key(&address) {
-            return SeedSource::KnownFunction;
-        }
-        if obj
-            .symbols
-            .kind_at_section_address(address.section, address.address, ObjSymbolKind::Function)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            return SeedSource::Symbol;
-        }
-        if matches!(
-            obj.sections.get(address.section),
-            Some(section)
-                if section.kind == ObjSectionKind::Code && section.address as u32 == address.address
-        ) {
-            return SeedSource::SectionStart;
-        }
-        SeedSource::Discovered
     }
 }
 
@@ -346,7 +346,64 @@ impl CfaPipelineEngine for LegacyPipelineEngine {
             .into_iter()
             .map(|address| FunctionSeed {
                 address,
-                source: Self::classify_seed_source(obj, address),
+                source: classify_seed_source(obj, address),
+            })
+            .collect();
+        Ok(SeedDiscoveryOutput { seeds })
+    }
+
+    fn phase_slice_exploration(
+        &mut self,
+        obj: &ObjInfo,
+        seed: &SeedDiscoveryOutput,
+    ) -> Result<SliceExplorationOutput> {
+        let seed_addrs = seed.seeds.iter().map(|entry| entry.address).collect::<Vec<_>>();
+        self.state.phase_slice_seeded_functions(obj, &seed_addrs)?;
+        Ok(SliceExplorationOutput { processed_seed_count: seed_addrs.len() })
+    }
+
+    fn phase_finalization(&mut self, obj: &ObjInfo) -> Result<FinalizationOutput> {
+        self.state.phase_discover_remaining_functions(obj)?;
+        self.state.phase_finalize_and_validate(obj)?;
+        Ok(FinalizationOutput {
+            function_count: self.state.functions.len(),
+            jump_table_count: self.state.jump_tables.len(),
+        })
+    }
+
+    fn phase_apply(&self, obj: &mut ObjInfo) -> Result<ApplyOutput> {
+        let function_symbol_count =
+            self.state.functions.values().filter(|info| info.end.is_some()).count();
+        let jump_table_symbol_count = self.state.jump_tables.len();
+        self.state.apply(obj)?;
+        Ok(ApplyOutput { function_symbol_count, jump_table_symbol_count })
+    }
+
+    fn digest(&self) -> PipelineDigest {
+        PipelineDigest::from_state(&self.state)
+    }
+}
+
+pub struct CandidatePipelineEngine {
+    pub state: AnalyzerState,
+}
+
+impl CandidatePipelineEngine {
+    pub fn new(skip_ranges: BTreeMap<SectionAddress, SectionAddress>) -> Self {
+        Self { state: AnalyzerState::new(skip_ranges) }
+    }
+}
+
+impl CfaPipelineEngine for CandidatePipelineEngine {
+    fn phase_seed_discovery(&mut self, obj: &ObjInfo) -> Result<SeedDiscoveryOutput> {
+        // Candidate phase hook: currently mirrors legacy semantics to enforce parity-first rollout.
+        let seeds = self
+            .state
+            .phase_seed_discovery(obj)?
+            .into_iter()
+            .map(|address| FunctionSeed {
+                address,
+                source: classify_seed_source(obj, address),
             })
             .collect();
         Ok(SeedDiscoveryOutput { seeds })
@@ -546,9 +603,9 @@ mod tests {
             });
             let baseline_digest = PipelineDigest::from_state(&baseline);
 
-            let mut pipeline = LegacyPipelineEngine::new(BTreeMap::new());
+            let mut pipeline = CandidatePipelineEngine::new(BTreeMap::new());
             let pipeline_digest = pipeline.run(&obj).unwrap_or_else(|e| {
-                panic!("legacy pipeline run failed for {}: {e:#}", fixture.test_id)
+                panic!("candidate pipeline run failed for {}: {e:#}", fixture.test_id)
             });
 
             let diff_summary = baseline_digest.diff_summary(&pipeline_digest);
@@ -730,6 +787,24 @@ mod tests {
         assert!(
             diffs.is_empty(),
             "pipeline run should match manual phase execution, diffs: {diffs:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_pipeline_run_matches_legacy_pipeline_digest() {
+        let mut obj = make_obj(0x1000, &[NOP, BLR, NOP, NOP, BLR]);
+        obj.known_functions.insert(SectionAddress::new(0, 0x1000), Some(8));
+
+        let mut legacy = LegacyPipelineEngine::new(BTreeMap::new());
+        let legacy_digest = legacy.run(&obj).expect("legacy pipeline run should succeed");
+
+        let mut candidate = CandidatePipelineEngine::new(BTreeMap::new());
+        let candidate_digest = candidate.run(&obj).expect("candidate pipeline run should succeed");
+
+        let diffs = legacy_digest.diff(&candidate_digest);
+        assert!(
+            diffs.is_empty(),
+            "candidate pipeline should match legacy digest during parity stage, diffs: {diffs:?}"
         );
     }
 

@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: M1 complete, M2a corpus shadow harness complete, M3 guardrail prep active
+- Phase: M1 complete, M2a corpus shadow harness complete, M3 guardrail prep active (runtime VM deltas pending wiring)
 - Initial scaffold: `src/analysis/vm2.rs`
 
 Current implementation snapshot:
@@ -19,6 +19,9 @@ Current implementation snapshot:
 - Zero-diff gates now run for:
   - selected fixture subset (`1, 4, 8, 12, 19`)
   - full CFA fixture corpus
+- Runtime note:
+  - CFA shadow fallback now uses live pipeline checkpoint/digest deltas.
+  - VM2 runtime shadow metric is still temporarily fixed at `0` until VM2 execution is wired into CFA.
 
 ## Why this rewrite exists
 
