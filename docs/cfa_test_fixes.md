@@ -43,7 +43,7 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
-  - `cargo test analysis::vm2::tests::` (18/18)
+  - `cargo test analysis::vm2::tests::` (19/19)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
   - `cargo test analysis::pipeline::tests::` (15/15)
   - `cargo test util::xex::tests::` (5/5)
@@ -78,6 +78,9 @@ Follow-up status:
     - outputs remained parity-clean (`4448` files, `2223` `.obj`, non-trivial diff count `0`).
   - Scripted workflow smoke (`r11-smoke`):
     - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r11-smoke`
+    - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
+  - Scripted workflow smoke (`r12-stackor`) after stack-provenance OR native handling:
+    - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r12-stackor`
     - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
@@ -171,6 +174,7 @@ Follow-up status:
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
     - `analysis::vm2::tests::vm2_step_shadow_native_handles_relative_jump_table_sequence`
     - `analysis::vm2::tests::vm2_step_shadow_native_handles_lwzx_and_lhzx_parity`
+    - `analysis::vm2::tests::vm2_step_shadow_native_handles_stack_provenance_register_copy_or`
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_bridges_or_register_copy`
   - New rewrite-baseline tests:

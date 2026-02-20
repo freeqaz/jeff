@@ -597,8 +597,15 @@ impl Vm2 {
             }
             // or rA, rS, rB
             Opcode::Or => {
-                // Mirror legacy provenance-sensitive register-copy behavior by bridging.
+                // Register-copy form: preserve legacy stack-slot provenance natively when possible.
                 if ins.field_rs() == ins.field_rb() {
+                    let dst = ins.field_ra() as usize;
+                    let src = self.reg(ins.field_rs()).clone();
+                    if matches!(src.provenance, Provenance2::StackSlot { .. }) {
+                        self.gpr[dst] = src;
+                        return true;
+                    }
+                    // Keep bridging for non-stack register copies to preserve legacy provenance parity.
                     return false;
                 }
                 let dst = ins.field_ra() as usize;
@@ -1216,6 +1223,28 @@ mod tests {
         let _ = step(&mut legacy_lhzx, &obj, 0x24, 0x7C0C_022E);
         let diff_lhzx = VmShadowDiffReport::from_legacy_pair(&legacy_lhzx, &vm2_lhzx);
         assert_eq!(diff_lhzx.summary.total(), 0, "{diff_lhzx:?}");
+    }
+
+    #[test]
+    fn vm2_step_shadow_native_handles_stack_provenance_register_copy_or() {
+        let obj = make_obj_with_words(0x1000, &[0x7C89_2378]); // or r9, r4, r4
+        let mut legacy = VM::default();
+        legacy.gpr[4].value = GprValue::Range { min: 0, max: 0x20, step: 1 };
+        legacy.gpr[4].source.kind = GprSourceLocation::Stack(0x50);
+        legacy.gpr[4].source.version = 7;
+        legacy.gpr[4].version = 7;
+
+        let mut vm2 = Vm2::from_legacy_vm(&legacy);
+        let or_copy = Ins::new(0x7C89_2378, Extensions::xenon());
+        assert!(
+            vm2.step_shadow_native(&obj, SectionAddress::new(0, 0x1000), or_copy),
+            "stack-provenance register-copy OR should be native"
+        );
+
+        let _ = step(&mut legacy, &obj, 0x1000, 0x7C89_2378);
+        let diff = VmShadowDiffReport::from_legacy_pair(&legacy, &vm2);
+        assert_eq!(diff.summary.total(), 0, "{diff:?}");
+        assert!(matches!(vm2.reg(9).provenance, Provenance2::StackSlot { offset: 0x50, .. }));
     }
 
     #[test]
