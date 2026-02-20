@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete, S2b runtime shadow routing active, S2c candidate seed/slice/finalization divergence active, S2d/E1f gated heuristic hooks active
+- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete, S2b runtime shadow routing active, S2c candidate seed/slice/finalization divergence active, S2d/E1f gated heuristic hooks active, E1g cutover-mode scaffold active
 - Initial scaffold: `src/analysis/pipeline.rs`
 
 Current implementation snapshot:
@@ -40,7 +40,12 @@ Current implementation snapshot:
   - Dual pipeline reports are compared at runtime when shadow gates are enabled.
   - Any pipeline digest mismatch forces conservative fallback to legacy state.
   - Fallback path emits bounded checkpoint/digest delta entries for triage.
+  - Execution-mode routing now supports staged rollout in `AnalyzerState::detect_functions`:
+    - `legacy` (default, current production path),
+    - `shadow` / `auto` (forced candidate-vs-legacy comparison),
+    - `candidate` (direct candidate-lane opt-in).
   - Runtime gate controls:
+    - `DTK_CFA_PIPELINE_MODE`
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
     - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
 

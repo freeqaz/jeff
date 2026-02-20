@@ -43,9 +43,9 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
-  - `cargo test analysis::vm2::tests::` (9/9)
+  - `cargo test analysis::vm2::tests::` (16/16)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
-  - `cargo test analysis::pipeline::tests::` (8/8)
+  - `cargo test analysis::pipeline::tests::` (15/15)
   - `cargo test util::xex::tests::` (5/5)
 - Shared negative fixture asset:
   - `assets/tests/jump_table_negative_snippets.txt`
@@ -57,6 +57,12 @@ Follow-up status:
   - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke2` -> `exit=0`
   - Revalidated post COFF/COMDAT edits:
     - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke3` -> `exit=0`
+- Current debug parity run status:
+  - `~/code/milohax/jeff/target/debug/dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-baseline-r8-<timestamp>` -> `exit=101`
+  - panic: `src/analysis/tracker.rs:611` (`Relocation already exists ...`)
+  - shadow-mode confirmation:
+    - `DTK_CFA_PIPELINE_MODE=shadow ... dtk xex split ...` -> same panic.
+  - Interpretation: this is currently a real-XEX blocker, but not specific to new cutover-mode routing.
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
@@ -89,6 +95,7 @@ Follow-up status:
     - Fallback telemetry now logs bounded phase/digest mismatch entries for triage.
     - VM2 runtime delta is now sampled live via bounded VM shadow metrics from seed-function linear traces.
     - Shadow gate env controls are available:
+      - `DTK_CFA_PIPELINE_MODE`
       - `DTK_CFA_ENABLE_VM2_SHADOW`
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
       - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
@@ -103,11 +110,18 @@ Follow-up status:
       - `analysis::vm2::runtime_vm_shadow_report_with_mode(...)`
       - CFA fallback path now logs bounded mismatched function summaries.
       - Runtime report now tracks `native_steps` and `bridged_steps` (total + per-function).
-      - Native VM2 mode currently handles `addis`, `addi`/`addic`/`addic.`, `ori`, and no-op
-        branch/illegal cases, with legacy bridge fallback for unsupported opcodes.
+      - Native VM2 mode currently handles:
+        - `add`, `addis`, `addi`/`addic`/`addic.`
+        - `subf`/`subfc`, `subfic`
+        - `ori`, `or` (non-register-copy form)
+        - `mfspr`, `mtspr`
+        - no-op branch/illegal cases
+      - Register-copy `or` form intentionally bridges to preserve legacy provenance parity.
   - Candidate pipeline lane update:
     - Added `analysis::pipeline::CandidatePipelineEngine` (parity-mirrored implementation stage).
     - Runtime shadow compares legacy vs candidate pipeline engines.
+    - Runtime cutover-mode gate:
+      - `DTK_CFA_PIPELINE_MODE=legacy|shadow|candidate` (`auto` aliases `shadow`)
     - Added parity test:
       - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
       - `analysis::pipeline::tests::candidate_seed_phase_matches_legacy_seed_phase`
@@ -139,6 +153,8 @@ Follow-up status:
   - New VM2 shadow tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_bridges_or_register_copy`
   - New rewrite-baseline tests:
     - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
     - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`

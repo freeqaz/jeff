@@ -143,6 +143,7 @@ pub(crate) const ENABLE_VM2_CANDIDATE_SHADOW: bool = false;
 pub(crate) const ENABLE_PIPELINE_CANDIDATE_SHADOW: bool = false;
 pub(crate) const MAX_ALLOWED_VM_SHADOW_DELTAS: usize = 0;
 pub(crate) const MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS: usize = 0;
+pub(crate) const ENV_PIPELINE_MODE: &str = "DTK_CFA_PIPELINE_MODE";
 pub(crate) const ENV_ENABLE_VM2_SHADOW: &str = "DTK_CFA_ENABLE_VM2_SHADOW";
 pub(crate) const ENV_ENABLE_PIPELINE_SHADOW: &str = "DTK_CFA_ENABLE_PIPELINE_SHADOW";
 pub(crate) const ENV_MAX_VM_SHADOW_DELTAS: &str = "DTK_CFA_MAX_VM_SHADOW_DELTAS";
@@ -154,11 +155,29 @@ pub(crate) const ENV_CANDIDATE_STRICT_CODE_SEEDS: &str = "DTK_CFA_CANDIDATE_STRI
 pub(crate) const ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS: &str =
     "DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS";
 const MAX_LOGGED_SHADOW_DELTA_ENTRIES: usize = 8;
+const DEFAULT_PIPELINE_EXECUTION_MODE: PipelineExecutionMode = PipelineExecutionMode::Legacy;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub(crate) enum PipelineExecutionMode {
+    #[default]
+    Legacy,
+    Shadow,
+    Candidate,
+}
 
 fn parse_shadow_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_pipeline_execution_mode(raw: &str) -> Option<PipelineExecutionMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "legacy" => Some(PipelineExecutionMode::Legacy),
+        "shadow" | "auto" => Some(PipelineExecutionMode::Shadow),
+        "candidate" => Some(PipelineExecutionMode::Candidate),
         _ => None,
     }
 }
@@ -180,6 +199,31 @@ fn read_shadow_usize_env(name: &str, default: usize) -> usize {
             default
         }),
         Err(_) => default,
+    }
+}
+
+fn read_pipeline_execution_mode_env(default: PipelineExecutionMode) -> PipelineExecutionMode {
+    match env::var(ENV_PIPELINE_MODE) {
+        Ok(raw) => parse_pipeline_execution_mode(&raw).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid {} value '{}', using default {:?}",
+                ENV_PIPELINE_MODE,
+                raw,
+                default
+            );
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+fn read_candidate_pipeline_config() -> CandidatePipelineConfig {
+    CandidatePipelineConfig {
+        strict_code_seeds: read_shadow_bool_env(ENV_CANDIDATE_STRICT_CODE_SEEDS, false),
+        strict_symbol_size_seeds: read_shadow_bool_env(
+            ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS,
+            false,
+        ),
     }
 }
 
@@ -663,6 +707,16 @@ impl AnalyzerState {
         Ok(())
     }
 
+    fn detect_functions_candidate(&mut self, obj: &ObjInfo) -> Result<()> {
+        let skip_ranges = self.skip_ranges.clone();
+        let candidate_config = read_candidate_pipeline_config();
+        let mut candidate_pipeline =
+            CandidatePipelineEngine::new_with_config(skip_ranges, candidate_config);
+        candidate_pipeline.run_with_report(obj)?;
+        *self = candidate_pipeline.state;
+        Ok(())
+    }
+
     fn detect_functions_with_shadow_config(
         &mut self,
         obj: &ObjInfo,
@@ -683,13 +737,7 @@ impl AnalyzerState {
             legacy_report.seed_discovery.seeds.iter().map(|seed| seed.address).collect_vec();
 
         // Candidate path is isolated behind its own engine type for staged phase rollout.
-        let candidate_config = CandidatePipelineConfig {
-            strict_code_seeds: read_shadow_bool_env(ENV_CANDIDATE_STRICT_CODE_SEEDS, false),
-            strict_symbol_size_seeds: read_shadow_bool_env(
-                ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS,
-                false,
-            ),
-        };
+        let candidate_config = read_candidate_pipeline_config();
         let mut candidate_pipeline =
             CandidatePipelineEngine::new_with_config(skip_ranges, candidate_config);
         let candidate_report = candidate_pipeline.run_with_report(obj)?;
@@ -791,8 +839,17 @@ impl AnalyzerState {
     }
 
     pub fn detect_functions(&mut self, obj: &ObjInfo) -> Result<()> {
-        let gate_config = CandidateShadowGateConfig::defaults();
-        let _decision = self.detect_functions_with_shadow_config(obj, gate_config)?;
+        let execution_mode = read_pipeline_execution_mode_env(DEFAULT_PIPELINE_EXECUTION_MODE);
+        log::debug!("CFA pipeline execution mode: {:?}", execution_mode);
+        match execution_mode {
+            PipelineExecutionMode::Legacy => self.detect_functions_legacy(obj)?,
+            PipelineExecutionMode::Shadow => {
+                let mut gate_config = CandidateShadowGateConfig::defaults();
+                gate_config.enable_pipeline_shadow = true;
+                let _decision = self.detect_functions_with_shadow_config(obj, gate_config)?;
+            }
+            PipelineExecutionMode::Candidate => self.detect_functions_candidate(obj)?,
+        }
         Ok(())
     }
 
@@ -1767,6 +1824,33 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pipeline_execution_mode_accepts_common_values() {
+        assert_eq!(
+            parse_pipeline_execution_mode("legacy"),
+            Some(PipelineExecutionMode::Legacy)
+        );
+        assert_eq!(
+            parse_pipeline_execution_mode("shadow"),
+            Some(PipelineExecutionMode::Shadow)
+        );
+        assert_eq!(
+            parse_pipeline_execution_mode("AUTO"),
+            Some(PipelineExecutionMode::Shadow)
+        );
+        assert_eq!(
+            parse_pipeline_execution_mode("candidate"),
+            Some(PipelineExecutionMode::Candidate)
+        );
+    }
+
+    #[test]
+    fn test_parse_pipeline_execution_mode_rejects_invalid_values() {
+        assert_eq!(parse_pipeline_execution_mode(""), None);
+        assert_eq!(parse_pipeline_execution_mode("legacy-shadow"), None);
+        assert_eq!(parse_pipeline_execution_mode("1"), None);
+    }
+
+    #[test]
     fn test_candidate_shadow_decision_triggers_phase_threshold_fallback() {
         let config = CandidateShadowGateConfig {
             enable_vm2_shadow: false,
@@ -1873,6 +1957,19 @@ mod tests {
         assert_eq!(decision.phase_checkpoint_deltas, 0);
         assert!(!decision.should_fallback());
         assert!(!state.functions.is_empty(), "state should be populated after analysis");
+    }
+
+    #[test]
+    fn test_detect_functions_candidate_mode_runs_without_shadow() {
+        let obj = make_obj(0x1000, &[NOP, BLR]);
+        let mut state = AnalyzerState::new(std::collections::BTreeMap::new());
+        state
+            .detect_functions_candidate(&obj)
+            .expect("candidate-mode detect_functions should succeed");
+        assert!(
+            !state.functions.is_empty(),
+            "candidate mode should populate analyzer state without shadow fallback"
+        );
     }
 
     #[test]

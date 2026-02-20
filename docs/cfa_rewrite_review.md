@@ -433,6 +433,30 @@ Open technical debt (non-blocking for this branch state):
     - pipeline digest summary counts (`function_presence`, `function_end`, `function_state`, `jump_table_presence`, `jump_table_size`)
   - Existing bounded per-entry logging remains unchanged for deep triage.
 
+- **Phase E2h complete (R7 native VM2 opcode expansion)**: runtime native shadow now covers more arithmetic/control state ops.
+  - Expanded native VM2 handling in `analysis::vm2::Vm2::step_shadow_native`:
+    - `add` (parity-safe value forms),
+    - `subf` / `subfc`,
+    - `subfic`,
+    - `or` (non-register-copy form; register-copy form intentionally bridges),
+    - `mtspr` / `mfspr`.
+  - Value-confidence synthesis for native facts now mirrors legacy mapping semantics for
+    `Top`/`Range`/`IndexedLoad`/`CompareTag` classes.
+  - Added regressions:
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_bridges_or_register_copy`
+
+- **Phase E1g complete (R6 cutover mode scaffold)**: CFA now has explicit execution-mode routing for staged default migration.
+  - Added `PipelineExecutionMode` in `analysis::cfa` with env control:
+    - `DTK_CFA_PIPELINE_MODE=legacy|shadow|candidate` (`auto` aliases `shadow`)
+  - Default remains conservative (`legacy`).
+  - `shadow` mode forces candidate-vs-legacy comparison path for rollout soak.
+  - `candidate` mode enables direct candidate-lane execution for controlled opt-in trials.
+  - Added regressions:
+    - `analysis::cfa::tests::test_parse_pipeline_execution_mode_accepts_common_values`
+    - `analysis::cfa::tests::test_parse_pipeline_execution_mode_rejects_invalid_values`
+    - `analysis::cfa::tests::test_detect_functions_candidate_mode_runs_without_shadow`
+
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
   - Runtime shadow now compares `LegacyPipelineEngine` vs `CandidatePipelineEngine`.
@@ -518,6 +542,16 @@ Open technical debt (non-blocking for this branch state):
       - CRT object deltas align with current COMDAT fall-through handling for `__savegprlr*`/`__restgprlr*` and `__savefpr*`/`__restfpr*`.
     - Determinism check (same commit, second run):
       - no non-trivial diffs (`config.json`/`dep` excluded).
+  - Latest debug parity run status (current branch tip):
+    - `DTK_CFA_PIPELINE_MODE=shadow DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-r8-<timestamp>`
+    - Result: `status=101`, panic in `src/analysis/tracker.rs:611` (`Relocation already exists ...`).
+    - Baseline confirmation: plain split run (no shadow env) also hits the same panic.
+    - Current interpretation: relocation-tracker issue is pre-existing and not mode-specific; keep queued as real-XEX blocker.
+  - Parser smoke remains healthy:
+    - `dtk xex info` succeeds on:
+      - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
+      - `/home/free/code/milohax/milo-executable-library/dc1/TU0/default.xex`
+      - `/home/free/code/milohax/milo-executable-library/gh2/360 TU0 Strum Limit Fix/default.xex`
 
 #### Useful XEX Links (Local Workspace)
 
@@ -530,29 +564,28 @@ Open technical debt (non-blocking for this branch state):
 
 ### Next Phase Queue
 
-1. **R6 implementation: candidate phase component spikes (B8)**:
-   - Start first candidate heuristic refinement behind `CandidatePipelineEngine` gates
-     (seed/slice/finalization micro-change with parity proof and rollback path).
-   - Keep legacy analyzer default unless checkpoint + digest parity remain clean.
-2. **R7 implementation: operational fallback routing (B7/B8)**:
-   - Continue expanding native VM2 opcode coverage in runtime shadow to reduce bridge dependency.
-   - Keep bridge fallback deterministic and bounded while coverage grows.
-   - Emit structured mismatch logs with actionable fixture-level summaries.
-3. **Real-XEX parity proof loop**:
-   - Run shadow parity against real XEX workflows in `~/code/milohax/dc3-decomp` and the executables repo.
-   - Track unresolved deltas as blockers for candidate-path rollout.
+1. **R6 rollout prep (cutover scaffold utilization)**:
+   - Run `DTK_CFA_PIPELINE_MODE=shadow` soak across fixture + real-XEX workflows.
+   - Start controlled `DTK_CFA_PIPELINE_MODE=candidate` opt-in checks on bounded corpora.
+   - Keep default at `legacy` until parity + stability gates are met.
+2. **R7 native VM2 coverage continuation**:
+   - Expand parity-safe native handling into the jump-table-heavy path (`rlwinm`, indexed loads, selective branch facts).
+   - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
+3. **Real-XEX blocker burn-down**:
+   - Triage/fix `tracker.rs` relocation duplicate panic (`Relocation already exists ...`) observed in both baseline and shadow runs.
+   - Re-establish DC3 split `rc=0` parity smoke before further cutover promotion.
 
 ### Immediate Execution Plan (Kickoff: 2026-02-20, updated post-Phase D)
 
-1. **Sprint E1 (R6 implementation)**:
-   - Implement first candidate phase path(s) and compare against legacy using checkpoint + digest summaries.
-2. **Sprint E2 (R7 integration)**:
-   - Bind fallback hooks to candidate path output deltas for automatic legacy routing on threshold breach.
-3. **Sprint E3 (external parity evidence)**:
-   - Run real-XEX parity checks in `dc3-decomp` and executables repo, then document unresolved deltas.
+1. **Sprint F1 (cutover rehearsal)**:
+   - Validate `legacy` vs `shadow` vs `candidate` mode behavior on corpus + real-XEX samples.
+2. **Sprint F2 (native coverage growth)**:
+   - Land the next native VM2 opcode tranche with bridge-safe tests and coverage metrics.
+3. **Sprint F3 (real-world stability gate)**:
+   - Resolve relocation-tracker split panic and restore end-to-end split parity evidence.
 
 Exit criteria for next implementation pass:
 
-- Candidate phase path produces measurable checkpoint/digest parity reports.
-- Fallback hooks are exercised by real candidate deltas (not only synthetic tests).
-- Real-XEX parity evidence is documented with concrete pass/fail fixtures.
+- Candidate execution-mode routing is validated on real workloads.
+- Native VM2 shadow coverage improves without increasing unresolved diff counts.
+- DC3 split panic blocker has a documented fix path (or landed fix) with verification evidence.

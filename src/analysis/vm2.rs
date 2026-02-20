@@ -222,8 +222,31 @@ impl Vm2 {
     }
 
     #[inline]
+    fn confidence_for_value(value: &Value2) -> Confidence2 {
+        match value {
+            Value2::Top => Confidence2::Low,
+            Value2::CompareTag { .. } => Confidence2::Medium,
+            Value2::IndexedLoad { max_offset, .. } => {
+                if max_offset.is_some() {
+                    Confidence2::High
+                } else {
+                    Confidence2::Medium
+                }
+            }
+            Value2::Range { step, .. } => {
+                if *step == 0 {
+                    Confidence2::Low
+                } else {
+                    Confidence2::High
+                }
+            }
+            _ => Confidence2::High,
+        }
+    }
+
+    #[inline]
     fn fact_from_value(value: Value2) -> ValueFact2 {
-        let confidence = if value == Value2::Top { Confidence2::Low } else { Confidence2::High };
+        let confidence = Self::confidence_for_value(&value);
         ValueFact2 { value, provenance: Provenance2::None, confidence }
     }
 
@@ -234,6 +257,26 @@ impl Vm2 {
         match ins.op {
             // `ori rX, rX, 0` / `nop`: no semantic state change.
             Opcode::Ori if ins.field_uimm() == 0 && ins.field_ra() == ins.field_rs() => true,
+            // add rD, rA, rB
+            Opcode::Add => {
+                let dst = ins.field_rd() as usize;
+                let left = self.reg(ins.field_ra()).value.clone();
+                let right = self.reg(ins.field_rb()).value.clone();
+                let value = match (left, right) {
+                    (Value2::Const(left), Value2::Const(right)) => {
+                        Value2::Const(left.wrapping_add(right))
+                    }
+                    (Value2::Address(RelocationTarget::Address(left)), Value2::Const(right)) => {
+                        Value2::Address(RelocationTarget::Address(left.wrapping_add(right as u32)))
+                    }
+                    (Value2::Const(left), Value2::Address(RelocationTarget::Address(right))) => {
+                        Value2::Address(RelocationTarget::Address(right.wrapping_add(left as u32)))
+                    }
+                    _ => return false,
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
             // addis rD, rA, SIMM
             Opcode::Addis => {
                 let dst = ins.field_rd() as usize;
@@ -283,6 +326,33 @@ impl Vm2 {
                 self.gpr[dst] = Self::fact_from_value(value);
                 true
             }
+            // subf/subfc rD, rA, rB
+            Opcode::Subf | Opcode::Subfc => {
+                let dst = ins.field_rd() as usize;
+                let value = match (
+                    self.reg(ins.field_ra()).value.clone(),
+                    self.reg(ins.field_rb()).value.clone(),
+                ) {
+                    (Value2::Const(left), Value2::Const(right)) => {
+                        Value2::Const((!left).wrapping_add(right).wrapping_add(1))
+                    }
+                    _ => Value2::Top,
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // subfic rD, rA, SIMM
+            Opcode::Subfic => {
+                let dst = ins.field_rd() as usize;
+                let value = match self.reg(ins.field_ra()).value.clone() {
+                    Value2::Const(value) => {
+                        Value2::Const((!value).wrapping_add(ins.field_simm() as u64).wrapping_add(1))
+                    }
+                    _ => Value2::Top,
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
             // ori rA, rS, UIMM
             Opcode::Ori => {
                 let dst = ins.field_ra() as usize;
@@ -295,6 +365,44 @@ impl Vm2 {
                         Value2::Const(value) => Value2::Const(value | ins.field_uimm() as u64),
                         _ => Value2::Top,
                     }
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // or rA, rS, rB
+            Opcode::Or => {
+                // Mirror legacy provenance-sensitive register-copy behavior by bridging.
+                if ins.field_rs() == ins.field_rb() {
+                    return false;
+                }
+                let dst = ins.field_ra() as usize;
+                let value = match (
+                    self.reg(ins.field_rs()).value.clone(),
+                    self.reg(ins.field_rb()).value.clone(),
+                ) {
+                    (Value2::Const(left), Value2::Const(right)) => Value2::Const(left | right),
+                    _ => Value2::Top,
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // mtspr SPR, rS
+            Opcode::Mtspr => {
+                let source = Self::fact_from_value(self.reg(ins.field_rs()).value.clone());
+                match ins.field_spr() {
+                    8 => self.lr = source,
+                    9 => self.ctr = source,
+                    _ => {}
+                }
+                true
+            }
+            // mfspr rD, SPR
+            Opcode::Mfspr => {
+                let dst = ins.field_rd() as usize;
+                let value = match ins.field_spr() {
+                    8 => self.lr.value.clone(),
+                    9 => self.ctr.value.clone(),
+                    _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
                 true
@@ -804,6 +912,86 @@ mod tests {
         assert!(
             function_report.bridged_steps >= 1,
             "expected at least one bridged step in native mode"
+        );
+        assert_eq!(report.native_steps, function_report.native_steps);
+        assert_eq!(report.bridged_steps, function_report.bridged_steps);
+        assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops() {
+        // li r3,4
+        // li r4,8
+        // add r5,r3,r4
+        // subf r6,r3,r4
+        // subfic r8,r6,5
+        // or r9,r5,r6
+        // mtctr r9
+        // mfctr r10
+        // blr
+        let obj = make_obj_with_words(
+            0x1000,
+            &[
+                0x3860_0004,
+                0x3880_0008,
+                0x7CA3_2214,
+                0x7CC3_2050,
+                0x2106_0005,
+                0x7CA9_3378,
+                0x7D29_03A6,
+                0x7D49_02A6,
+                0x4E80_0020,
+            ],
+        );
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report_with_mode(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 32 },
+            true,
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 1);
+        assert_eq!(report.function_reports.len(), 1);
+        let function_report = &report.function_reports[0];
+        assert!(
+            function_report.steps_sampled >= 8,
+            "expected full arithmetic/spr sequence to be sampled"
+        );
+        assert_eq!(
+            function_report.bridged_steps, 0,
+            "all arithmetic/spr operations in this sequence should be native"
+        );
+        assert_eq!(report.bridged_steps, 0);
+        assert_eq!(function_report.native_steps, function_report.steps_sampled);
+        assert_eq!(report.native_steps, report.steps_sampled);
+        assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_native_mode_bridges_or_register_copy() {
+        // li r3,1
+        // or r4,r3,r3 (register-copy form should bridge to preserve provenance parity)
+        // blr
+        let obj = make_obj_with_words(0x1000, &[0x3860_0001, 0x7C64_1B78, 0x4E80_0020]);
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report_with_mode(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+            true,
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 1);
+        assert_eq!(report.function_reports.len(), 1);
+        let function_report = &report.function_reports[0];
+        assert!(
+            function_report.native_steps >= 1,
+            "expected surrounding instructions to remain native"
+        );
+        assert!(
+            function_report.bridged_steps >= 1,
+            "register-copy OR should bridge to preserve legacy provenance behavior"
         );
         assert_eq!(report.native_steps, function_report.native_steps);
         assert_eq!(report.bridged_steps, function_report.bridged_steps);
