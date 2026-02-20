@@ -104,6 +104,8 @@ Follow-up status:
       - `analysis::pipeline::tests::candidate_seed_phase_strict_code_filter_drops_non_code_function_symbol`
       - `analysis::pipeline::tests::candidate_slice_phase_matches_legacy_slice_phase`
       - `analysis::pipeline::tests::candidate_finalization_phase_matches_legacy_finalization_phase`
+    - Runtime candidate heuristic gate:
+      - `DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS`
     - Runtime env-gated smoke:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
       - Result: `20/20` pass.

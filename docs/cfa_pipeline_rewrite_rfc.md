@@ -15,6 +15,8 @@ Current implementation snapshot:
 - Candidate finalization phase is now implemented directly in `CandidatePipelineEngine`.
 - Candidate config hook now exists (`CandidatePipelineConfig::strict_code_seeds`) for
   default-off seed refinement experiments.
+  - Runtime toggle for strict seed refinement:
+    - `DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS`
 - `analysis::pipeline` now exposes phase outputs and a run report model.
 - Digest comparison now includes categorized diff entries and summary counters.
 - Full CFA fixture shadow parity gate is active with zero-diff totals and per-fixture reporting.

@@ -15,8 +15,9 @@ use crate::{
         disassemble,
         executor::{ExecCbData, ExecCbResult, Executor},
         pipeline::{
-            compare_phase_checkpoints, phase_checkpoint_diff_entries, CandidatePipelineEngine,
-            CfaPipelineEngine, LegacyPipelineEngine, PhaseCheckpointDiffEntry, PipelineDiffEntry,
+            compare_phase_checkpoints, phase_checkpoint_diff_entries, CandidatePipelineConfig,
+            CandidatePipelineEngine, CfaPipelineEngine, LegacyPipelineEngine,
+            PhaseCheckpointDiffEntry, PipelineDiffEntry,
         },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
@@ -145,6 +146,7 @@ pub(crate) const ENV_MAX_VM_SHADOW_DELTAS: &str = "DTK_CFA_MAX_VM_SHADOW_DELTAS"
 pub(crate) const ENV_MAX_PHASE_CHECKPOINT_DELTAS: &str = "DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS";
 pub(crate) const ENV_VM_SHADOW_MAX_FUNCTIONS: &str = "DTK_CFA_VM_SHADOW_MAX_FUNCTIONS";
 pub(crate) const ENV_VM_SHADOW_MAX_STEPS: &str = "DTK_CFA_VM_SHADOW_MAX_STEPS";
+pub(crate) const ENV_CANDIDATE_STRICT_CODE_SEEDS: &str = "DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS";
 const MAX_LOGGED_SHADOW_DELTA_ENTRIES: usize = 8;
 
 fn parse_shadow_bool(raw: &str) -> Option<bool> {
@@ -621,7 +623,11 @@ impl AnalyzerState {
             legacy_report.seed_discovery.seeds.iter().map(|seed| seed.address).collect_vec();
 
         // Candidate path is isolated behind its own engine type for staged phase rollout.
-        let mut candidate_pipeline = CandidatePipelineEngine::new(skip_ranges);
+        let candidate_config = CandidatePipelineConfig {
+            strict_code_seeds: read_shadow_bool_env(ENV_CANDIDATE_STRICT_CODE_SEEDS, false),
+        };
+        let mut candidate_pipeline =
+            CandidatePipelineEngine::new_with_config(skip_ranges, candidate_config);
         let candidate_report = candidate_pipeline.run_with_report(obj)?;
         let candidate_digest = candidate_report.digest.clone();
 
