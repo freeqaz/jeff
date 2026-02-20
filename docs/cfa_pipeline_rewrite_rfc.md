@@ -21,6 +21,8 @@ Current implementation snapshot:
     - `DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS`
 - `analysis::pipeline` now exposes phase outputs and a run report model.
 - Digest comparison now includes categorized diff entries and summary counters.
+- Digest comparison now includes function-state categories (`FunctionState`) in addition to
+  function presence/end and jump-table categories.
 - Full CFA fixture shadow parity gate is active with zero-diff totals and per-fixture reporting.
 - Shadow corpus parity test now runs through candidate pipeline engine against baseline analyzer digest.
 - Candidate seed parity test is active:

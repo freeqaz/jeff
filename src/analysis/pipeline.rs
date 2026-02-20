@@ -47,6 +47,7 @@ pub struct ApplyOutput {
 pub enum PipelineDiffKind {
     FunctionPresence,
     FunctionEnd,
+    FunctionState,
     JumpTablePresence,
     JumpTableSize,
 }
@@ -63,26 +64,58 @@ pub struct PipelineDiffEntry {
 pub struct PipelineDiffSummary {
     pub function_presence: usize,
     pub function_end: usize,
+    pub function_state: usize,
     pub jump_table_presence: usize,
     pub jump_table_size: usize,
 }
 
 impl PipelineDiffSummary {
     pub fn total(&self) -> usize {
-        self.function_presence + self.function_end + self.jump_table_presence + self.jump_table_size
+        self.function_presence
+            + self.function_end
+            + self.function_state
+            + self.jump_table_presence
+            + self.jump_table_size
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum FunctionDigestState {
+    #[default]
+    Unanalyzed,
+    Function,
+    NonFunction,
+    Unfinalized,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct PipelineDigest {
     pub functions: BTreeMap<SectionAddress, Option<SectionAddress>>,
+    pub function_states: BTreeMap<SectionAddress, FunctionDigestState>,
     pub jump_tables: BTreeMap<SectionAddress, u32>,
 }
 
 impl PipelineDigest {
+    fn classify_function_state(info: &FunctionInfo) -> FunctionDigestState {
+        if info.is_function() {
+            FunctionDigestState::Function
+        } else if info.is_non_function() {
+            FunctionDigestState::NonFunction
+        } else if info.is_unfinalized() {
+            FunctionDigestState::Unfinalized
+        } else {
+            FunctionDigestState::Unanalyzed
+        }
+    }
+
     pub fn from_state(state: &AnalyzerState) -> Self {
         Self {
             functions: state.functions.iter().map(|(&addr, info)| (addr, info.end)).collect(),
+            function_states: state
+                .functions
+                .iter()
+                .map(|(&addr, info)| (addr, Self::classify_function_state(info)))
+                .collect(),
             jump_tables: state.jump_tables.clone(),
         }
     }
@@ -105,6 +138,16 @@ impl PipelineDigest {
                     address: key,
                     left: format!("{left:?}"),
                     right: format!("{right:?}"),
+                });
+            }
+            let left_state = self.function_states.get(&key);
+            let right_state = other.function_states.get(&key);
+            if left.is_some() && right.is_some() && left_state != right_state {
+                diffs.push(PipelineDiffEntry {
+                    kind: PipelineDiffKind::FunctionState,
+                    address: key,
+                    left: format!("{left_state:?}"),
+                    right: format!("{right_state:?}"),
                 });
             }
         }
@@ -142,6 +185,7 @@ impl PipelineDigest {
                 match diff.kind {
                     PipelineDiffKind::FunctionPresence => out.function_presence += 1,
                     PipelineDiffKind::FunctionEnd => out.function_end += 1,
+                    PipelineDiffKind::FunctionState => out.function_state += 1,
                     PipelineDiffKind::JumpTablePresence => out.jump_table_presence += 1,
                     PipelineDiffKind::JumpTableSize => out.jump_table_size += 1,
                 }
@@ -708,6 +752,7 @@ mod tests {
     fn accumulate_summary(total: &mut PipelineDiffSummary, add: &PipelineDiffSummary) {
         total.function_presence += add.function_presence;
         total.function_end += add.function_end;
+        total.function_state += add.function_state;
         total.jump_table_presence += add.jump_table_presence;
         total.jump_table_size += add.jump_table_size;
     }
@@ -804,6 +849,28 @@ mod tests {
         assert_eq!(summary.jump_table_size, 1);
         assert_eq!(summary.jump_table_presence, 2);
         assert_eq!(summary.total(), 5);
+    }
+
+    #[test]
+    fn pipeline_digest_diff_reports_function_state_deltas() {
+        let addr = SectionAddress::new(0, 0x1000);
+
+        let mut left = PipelineDigest::default();
+        left.functions.insert(addr, None);
+        left.function_states.insert(addr, FunctionDigestState::Unfinalized);
+
+        let mut right = PipelineDigest::default();
+        right.functions.insert(addr, None);
+        right.function_states.insert(addr, FunctionDigestState::NonFunction);
+
+        let entries = left.diff_entries(&right);
+        assert!(
+            entries.iter().any(|entry| entry.kind == PipelineDiffKind::FunctionState),
+            "expected function-state delta entry, got: {entries:?}"
+        );
+        let summary = left.diff_summary(&right);
+        assert_eq!(summary.function_state, 1);
+        assert_eq!(summary.total(), 1);
     }
 
     #[test]

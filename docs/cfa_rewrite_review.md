@@ -417,6 +417,16 @@ Open technical debt (non-blocking for this branch state):
     - Result: `rc=0`, `4448` files, `2223` `.obj`.
     - Same-commit rerun deterministic (no non-trivial diffs excluding `config.json`/`dep`).
 
+- **Phase E2f complete (R7 digest hardening)**: pipeline digest diffs now include per-function state class.
+  - Added `PipelineDiffKind::FunctionState` and `PipelineDiffSummary::function_state`.
+  - `PipelineDigest::from_state(...)` now captures function state classification
+    (`Function` / `NonFunction` / `Unfinalized` / `Unanalyzed`) in addition to end addresses.
+  - Added regression:
+    - `analysis::pipeline::tests::pipeline_digest_diff_reports_function_state_deltas`
+  - Real-XEX smoke with strict candidate gates and native VM2 shadow remains stable:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-digeststate-<timestamp>`
+    - Result: `rc=0`, `4448` files, `2223` `.obj`, no non-trivial diffs vs strict-symbol baseline.
+
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
   - Runtime shadow now compares `LegacyPipelineEngine` vs `CandidatePipelineEngine`.

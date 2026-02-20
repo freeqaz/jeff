@@ -118,6 +118,8 @@ Follow-up status:
     - Runtime candidate heuristic gate:
       - `DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS`
       - `DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS`
+    - Pipeline digest diff now includes function-state deltas in addition to
+      presence/end and jump-table deltas.
     - Runtime env-gated smoke:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
       - Result: `20/20` pass.
