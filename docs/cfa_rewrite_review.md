@@ -274,7 +274,7 @@ Validation run:
 
 - Branch: `cfa_fix`
 - Version: `1.9.2`
-- Working tree: roadmap execution active (`R2 complete`, `R3 complete`, `R4 complete`, `R5 complete`, `R6 prep complete`, `R7 prep complete`)
+- Working tree: roadmap execution active (`R2 complete`, `R3 complete`, `R4 complete`, `R5 complete`, `R6 prep complete`, `R7 tranche-1 complete`)
 - Dev branch delta: only one version-bump commit (`1.9.1`) remains on `dev`, superseded by `1.9.2` here
 
 Current observed test state on this branch:
@@ -282,9 +282,9 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 3 passed
-- `cargo test analysis::vm2::tests::` -> 9 passed
+- `cargo test analysis::vm2::tests::` -> 18 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
-- `cargo test analysis::pipeline::tests::` -> 8 passed
+- `cargo test analysis::pipeline::tests::` -> 15 passed
 - `cargo test util::xex::tests::` -> 5 passed
 
 Open technical debt (non-blocking for this branch state):
@@ -558,6 +558,12 @@ Open technical debt (non-blocking for this branch state):
       - only `config.json` and `dep` differ; no other output-tree deltas.
     - Baseline vs candidate diff:
       - only `config.json` and `dep` differ; no other output-tree deltas.
+    - Post native-VM2 jump-table opcode tranche validation (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`):
+      - `target/debug/dtk` baseline vs candidate rerun (`r10b`) returned `BASE_RC=0`, `CAND_RC=0`.
+      - Both runs produced `4448` files and `2223` `.obj`; only `config.json` + `dep` differed.
+      - Added native parity tests:
+        - `analysis::vm2::tests::vm2_step_shadow_native_handles_relative_jump_table_sequence`
+        - `analysis::vm2::tests::vm2_step_shadow_native_handles_lwzx_and_lhzx_parity`
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
@@ -580,7 +586,7 @@ Open technical debt (non-blocking for this branch state):
    - Start controlled `DTK_CFA_PIPELINE_MODE=candidate` opt-in checks on bounded corpora.
    - Keep default at `legacy` until parity + stability gates are met.
 2. **R7 native VM2 coverage continuation**:
-   - Expand parity-safe native handling into the jump-table-heavy path (`rlwinm`, indexed loads, selective branch facts).
+   - Extend native handling past tranche-1 (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) into selective branch-fact paths.
    - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
 3. **Real-XEX workflow promotion**:
    - Run `legacy`/`shadow`/`candidate` split comparisons on DC3 and sample executable-library XEX files.
@@ -591,7 +597,7 @@ Open technical debt (non-blocking for this branch state):
 1. **Sprint F1 (cutover rehearsal)**:
    - Validate `legacy` vs `shadow` vs `candidate` mode behavior on corpus + real-XEX samples.
 2. **Sprint F2 (native coverage growth)**:
-   - Land the next native VM2 opcode tranche with bridge-safe tests and coverage metrics.
+   - Land the next native VM2 branch-fact/provenance tranche with bridge-safe tests and coverage metrics.
 3. **Sprint F3 (real-world stability gate)**:
    - Expand real-XEX mode parity evidence (`legacy`/`shadow`/`candidate`) and document promotion criteria.
 

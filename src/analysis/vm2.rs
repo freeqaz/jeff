@@ -6,10 +6,11 @@ use std::{
 use powerpc::{Ins, Opcode};
 
 use crate::analysis::{
-    disassemble,
     cfa::SectionAddress,
-    relocation_target_for,
-    vm::{Cr, Gpr, GprSourceLocation, GprValue, JumpTableType, StepResult, VM},
+    disassemble, relocation_target_for,
+    vm::{
+        section_address_for, Cr, Gpr, GprSourceLocation, GprValue, JumpTableType, StepResult, VM,
+    },
     RelocationTarget,
 };
 use crate::obj::{ObjInfo, ObjSectionKind};
@@ -72,6 +73,13 @@ impl Default for ValueFact2 {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+struct CrCompareState2 {
+    left: Value2,
+    right: Value2,
+    signed: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Vm2 {
     pub gpr: [ValueFact2; 32],
     pub cr: [ValueFact2; 8],
@@ -79,6 +87,8 @@ pub struct Vm2 {
     pub ctr: ValueFact2,
     pub stack_slots: BTreeMap<i16, ValueFact2>,
     pub current_revision: usize,
+    cr_compare: [Option<CrCompareState2>; 8],
+    last_modified_cr: u8,
 }
 
 impl Default for Vm2 {
@@ -90,6 +100,8 @@ impl Default for Vm2 {
             ctr: ValueFact2::default(),
             stack_slots: BTreeMap::new(),
             current_revision: 0,
+            cr_compare: std::array::from_fn(|_| None),
+            last_modified_cr: 0,
         }
     }
 }
@@ -170,6 +182,18 @@ impl Vm2 {
         }
     }
 
+    fn cr_compare_from_legacy_cr(cr: &Cr) -> Option<CrCompareState2> {
+        if cr.left == GprValue::Unknown && cr.right == GprValue::Unknown {
+            None
+        } else {
+            Some(CrCompareState2 {
+                left: Self::map_legacy_value(cr.left).0,
+                right: Self::map_legacy_value(cr.right).0,
+                signed: cr.signed,
+            })
+        }
+    }
+
     pub fn from_legacy_vm(legacy: &VM) -> Self {
         let mut vm2 = Self::new();
         for reg in 0..32 {
@@ -185,6 +209,9 @@ impl Vm2 {
             .iter()
             .map(|(&offset, gpr)| (offset, Self::fact_from_legacy_gpr(gpr)))
             .collect();
+        vm2.cr_compare =
+            std::array::from_fn(|crf| Self::cr_compare_from_legacy_cr(&legacy.cr[crf]));
+        vm2.last_modified_cr = legacy.last_modified_cr;
         vm2.current_revision = legacy.gpr.iter().map(|gpr| gpr.version).max().unwrap_or_default();
         vm2
     }
@@ -250,10 +277,47 @@ impl Vm2 {
         ValueFact2 { value, provenance: Provenance2::None, confidence }
     }
 
+    #[inline]
+    fn value_as_address(
+        obj: &ObjInfo,
+        ins_addr: SectionAddress,
+        value: &Value2,
+    ) -> Option<RelocationTarget> {
+        match value {
+            Value2::Const(raw) => section_address_for(obj, ins_addr, *raw as u32),
+            Value2::Address(target) => Some(target.clone()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn mask_value(begin: u32, end: u32) -> u32 {
+        if begin <= end {
+            let mut mask = 0u32;
+            for bit in begin..=end {
+                mask |= 1 << (31 - bit);
+            }
+            mask
+        } else if begin == end + 1 {
+            u32::MAX
+        } else {
+            let mut mask = u32::MAX;
+            for bit in end + 1..begin {
+                mask &= !(1 << (31 - bit));
+            }
+            mask
+        }
+    }
+
     /// Best-effort native VM2 runtime-shadow step.
     /// Returns `true` when the opcode is handled natively; callers should bridge from legacy VM
     /// state when `false`.
-    pub fn step_shadow_native(&mut self, obj: &ObjInfo, ins_addr: SectionAddress, ins: Ins) -> bool {
+    pub fn step_shadow_native(
+        &mut self,
+        obj: &ObjInfo,
+        ins_addr: SectionAddress,
+        ins: Ins,
+    ) -> bool {
         match ins.op {
             // `ori rX, rX, 0` / `nop`: no semantic state change.
             Opcode::Ori if ins.field_uimm() == 0 && ins.field_ra() == ins.field_rs() => true,
@@ -271,6 +335,22 @@ impl Vm2 {
                     }
                     (Value2::Const(left), Value2::Address(RelocationTarget::Address(right))) => {
                         Value2::Address(RelocationTarget::Address(right.wrapping_add(left as u32)))
+                    }
+                    (
+                        Value2::Const(left),
+                        Value2::IndexedLoad { table_addr, max_offset, relative_base },
+                    ) => {
+                        if relative_base.is_some() {
+                            return false;
+                        }
+                        Value2::IndexedLoad {
+                            table_addr,
+                            max_offset,
+                            relative_base: Some(RelocationTarget::Address(SectionAddress::new(
+                                ins_addr.section,
+                                left as u32,
+                            ))),
+                        }
                     }
                     _ => return false,
                 };
@@ -294,7 +374,9 @@ impl Vm2 {
                         }
                     };
                     match left {
-                        Some(value) => Value2::Const(value.wrapping_add((ins.field_simm() as u64) << 16)),
+                        Some(value) => {
+                            Value2::Const(value.wrapping_add((ins.field_simm() as u64) << 16))
+                        }
                         None => Value2::Top,
                     }
                 };
@@ -316,10 +398,12 @@ impl Vm2 {
                         self.reg(ins.field_ra()).value.clone()
                     };
                     match left {
-                        Value2::Const(value) => Value2::Const(value.wrapping_add(ins.field_simm() as u64)),
-                        Value2::Address(RelocationTarget::Address(address)) => {
-                            Value2::Address(RelocationTarget::Address(address.offset(ins.field_simm() as i32)))
+                        Value2::Const(value) => {
+                            Value2::Const(value.wrapping_add(ins.field_simm() as u64))
                         }
+                        Value2::Address(RelocationTarget::Address(address)) => Value2::Address(
+                            RelocationTarget::Address(address.offset(ins.field_simm() as i32)),
+                        ),
                         _ => Value2::Top,
                     }
                 };
@@ -345,8 +429,150 @@ impl Vm2 {
             Opcode::Subfic => {
                 let dst = ins.field_rd() as usize;
                 let value = match self.reg(ins.field_ra()).value.clone() {
-                    Value2::Const(value) => {
-                        Value2::Const((!value).wrapping_add(ins.field_simm() as u64).wrapping_add(1))
+                    Value2::Const(value) => Value2::Const(
+                        (!value).wrapping_add(ins.field_simm() as u64).wrapping_add(1),
+                    ),
+                    _ => Value2::Top,
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // cmp/cmpi/cmpl/cmpli [crfD], [L], rA, rB|IMM
+            Opcode::Cmp | Opcode::Cmpi | Opcode::Cmpl | Opcode::Cmpli => {
+                if ins.field_l() != 0 {
+                    return true;
+                }
+                let left_reg = ins.field_ra() as usize;
+                let left = self.gpr[left_reg].value.clone();
+                let (right, signed) = match ins.op {
+                    Opcode::Cmp => (self.reg(ins.field_rb()).value.clone(), true),
+                    Opcode::Cmpl => (self.reg(ins.field_rb()).value.clone(), false),
+                    Opcode::Cmpi => (Value2::Const(ins.field_simm() as u64), true),
+                    Opcode::Cmpli => (Value2::Const(ins.field_uimm() as u64), false),
+                    _ => unreachable!(),
+                };
+                let crf = ins.field_crfd();
+                self.cr[crf as usize] = ValueFact2 {
+                    value: Value2::CompareTag { crf },
+                    provenance: Provenance2::None,
+                    confidence: Confidence2::Medium,
+                };
+                self.cr_compare[crf as usize] =
+                    Some(CrCompareState2 { left: left.clone(), right: right.clone(), signed });
+                let provenance = self.gpr[left_reg].provenance.clone();
+                self.gpr[left_reg] = ValueFact2 {
+                    value: Value2::CompareTag { crf },
+                    provenance,
+                    confidence: Confidence2::Medium,
+                };
+                self.last_modified_cr = crf;
+                true
+            }
+            // rlwinm/rlwnm rA, rS, SH|rB, MB, ME
+            Opcode::Rlwinm | Opcode::Rlwnm => {
+                let dst = ins.field_ra() as usize;
+                let shift = match ins.op {
+                    Opcode::Rlwinm => Some(ins.field_sh() as u32),
+                    Opcode::Rlwnm => match self.reg(ins.field_rb()).value {
+                        Value2::Const(value) => Some(value as u32),
+                        _ => None,
+                    },
+                    _ => unreachable!(),
+                };
+                let value = if let Some(shift) = shift {
+                    let mask = Self::mask_value(ins.field_mb() as u32, ins.field_me() as u32);
+                    match self.reg(ins.field_rs()).value.clone() {
+                        Value2::Const(value) => {
+                            Value2::Const(((value as u32).rotate_left(shift) & mask) as u64)
+                        }
+                        Value2::Range { min, max, step } => Value2::Range {
+                            min: ((min as u32).rotate_left(shift) & mask) as u64,
+                            max: ((max as u32).rotate_left(shift) & mask) as u64,
+                            step: ((step as u32).rotate_left(shift)) as u64,
+                        },
+                        Value2::IndexedLoad { table_addr, max_offset, relative_base } => {
+                            Value2::IndexedLoad { table_addr, max_offset, relative_base }
+                        }
+                        _ => Value2::Range {
+                            min: 0,
+                            max: mask as u64,
+                            step: 1u64.rotate_left(shift),
+                        },
+                    }
+                } else {
+                    Value2::Top
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // lwzx rD, rA, rB
+            Opcode::Lwzx => {
+                let dst = ins.field_rd() as usize;
+                let left = Self::value_as_address(obj, ins_addr, &self.reg(ins.field_ra()).value);
+                let right = self.reg(ins.field_rb()).value.clone();
+                let value = match (left, right) {
+                    (Some(table_addr), Value2::Range { max, .. })
+                        if max < u64::MAX - 4 && max & 3 == 0 =>
+                    {
+                        Value2::IndexedLoad {
+                            table_addr,
+                            max_offset: NonZeroU32::new(max as u32),
+                            relative_base: None,
+                        }
+                    }
+                    (Some(table_addr), _) => {
+                        Value2::IndexedLoad { table_addr, max_offset: None, relative_base: None }
+                    }
+                    _ => Value2::Top,
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // lbzx rD, rA, rB
+            Opcode::Lbzx => {
+                let dst = ins.field_rd() as usize;
+                let left = Self::value_as_address(obj, ins_addr, &self.reg(ins.field_ra()).value);
+                let right = self.reg(ins.field_rb()).value.clone();
+                let value = match (left, right) {
+                    (Some(table_addr), Value2::Range { max, .. }) if max < u64::MAX - 4 => {
+                        let bounds_known = self.cr_compare[self.last_modified_cr as usize]
+                            .as_ref()
+                            .is_some_and(|cr| cr.right == Value2::Const(max));
+                        Value2::IndexedLoad {
+                            table_addr,
+                            max_offset: if bounds_known {
+                                NonZeroU32::new(max as u32)
+                            } else {
+                                None
+                            },
+                            relative_base: None,
+                        }
+                    }
+                    (Some(table_addr), _) => {
+                        Value2::IndexedLoad { table_addr, max_offset: None, relative_base: None }
+                    }
+                    _ => Value2::Top,
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // lhzx rD, rA, rB
+            Opcode::Lhzx => {
+                let dst = ins.field_rd() as usize;
+                let left = Self::value_as_address(obj, ins_addr, &self.reg(ins.field_ra()).value);
+                let right = self.reg(ins.field_rb()).value.clone();
+                let value = match (left, right) {
+                    (Some(table_addr), Value2::Range { max, .. })
+                        if max < u64::MAX - 4 && max & 1 == 0 =>
+                    {
+                        Value2::IndexedLoad {
+                            table_addr,
+                            max_offset: NonZeroU32::new(max as u32),
+                            relative_base: None,
+                        }
+                    }
+                    (Some(table_addr), _) => {
+                        Value2::IndexedLoad { table_addr, max_offset: None, relative_base: None }
                     }
                     _ => Value2::Top,
                 };
@@ -892,8 +1118,8 @@ mod tests {
 
     #[test]
     fn runtime_vm_shadow_report_native_mode_tracks_native_and_bridged_steps() {
-        // nop -> unsupported lbzx -> blr
-        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x7C0C_58AE, 0x4E80_0020]);
+        // nop -> unsupported lwz -> blr
+        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x8061_0000, 0x4E80_0020]);
         let starts = [SectionAddress::new(0, 0x1000)];
         let report = runtime_vm_shadow_report_with_mode(
             &obj,
@@ -916,6 +1142,80 @@ mod tests {
         assert_eq!(report.native_steps, function_report.native_steps);
         assert_eq!(report.bridged_steps, function_report.bridged_steps);
         assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn vm2_step_shadow_native_handles_relative_jump_table_sequence() {
+        let obj = make_obj_with_size(0x0, 0x400);
+        let mut legacy = VM::new_from_obj(&obj);
+        legacy.gpr[11].value = GprValue::Range { min: 0, max: 0x10, step: 1 };
+        legacy.last_modified_cr = 0;
+        legacy.cr[0].right = GprValue::Constant(0x10);
+        let mut vm2 = Vm2::from_legacy_vm(&legacy);
+
+        let sequence = [
+            (0x0000, 0x3D80_0000), // lis r12, 0
+            (0x0004, 0x398C_0100), // addi r12, r12, 0x100 (table)
+            (0x0008, 0x7C0C_58AE), // lbzx r0, r12, r11
+            (0x000C, 0x5400_103A), // slwi r0, r0, 2
+            (0x0010, 0x3D80_0000), // lis r12, 0
+            (0x0014, 0x398C_0200), // addi r12, r12, 0x200 (relative base)
+            (0x0018, 0x7D8C_0214), // add r12, r12, r0
+            (0x001C, 0x7D89_03A6), // mtctr r12
+        ];
+
+        for (addr, code) in sequence {
+            let ins = Ins::new(code, Extensions::xenon());
+            assert!(
+                vm2.step_shadow_native(&obj, SectionAddress::new(0, addr), ins),
+                "expected native handling for opcode 0x{code:08X} at 0x{addr:08X}"
+            );
+            let _ = step(&mut legacy, &obj, addr, code);
+            let diff = VmShadowDiffReport::from_legacy_pair(&legacy, &vm2);
+            assert_eq!(
+                diff.summary.total(),
+                0,
+                "native step should match legacy mapping for opcode 0x{code:08X}: {diff:?}"
+            );
+        }
+
+        assert_eq!(
+            vm2.ctr.value,
+            Value2::IndexedLoad {
+                table_addr: RelocationTarget::Address(SectionAddress::new(0, 0x100)),
+                max_offset: NonZeroU32::new(0x10),
+                relative_base: Some(RelocationTarget::Address(SectionAddress::new(0, 0x200))),
+            }
+        );
+    }
+
+    #[test]
+    fn vm2_step_shadow_native_handles_lwzx_and_lhzx_parity() {
+        let obj = make_obj_with_size(0x0, 0x400);
+
+        // lwzx r0, r12, r0
+        let mut legacy_lwzx = VM::new_from_obj(&obj);
+        legacy_lwzx.gpr[12].value =
+            GprValue::Address(RelocationTarget::Address(SectionAddress::new(0, 0x100)));
+        legacy_lwzx.gpr[0].value = GprValue::Range { min: 0, max: 0x20, step: 4 };
+        let mut vm2_lwzx = Vm2::from_legacy_vm(&legacy_lwzx);
+        let lwzx = Ins::new(0x7C0C_002E, Extensions::xenon());
+        assert!(vm2_lwzx.step_shadow_native(&obj, SectionAddress::new(0, 0x20), lwzx));
+        let _ = step(&mut legacy_lwzx, &obj, 0x20, 0x7C0C_002E);
+        let diff_lwzx = VmShadowDiffReport::from_legacy_pair(&legacy_lwzx, &vm2_lwzx);
+        assert_eq!(diff_lwzx.summary.total(), 0, "{diff_lwzx:?}");
+
+        // lhzx r0, r12, r0
+        let mut legacy_lhzx = VM::new_from_obj(&obj);
+        legacy_lhzx.gpr[12].value =
+            GprValue::Address(RelocationTarget::Address(SectionAddress::new(0, 0x100)));
+        legacy_lhzx.gpr[0].value = GprValue::Range { min: 0, max: 0x10, step: 2 };
+        let mut vm2_lhzx = Vm2::from_legacy_vm(&legacy_lhzx);
+        let lhzx = Ins::new(0x7C0C_022E, Extensions::xenon());
+        assert!(vm2_lhzx.step_shadow_native(&obj, SectionAddress::new(0, 0x24), lhzx));
+        let _ = step(&mut legacy_lhzx, &obj, 0x24, 0x7C0C_022E);
+        let diff_lhzx = VmShadowDiffReport::from_legacy_pair(&legacy_lhzx, &vm2_lhzx);
+        assert_eq!(diff_lhzx.summary.total(), 0, "{diff_lhzx:?}");
     }
 
     #[test]
