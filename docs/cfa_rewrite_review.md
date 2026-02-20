@@ -348,6 +348,9 @@ Open technical debt (non-blocking for this branch state):
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW`
     - `DTK_CFA_MAX_VM_SHADOW_DELTAS`
     - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
+  - Env-gated validation pass:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
+    - Result: `20/20` passing with runtime shadow path enabled.
 
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.

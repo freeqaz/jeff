@@ -97,6 +97,9 @@ Follow-up status:
     - Runtime shadow compares legacy vs candidate pipeline engines.
     - Added parity test:
       - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
+    - Runtime env-gated smoke:
+      - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
+      - Result: `20/20` pass.
   - New VM2 shadow tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
