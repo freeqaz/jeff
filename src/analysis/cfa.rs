@@ -21,7 +21,7 @@ use crate::{
         },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
-        vm2::{runtime_vm_shadow_summary, VmRuntimeShadowConfig},
+        vm2::{runtime_vm_shadow_report, VmRuntimeShadowConfig},
         RelocationTarget,
     },
     obj::{
@@ -643,19 +643,22 @@ impl AnalyzerState {
                     default_config.max_steps_per_function,
                 ),
             };
-            let vm_shadow_summary =
-                runtime_vm_shadow_summary(obj, &legacy_seed_addresses, vm_shadow_config);
+            let vm_shadow_report =
+                runtime_vm_shadow_report(obj, &legacy_seed_addresses, vm_shadow_config);
             log::debug!(
-                "VM shadow summary: total={} (presence={}, value={}, provenance={}, confidence={}) with max_functions={} max_steps={}",
-                vm_shadow_summary.total(),
-                vm_shadow_summary.presence,
-                vm_shadow_summary.value,
-                vm_shadow_summary.provenance,
-                vm_shadow_summary.confidence,
+                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} max_functions={} max_steps={}",
+                vm_shadow_report.total_diffs(),
+                vm_shadow_report.summary.presence,
+                vm_shadow_report.summary.value,
+                vm_shadow_report.summary.provenance,
+                vm_shadow_report.summary.confidence,
+                vm_shadow_report.functions_requested,
+                vm_shadow_report.functions_sampled,
+                vm_shadow_report.steps_sampled,
                 vm_shadow_config.max_functions,
                 vm_shadow_config.max_steps_per_function
             );
-            vm_shadow_summary.total()
+            vm_shadow_report.total_diffs()
         } else {
             0
         };

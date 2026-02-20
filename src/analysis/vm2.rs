@@ -326,6 +326,20 @@ impl Default for VmRuntimeShadowConfig {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct VmRuntimeShadowReport {
+    pub summary: VmShadowDiffSummary,
+    pub functions_requested: usize,
+    pub functions_sampled: usize,
+    pub steps_sampled: usize,
+}
+
+impl VmRuntimeShadowReport {
+    pub fn total_diffs(&self) -> usize {
+        self.summary.total()
+    }
+}
+
 impl VmShadowDiffReport {
     fn push(
         &mut self,
@@ -425,23 +439,27 @@ impl VmShadowDiffReport {
     }
 }
 
-pub fn runtime_vm_shadow_summary(
+pub fn runtime_vm_shadow_report(
     obj: &ObjInfo,
     function_starts: &[SectionAddress],
     config: VmRuntimeShadowConfig,
-) -> VmShadowDiffSummary {
+) -> VmRuntimeShadowReport {
+    let mut report = VmRuntimeShadowReport::default();
     if config.max_functions == 0 || config.max_steps_per_function == 0 {
-        return VmShadowDiffSummary::default();
+        return report;
     }
 
-    let mut total = VmShadowDiffSummary::default();
-    for &start in function_starts.iter().take(config.max_functions) {
+    let selected = function_starts.iter().take(config.max_functions).copied().collect::<Vec<_>>();
+    report.functions_requested = selected.len();
+
+    for start in selected {
         let Some(section) = obj.sections.get(start.section) else {
             continue;
         };
         if section.kind != ObjSectionKind::Code || !section.contains(start.address) {
             continue;
         }
+        report.functions_sampled += 1;
 
         let mut vm = VM::new_from_obj(obj);
         let mut addr = start;
@@ -452,12 +470,13 @@ pub fn runtime_vm_shadow_summary(
             let Some(ins) = disassemble(section, addr.address) else {
                 break;
             };
+            report.steps_sampled += 1;
             let result = vm.step(obj, addr, ins);
 
             // Candidate runtime shadow currently maps from the legacy VM state.
             let candidate = Vm2::from_legacy_vm(&vm);
             let diff = VmShadowDiffReport::from_legacy_pair(&vm, &candidate);
-            total.accumulate(&diff.summary);
+            report.summary.accumulate(&diff.summary);
 
             match result {
                 StepResult::Continue | StepResult::LoadStore { .. } | StepResult::Branch(_) => {
@@ -467,7 +486,15 @@ pub fn runtime_vm_shadow_summary(
             }
         }
     }
-    total
+    report
+}
+
+pub fn runtime_vm_shadow_summary(
+    obj: &ObjInfo,
+    function_starts: &[SectionAddress],
+    config: VmRuntimeShadowConfig,
+) -> VmShadowDiffSummary {
+    runtime_vm_shadow_report(obj, function_starts, config).summary
 }
 
 #[cfg(test)]
@@ -578,6 +605,24 @@ mod tests {
             VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 0 },
         );
         assert_eq!(summary_zero_steps.total(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_tracks_sampling_counts() {
+        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x4E80_0020]);
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 1);
+        assert!(
+            report.steps_sampled >= 1,
+            "runtime shadow report should record at least one sampled step"
+        );
+        assert_eq!(report.total_diffs(), 0);
     }
 
     fn make_obj_with_size(base: u32, size: usize) -> ObjInfo {

@@ -95,6 +95,9 @@ Follow-up status:
       - `DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS`
       - `DTK_CFA_VM_SHADOW_MAX_FUNCTIONS`
       - `DTK_CFA_VM_SHADOW_MAX_STEPS`
+    - Runtime VM coverage diagnostics:
+      - `analysis::vm2::VmRuntimeShadowReport`
+      - `analysis::vm2::runtime_vm_shadow_report(...)`
   - Candidate pipeline lane update:
     - Added `analysis::pipeline::CandidatePipelineEngine` (parity-mirrored implementation stage).
     - Runtime shadow compares legacy vs candidate pipeline engines.

@@ -1438,44 +1438,7 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                                 .copy_from_slice(&zeroed.to_be_bytes());
                         }
                     }
-                    ObjRelocKind::PpcRel14 => {
-                        // REL14 (bc): displacement in bits [15:2].
-                        // Preserve opcode/BO/BI [31:16] and AA/LK [1:0].
-                        if offset + 4 <= data.len() {
-                            let insn = u32::from_be_bytes(
-                                data[offset..offset + 4].try_into().unwrap(),
-                            );
-                            let zeroed = insn & 0xFFFF0003;
-                            data[offset..offset + 4]
-                                .copy_from_slice(&zeroed.to_be_bytes());
-                        }
-                    }
-                    ObjRelocKind::PpcAddr16Ha
-                    | ObjRelocKind::PpcAddr16Hi
-                    | ObjRelocKind::PpcAddr16Lo => {
-                        // ADDR16 (lis/addi/ori): immediate in bits [15:0].
-                        // Preserve opcode and register fields [31:16].
-                        if offset + 4 <= data.len() {
-                            let insn = u32::from_be_bytes(
-                                data[offset..offset + 4].try_into().unwrap(),
-                            );
-                            let zeroed = insn & 0xFFFF0000;
-                            data[offset..offset + 4]
-                                .copy_from_slice(&zeroed.to_be_bytes());
-                        }
-                    }
-                    ObjRelocKind::PpcEmbSda21 => {
-                        // SDA21: immediate in bits [20:0].
-                        // Preserve opcode/register [31:21].
-                        if offset + 4 <= data.len() {
-                            let insn = u32::from_be_bytes(
-                                data[offset..offset + 4].try_into().unwrap(),
-                            );
-                            let zeroed = insn & 0xFFE00000;
-                            data[offset..offset + 4]
-                                .copy_from_slice(&zeroed.to_be_bytes());
-                        }
-                    }
+                    _ => {}
                 }
             }
         }

@@ -25,7 +25,9 @@ Current implementation snapshot:
   - Current runtime metric compares legacy VM to mapped VM2 state (expected zero-delta baseline).
   - Runtime sampling API:
     - `runtime_vm_shadow_summary(...)`
+    - `runtime_vm_shadow_report(...)`
     - `VmRuntimeShadowConfig`
+    - `VmRuntimeShadowReport`
   - Runtime gate controls already available for VM rollout:
     - `DTK_CFA_ENABLE_VM2_SHADOW`
     - `DTK_CFA_MAX_VM_SHADOW_DELTAS`

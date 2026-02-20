@@ -376,6 +376,18 @@ Open technical debt (non-blocking for this branch state):
     - pipeline digest deltas (`PipelineDiffEntry`)
   - Logging is capped (`MAX_LOGGED_SHADOW_DELTA_ENTRIES`) to avoid noisy/expensive dumps.
 
+- **Phase E2c complete (R7 VM runtime diagnostics)**: runtime VM shadow now reports sampling coverage.
+  - Added `VmRuntimeShadowReport` and `runtime_vm_shadow_report(...)` in `analysis::vm2`.
+  - CFA VM-shadow logging now includes:
+    - requested/sampled function counts
+    - sampled step count
+    - categorized diff totals
+  - Added regression:
+    - `analysis::vm2::tests::runtime_vm_shadow_report_tracks_sampling_counts`
+  - Real-XEX smoke with strict candidate seed gate and runtime shadow reporting:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-vmreport-<timestamp>`
+    - Result: `rc=0`, `4448` files, `2223` `.obj`.
+
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
   - Runtime shadow now compares `LegacyPipelineEngine` vs `CandidatePipelineEngine`.
