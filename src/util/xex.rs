@@ -1,8 +1,6 @@
 use std::{
     borrow::Cow,
-    cmp::min,
     collections::{btree_map::Entry, BTreeMap},
-    ffi::CString,
     fs,
     num::NonZeroU64,
 };
@@ -14,19 +12,17 @@ use object::{
     endian,
     read::pe::PeFile32,
     write::{SectionId, SymbolId},
-    Architecture, BinaryFormat, ComdatKind, Endianness, File, Import, Object, ObjectComdat,
-    ObjectKind, ObjectSection, ObjectSegment, ObjectSymbol, Relocation, RelocationFlags,
-    RelocationTarget, SectionKind, Symbol, SymbolFlags, SymbolKind, SymbolScope, SymbolSection,
+    Architecture, BinaryFormat, ComdatKind, Endianness, Object, ObjectSection, RelocationFlags,
+    SectionKind, SymbolFlags, SymbolKind, SymbolScope,
 };
 use typed_path::{Utf8NativePathBuf, Utf8UnixPath};
 
 use crate::{
     analysis::{cfa::SectionAddress, read_u32},
     obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind,
-        ObjSplit, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
-        ObjUnit, SectionIndex as ObjSectionIndex, SectionIndex, SymbolIndex as ObjSymbolIndex,
-        SymbolIndex,
+        ObjArchitecture, ObjInfo, ObjKind, ObjRelocKind, ObjSection, ObjSectionKind, ObjSymbol,
+        ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
+        SectionIndex as ObjSectionIndex, SectionIndex, SymbolIndex as ObjSymbolIndex, SymbolIndex,
     },
     util::{
         config::is_auto_label,
@@ -200,7 +196,6 @@ impl ResourceInfos {
             data.len() % 16 == 0,
             "Resource info has unexpected length! (expected a multiple of 16)"
         );
-        let num_resources = data.len() / 16;
         let mut info: Vec<ResourceInfo> = vec![];
         for (_, chunk) in data.chunks_exact(16).enumerate() {
             let title_id = String::from_utf8(chunk[0..8].to_vec())?;
@@ -594,10 +589,7 @@ impl XexInfo {
                         is_dev_kit = true;
                         exe_bytes = exe;
                     }
-                    Err(e) => {
-                        return Err(e); // here until case 2 is implemented
-                        bail!("Could not deduce exe type!");
-                    }
+                    Err(e) => return Err(e), // here until case 2 is implemented
                 }
             }
         }
@@ -1188,9 +1180,6 @@ pub fn process_xex(path: &Utf8NativePathBuf) -> Result<ObjInfo> {
 }
 
 pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
-    let root_name = obj.name.split('.').next().unwrap();
-    // println!("Writing {}.obj", root_name);
-
     // for each obj:
     let mut cur_coff =
         object::write::Object::new(BinaryFormat::Coff, Architecture::PowerPc, Endianness::Big);
@@ -1632,7 +1621,20 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
         for (addr, reloc) in sect.relocations.iter() {
             let sym_id = match sym_map.get(&reloc.target_symbol) {
                 Some(id) => id,
-                None => bail!("Could not find symbol ID for index {}", reloc.target_symbol),
+                None => {
+                    // Skip relocations targeting pdata@ symbols we omitted
+                    if let Some((_, sym)) = obj.symbols.iter()
+                        .find(|(i, _)| *i == reloc.target_symbol)
+                    {
+                        if sym.name.starts_with("pdata@") {
+                            continue;
+                        }
+                        bail!("Could not find symbol ID for index {} (name: '{}', section: {:?})",
+                            reloc.target_symbol, sym.name, sym.section)
+                    }
+                    bail!("Could not find symbol ID for index {} (no such symbol)",
+                        reloc.target_symbol)
+                }
             };
 
             // Check if this relocation originates from within a COMDAT region;
@@ -1786,8 +1788,8 @@ pub fn coff_path_for_unit(unit: &str) -> Utf8NativePathBuf {
 mod tests {
     use super::*;
     use crate::obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjRelocations, ObjSection,
-        ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
+        ObjArchitecture, ObjInfo, ObjKind, ObjRelocations, ObjSection, ObjSectionKind, ObjSymbol,
+        ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
     };
 
     /// Build a minimal relocatable ObjInfo with one .text section and one symbol.
@@ -1904,8 +1906,6 @@ mod tests {
             "Local+Unknown should be LABEL (6), got {storage_class}"
         );
     }
-
-    const IMAGE_SYM_CLASS_STATIC: u8 = 3;
 
     /// __unwind$ symbols produce a single EXTERNAL COMDAT symbol in .text$x
     #[test]
