@@ -112,10 +112,12 @@ Follow-up status:
       - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
       - `analysis::pipeline::tests::candidate_seed_phase_matches_legacy_seed_phase`
       - `analysis::pipeline::tests::candidate_seed_phase_strict_code_filter_drops_non_code_function_symbol`
+      - `analysis::pipeline::tests::candidate_seed_phase_strict_symbol_size_filter_drops_unknown_size_symbols`
       - `analysis::pipeline::tests::candidate_slice_phase_matches_legacy_slice_phase`
       - `analysis::pipeline::tests::candidate_finalization_phase_matches_legacy_finalization_phase`
     - Runtime candidate heuristic gate:
       - `DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS`
+      - `DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS`
     - Runtime env-gated smoke:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 cargo test cfa_tests`
       - Result: `20/20` pass.
@@ -128,6 +130,9 @@ Follow-up status:
     - Combined-gates real-XEX smoke:
       - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-shadow-<timestamp>`
       - Result: `rc=0`, `4448` files, `2223` `.obj`.
+    - Strict-symbol candidate gate smoke:
+      - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-symbolsize-<timestamp>`
+      - Result: `rc=0`, `4448` files, `2223` `.obj`; no non-trivial diffs vs strict-code baseline (excluding `config.json`/`dep`).
   - New VM2 shadow tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`

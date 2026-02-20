@@ -393,6 +393,8 @@ pub struct CandidatePipelineEngine {
 pub struct CandidatePipelineConfig {
     /// Candidate-only seed refinement (default-off): drop seeds that are not in code sections.
     pub strict_code_seeds: bool,
+    /// Candidate-only seed refinement (default-off): drop function-symbol seeds without known size.
+    pub strict_symbol_size_seeds: bool,
 }
 
 impl CandidatePipelineEngine {
@@ -451,15 +453,29 @@ impl CandidatePipelineEngine {
             .copied()
             .map(|address| FunctionSeed { address, source: classify_seed_source(obj, address) })
             .filter(|seed| {
-                if !self.config.strict_code_seeds {
-                    return true;
+                if self.config.strict_code_seeds
+                    && !matches!(
+                        obj.sections.get(seed.address.section),
+                        Some(section)
+                            if section.kind == ObjSectionKind::Code
+                                && section.contains(seed.address.address)
+                    )
+                {
+                    return false;
                 }
-                matches!(
-                    obj.sections.get(seed.address.section),
-                    Some(section)
-                        if section.kind == ObjSectionKind::Code
-                            && section.contains(seed.address.address)
-                )
+                if self.config.strict_symbol_size_seeds && seed.source == SeedSource::Symbol {
+                    return obj
+                        .symbols
+                        .kind_at_section_address(
+                            seed.address.section,
+                            seed.address.address,
+                            ObjSymbolKind::Function,
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some_and(|(_, symbol)| symbol.size_known);
+                }
+                true
             })
             .collect();
 
@@ -958,7 +974,7 @@ mod tests {
 
         let mut strict_candidate = CandidatePipelineEngine::new_with_config(
             BTreeMap::new(),
-            CandidatePipelineConfig { strict_code_seeds: true },
+            CandidatePipelineConfig { strict_code_seeds: true, ..Default::default() },
         );
         let strict_seed = strict_candidate
             .phase_seed_discovery(&obj)
@@ -976,6 +992,88 @@ mod tests {
                 .iter()
                 .any(|seed| seed.address == SectionAddress::new(1, 0x1000)),
             "strict code-seed mode should preserve valid code section seeds"
+        );
+    }
+
+    #[test]
+    fn candidate_seed_phase_strict_symbol_size_filter_drops_unknown_size_symbols() {
+        let code = make_code_section_bytes(
+            0x1000,
+            &[0x60, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x4E, 0x80, 0x00, 0x20],
+        );
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "candidate-symbol-size-filter-test".into(),
+            vec![],
+            vec![code],
+        );
+        obj.add_symbol(
+            ObjSymbol {
+                name: "unknown_size_func".into(),
+                address: 0x1004,
+                section: Some(0),
+                size: 0,
+                size_known: false,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("should add unknown-size function symbol");
+        obj.add_symbol(
+            ObjSymbol {
+                name: "known_size_func".into(),
+                address: 0x1008,
+                section: Some(0),
+                size: 4,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("should add known-size function symbol");
+
+        let mut default_candidate = CandidatePipelineEngine::new(BTreeMap::new());
+        let default_seed = default_candidate
+            .phase_seed_discovery(&obj)
+            .expect("default candidate seed should succeed");
+        assert!(
+            default_seed
+                .seeds
+                .iter()
+                .any(|seed| seed.address == SectionAddress::new(0, 0x1004)),
+            "default candidate mode should retain unknown-size symbol seed for parity"
+        );
+        assert!(
+            default_seed
+                .seeds
+                .iter()
+                .any(|seed| seed.address == SectionAddress::new(0, 0x1008)),
+            "default candidate mode should retain known-size symbol seed"
+        );
+
+        let mut strict_candidate = CandidatePipelineEngine::new_with_config(
+            BTreeMap::new(),
+            CandidatePipelineConfig { strict_symbol_size_seeds: true, ..Default::default() },
+        );
+        let strict_seed = strict_candidate
+            .phase_seed_discovery(&obj)
+            .expect("strict-symbol candidate seed should succeed");
+        assert!(
+            !strict_seed
+                .seeds
+                .iter()
+                .any(|seed| seed.address == SectionAddress::new(0, 0x1004)),
+            "strict symbol-size mode should drop unknown-size symbol seeds"
+        );
+        assert!(
+            strict_seed
+                .seeds
+                .iter()
+                .any(|seed| seed.address == SectionAddress::new(0, 0x1008)),
+            "strict symbol-size mode should keep known-size symbol seeds"
         );
     }
 

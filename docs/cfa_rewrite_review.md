@@ -470,6 +470,17 @@ Open technical debt (non-blocking for this branch state):
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-candidate-strict-env-<timestamp>`
     - Result: `rc=0`, `4448` files, `2223` `.obj`.
 
+- **Phase E1f complete (R6 gated symbol-size refinement)**: candidate seed refinement can now drop unknown-size symbol seeds.
+  - Added `CandidatePipelineConfig { strict_symbol_size_seeds }` (default `false`).
+  - Runtime gate:
+    - `DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS`
+  - Added regression:
+    - `analysis::pipeline::tests::candidate_seed_phase_strict_symbol_size_filter_drops_unknown_size_symbols`
+  - Strict-symbol runtime smoke:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-symbolsize-<timestamp>`
+    - Result: `rc=0`, `4448` files, `2223` `.obj`.
+    - Compared to same-commit strict-code baseline, no non-trivial file deltas (`config.json`/`dep` excluded).
+
 - **Phase E validation complete**: real-XEX parity smoke on external corpora.
   - Built release `dtk` from current branch and ran real DC3 split flow to `/tmp`:
     - `dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-<timestamp>`

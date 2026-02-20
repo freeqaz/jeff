@@ -150,6 +150,8 @@ pub(crate) const ENV_VM_SHADOW_MAX_FUNCTIONS: &str = "DTK_CFA_VM_SHADOW_MAX_FUNC
 pub(crate) const ENV_VM_SHADOW_MAX_STEPS: &str = "DTK_CFA_VM_SHADOW_MAX_STEPS";
 pub(crate) const ENV_VM_SHADOW_NATIVE_VM2: &str = "DTK_CFA_VM_SHADOW_NATIVE_VM2";
 pub(crate) const ENV_CANDIDATE_STRICT_CODE_SEEDS: &str = "DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS";
+pub(crate) const ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS: &str =
+    "DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS";
 const MAX_LOGGED_SHADOW_DELTA_ENTRIES: usize = 8;
 
 fn parse_shadow_bool(raw: &str) -> Option<bool> {
@@ -655,6 +657,10 @@ impl AnalyzerState {
         // Candidate path is isolated behind its own engine type for staged phase rollout.
         let candidate_config = CandidatePipelineConfig {
             strict_code_seeds: read_shadow_bool_env(ENV_CANDIDATE_STRICT_CODE_SEEDS, false),
+            strict_symbol_size_seeds: read_shadow_bool_env(
+                ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS,
+                false,
+            ),
         };
         let mut candidate_pipeline =
             CandidatePipelineEngine::new_with_config(skip_ranges, candidate_config);
