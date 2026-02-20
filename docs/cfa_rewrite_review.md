@@ -235,6 +235,7 @@ Implemented in this branch:
   - Added decision-complete pipeline/shadow RFC (`docs/cfa_pipeline_rewrite_rfc.md`).
   - Added explicit analyzer invariant validation (`AnalyzerState::validate_invariants`) and wired it into `detect_functions`.
   - Added shadow digest/diff determinism tests for legacy analyzer behavior.
+  - Added initial pipeline interface scaffold (`src/analysis/pipeline.rs`) including legacy engine wrapper and digest/diff model.
 
 Validation run:
 - `cargo test cfa_tests`
@@ -288,8 +289,8 @@ Open technical debt (non-blocking for this branch state):
    - Add internal VM2 value/provenance types and transfer-function skeleton in a parallel module.
    - Keep legacy VM as source of truth; no behavior switch.
 2. **R2: CFA phase-split scaffolding (B8 implementation start)**:
-   - Introduce internal phase boundaries for seed discovery, slice exploration, finalize, and apply.
-   - Route legacy analyzer through the same phase interfaces first.
+   - Expand `analysis::pipeline` from digest wrapper into explicit phase I/O contracts for seed, slice, finalize, and apply.
+   - Route legacy analyzer through those phase boundaries without behavior change.
 3. **R3: Shadow corpus and diff gating**:
    - Expand deterministic shadow digest tests from synthetic unit tests to selected real CFA fixtures.
    - Gate candidate rewrite phases on zero unresolved high-severity diffs.

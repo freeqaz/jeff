@@ -5,6 +5,7 @@
 - Date: 2026-02-20
 - Owner: `cfa_fix`
 - Phase: RFC + shadow scaffolding baseline
+- Initial scaffold: `src/analysis/pipeline.rs`
 
 ## Problem statement
 

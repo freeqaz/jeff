@@ -15,6 +15,7 @@ pub mod cfa;
 pub mod executor;
 pub mod objects;
 pub mod pass;
+pub mod pipeline;
 pub mod signatures;
 pub mod slices;
 pub mod tracker;

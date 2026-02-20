@@ -57,6 +57,7 @@ Follow-up status:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
   - VM2 scaffold module: `src/analysis/vm2.rs`
+  - Pipeline interface scaffold module: `src/analysis/pipeline.rs`
   - New rewrite-baseline tests:
     - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
     - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`
