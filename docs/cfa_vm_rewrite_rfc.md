@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: M1 complete, M2 shadow-bridge baseline active
+- Phase: M1 complete, M2 structured shadow-diff baseline active
 - Initial scaffold: `src/analysis/vm2.rs`
 
 Current implementation snapshot:
@@ -12,6 +12,7 @@ Current implementation snapshot:
 - Legacy-to-VM2 mapping covers constant/address/range/compare/indexed-load facts.
 - Legacy provenance is mapped into VM2 provenance (`register`, `stack slot`, legacy memory forms).
 - New VM2 parity tests include relative jump-table propagation from real legacy VM execution.
+- Structured VM shadow diff reporting is available via `VmShadowDiffReport::from_legacy_pair`.
 
 ## Why this rewrite exists
 
@@ -97,7 +98,7 @@ Confidence is attached to derived indexed-load and branch-target facts. Consumer
 - Introduce VM2 types + transfer dispatch in parallel module.
 - No CFA integration yet; test-only execution.
 
-### M2: Shadow execution (baseline in progress)
+### M2: Shadow execution (structured diff baseline active)
 
 - Run legacy VM and VM2 side-by-side on selected corpus.
 - Compare emitted branch/jump-table facts and range outcomes.

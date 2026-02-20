@@ -238,6 +238,12 @@ Implemented in this branch:
   - Added VM2 shadow parity tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
+  - Added structured VM shadow-diff report model:
+    - `VmShadowDiffReport`, `VmShadowDiffEntry`, `VmShadowDiffSummary`
+    - typed location/kind categories for CI-style parity diagnosis
+  - Added VM shadow-diff tests:
+    - `analysis::vm2::tests::vm2_shadow_diff_report_is_empty_for_exact_legacy_mapping`
+    - `analysis::vm2::tests::vm2_shadow_diff_report_categorizes_mismatch_types`
 
 - **B8 in progress (RFC + shadow scaffolding complete)**:
   - Added decision-complete pipeline/shadow RFC (`docs/cfa_pipeline_rewrite_rfc.md`).
@@ -251,8 +257,9 @@ Implemented in this branch:
     - `phase_finalize_and_validate`
   - Expanded pipeline contracts with phase outputs (`seed`, `slice`, `finalize`, `apply`) and run report support.
   - Added structured digest diff categorization (`function presence/end`, `jump-table presence/size`) and summary model.
-  - Added selected real-fixture shadow corpus parity gate:
-    - `analysis::pipeline::tests::shadow_corpus_selected_fixtures_match_legacy_pipeline_digest`
+  - Expanded to full real-fixture shadow corpus parity gate with aggregate reporting:
+    - `ShadowCorpusReport` / `ShadowCorpusFixtureReport` (test harness)
+    - `analysis::pipeline::tests::shadow_corpus_full_fixtures_match_legacy_pipeline_digest`
 
 Validation run:
 - `cargo test cfa_tests`
@@ -267,7 +274,7 @@ Validation run:
 
 - Branch: `cfa_fix`
 - Version: `1.9.2`
-- Working tree: roadmap execution active (`R2 complete`, `R3 shadow gating baseline complete`)
+- Working tree: roadmap execution active (`R2 complete`, `R3 complete`, `R5 complete`)
 - Dev branch delta: only one version-bump commit (`1.9.1`) remains on `dev`, superseded by `1.9.2` here
 
 Current observed test state on this branch:
@@ -275,7 +282,7 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 3 passed
-- `cargo test analysis::vm2::tests::` -> 4 passed
+- `cargo test analysis::vm2::tests::` -> 6 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
 - `cargo test analysis::pipeline::tests::` -> 6 passed
 - `cargo test util::xex::tests::` -> 5 passed
@@ -307,14 +314,18 @@ Open technical debt (non-blocking for this branch state):
     - relative-bytes unaligned candidate,
     - relative-shorts out-of-bounds candidate.
 
+- **Phase C complete**: expanded shadow gates for pipeline + VM2 parity diagnostics.
+  - Full CFA fixture corpus parity gate in pipeline tests with aggregate mismatch reporting.
+  - Structured VM shadow-diff report for legacy-vs-VM2 comparisons with typed categories.
+  - Added regression tests for zero-diff parity and category-specific mismatch reporting.
+
 ### Next Phase Queue
 
-1. **R4: VM2 shadow execution hooks (B7)**:
-   - Expand `Vm2::from_legacy_vm` parity checks from unit fixtures to selected CFA corpus paths.
-   - Add structured VM shadow-diff reporting to support CI gates.
-2. **R5: Shadow corpus expansion + CI-style gate (B8)**:
-   - Expand selected fixture set for digest parity.
-   - Keep diff-summary gate at zero unresolved deltas.
-3. **R6: Candidate phase implementation spikes**:
+1. **R4 remainder: VM2 corpus shadow execution hooks (B7)**:
+   - Drive `VmShadowDiffReport` across selected CFA corpus paths (not just unit-crafted traces).
+   - Define zero-diff acceptance thresholds for per-location VM parity categories.
+2. **R6: Candidate phase implementation spikes (B8/M3 prep)**:
    - Start rewritten phase component experiments behind internal guardrails.
    - Keep legacy analyzer default until parity and stability gates hold.
+3. **R7: Internal VM2 adoption guardrails**:
+   - Add fallback-on-diff hooks so VM2 candidate paths auto-revert to legacy VM when parity fails.

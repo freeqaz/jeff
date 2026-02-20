@@ -136,15 +136,18 @@ impl PipelineDigest {
     }
 
     pub fn diff_summary(&self, other: &Self) -> PipelineDiffSummary {
-        self.diff_entries(other).into_iter().fold(PipelineDiffSummary::default(), |mut out, diff| {
-            match diff.kind {
-                PipelineDiffKind::FunctionPresence => out.function_presence += 1,
-                PipelineDiffKind::FunctionEnd => out.function_end += 1,
-                PipelineDiffKind::JumpTablePresence => out.jump_table_presence += 1,
-                PipelineDiffKind::JumpTableSize => out.jump_table_size += 1,
-            }
-            out
-        })
+        self.diff_entries(other).into_iter().fold(
+            PipelineDiffSummary::default(),
+            |mut out, diff| {
+                match diff.kind {
+                    PipelineDiffKind::FunctionPresence => out.function_presence += 1,
+                    PipelineDiffKind::FunctionEnd => out.function_end += 1,
+                    PipelineDiffKind::JumpTablePresence => out.jump_table_presence += 1,
+                    PipelineDiffKind::JumpTableSize => out.jump_table_size += 1,
+                }
+                out
+            },
+        )
     }
 
     pub fn diff(&self, other: &Self) -> Vec<String> {
@@ -304,7 +307,7 @@ fn make_obj(base_addr: u32, instructions: &[u32]) -> ObjInfo {
 mod tests {
     use std::fs::File;
 
-    use serde::{Deserialize, Deserializer, de::Error};
+    use serde::{de::Error, Deserialize, Deserializer};
 
     use super::*;
     use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection};
@@ -351,6 +354,27 @@ mod tests {
         jump_table_bytes: Vec<u8>,
     }
 
+    #[derive(Debug, Clone, Eq, PartialEq, Default)]
+    struct ShadowCorpusFixtureReport {
+        test_id: u32,
+        diff_summary: PipelineDiffSummary,
+        diff_entries: Vec<PipelineDiffEntry>,
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq, Default)]
+    struct ShadowCorpusReport {
+        fixture_count: usize,
+        mismatch_count: usize,
+        totals: PipelineDiffSummary,
+        fixtures: Vec<ShadowCorpusFixtureReport>,
+    }
+
+    impl ShadowCorpusReport {
+        fn total_diffs(&self) -> usize {
+            self.totals.total()
+        }
+    }
+
     fn make_code_section_bytes(base_addr: u32, data: &[u8]) -> ObjSection {
         ObjSection {
             name: ".text".into(),
@@ -378,10 +402,7 @@ mod tests {
     fn fixture_obj(fixture: &ShadowFixture) -> ObjInfo {
         let code = make_code_section_bytes(fixture.function_start, &fixture.function_bytes);
         let sections = if fixture.jump_table_start != 0 {
-            vec![
-                make_data_section_bytes(fixture.jump_table_start, &fixture.jump_table_bytes),
-                code,
-            ]
+            vec![make_data_section_bytes(fixture.jump_table_start, &fixture.jump_table_bytes), code]
         } else {
             vec![code]
         };
@@ -392,6 +413,53 @@ mod tests {
             vec![],
             sections,
         )
+    }
+
+    fn accumulate_summary(total: &mut PipelineDiffSummary, add: &PipelineDiffSummary) {
+        total.function_presence += add.function_presence;
+        total.function_end += add.function_end;
+        total.jump_table_presence += add.jump_table_presence;
+        total.jump_table_size += add.jump_table_size;
+    }
+
+    fn run_shadow_corpus_parity(
+        fixtures: &[ShadowFixture],
+        selected: Option<&[u32]>,
+    ) -> ShadowCorpusReport {
+        let mut report = ShadowCorpusReport::default();
+
+        for fixture in fixtures
+            .iter()
+            .filter(|entry| selected.map_or(true, |ids| ids.contains(&entry.test_id)))
+        {
+            let obj = fixture_obj(fixture);
+
+            let mut baseline = AnalyzerState::new(BTreeMap::new());
+            baseline.detect_functions(&obj).unwrap_or_else(|e| {
+                panic!("baseline detect_functions failed for {}: {e:#}", fixture.test_id)
+            });
+            let baseline_digest = PipelineDigest::from_state(&baseline);
+
+            let mut pipeline = LegacyPipelineEngine::new(BTreeMap::new());
+            let pipeline_digest = pipeline.run(&obj).unwrap_or_else(|e| {
+                panic!("legacy pipeline run failed for {}: {e:#}", fixture.test_id)
+            });
+
+            let diff_summary = baseline_digest.diff_summary(&pipeline_digest);
+            let diff_entries = baseline_digest.diff_entries(&pipeline_digest);
+            if diff_summary.total() != 0 {
+                report.mismatch_count += 1;
+            }
+            accumulate_summary(&mut report.totals, &diff_summary);
+            report.fixtures.push(ShadowCorpusFixtureReport {
+                test_id: fixture.test_id,
+                diff_summary,
+                diff_entries,
+            });
+        }
+
+        report.fixture_count = report.fixtures.len();
+        report
     }
 
     #[test]
@@ -434,7 +502,9 @@ mod tests {
         left.jump_tables.insert(SectionAddress::new(0, 0x2100), 0x10);
 
         let mut right = PipelineDigest::default();
-        right.functions.insert(SectionAddress::new(0, 0x1000), Some(SectionAddress::new(0, 0x101C)));
+        right
+            .functions
+            .insert(SectionAddress::new(0, 0x1000), Some(SectionAddress::new(0, 0x101C)));
         right.jump_tables.insert(SectionAddress::new(0, 0x2000), 0x40);
         right.jump_tables.insert(SectionAddress::new(0, 0x2200), 0x08);
 
@@ -485,34 +555,27 @@ mod tests {
     }
 
     #[test]
-    fn shadow_corpus_selected_fixtures_match_legacy_pipeline_digest() {
+    fn shadow_corpus_full_fixtures_match_legacy_pipeline_digest() {
         let fixtures: Vec<ShadowFixture> =
             serde_yaml::from_reader(File::open("assets/tests/cfa_tests.yml").unwrap())
                 .expect("failed to read CFA fixture corpus");
-        let selected = [0u32, 4u32, 8u32, 12u32, 16u32];
-
-        for fixture in fixtures.iter().filter(|entry| selected.contains(&entry.test_id)) {
-            let obj = fixture_obj(fixture);
-
-            let mut baseline = AnalyzerState::new(BTreeMap::new());
-            baseline
-                .detect_functions(&obj)
-                .unwrap_or_else(|e| panic!("baseline detect_functions failed for {}: {e:#}", fixture.test_id));
-            let baseline_digest = PipelineDigest::from_state(&baseline);
-
-            let mut pipeline = LegacyPipelineEngine::new(BTreeMap::new());
-            let pipeline_digest = pipeline
-                .run(&obj)
-                .unwrap_or_else(|e| panic!("legacy pipeline run failed for {}: {e:#}", fixture.test_id));
-
-            let summary = baseline_digest.diff_summary(&pipeline_digest);
-            assert_eq!(
-                summary.total(),
-                0,
-                "shadow parity mismatch for fixture {}: {:?}",
-                fixture.test_id,
-                baseline_digest.diff(&pipeline_digest)
-            );
-        }
+        let report = run_shadow_corpus_parity(&fixtures, None);
+        assert_eq!(report.fixture_count, fixtures.len(), "all fixtures should be shadow-checked");
+        assert_eq!(
+            report.mismatch_count,
+            0,
+            "shadow corpus has mismatched fixtures: {:?}",
+            report
+                .fixtures
+                .iter()
+                .filter(|fixture| fixture.diff_summary.total() != 0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.total_diffs(),
+            0,
+            "shadow corpus diff totals should be zero: {:?}",
+            report
+        );
     }
 }

@@ -4,14 +4,14 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: S1 complete, S2 shadow-gating baseline active
+- Phase: S1 complete, S2 corpus-gated shadow parity active
 - Initial scaffold: `src/analysis/pipeline.rs`
 
 Current implementation snapshot:
 - Legacy analyzer routed through explicit phase methods in `AnalyzerState`.
 - `analysis::pipeline` now exposes phase outputs and a run report model.
 - Digest comparison now includes categorized diff entries and summary counters.
-- Selected real-fixture shadow parity test is active with zero-diff gate.
+- Full CFA fixture shadow parity gate is active with zero-diff totals and per-fixture reporting.
 
 ## Problem statement
 
@@ -119,7 +119,7 @@ Diff categories:
 - Extract per-phase structs/interfaces from monolithic state mutations.
 - Keep legacy implementation under these interfaces.
 
-### S2: rewritten phase shadowing (baseline in progress)
+### S2: rewritten phase shadowing (corpus gate active)
 
 - Implement rewritten phase components behind internal feature flags.
 - Compare phase outputs (not only final outputs) for debugging.

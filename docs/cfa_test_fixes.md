@@ -43,7 +43,7 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
-  - `cargo test analysis::vm2::tests::` (4/4)
+  - `cargo test analysis::vm2::tests::` (6/6)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
   - `cargo test analysis::pipeline::tests::` (6/6)
   - `cargo test util::xex::tests::` (5/5)
@@ -64,9 +64,13 @@ Follow-up status:
   - Pipeline interface scaffold module: `src/analysis/pipeline.rs`
   - VM2 shadow bridge from legacy VM: `Vm2::from_legacy_vm` in `src/analysis/vm2.rs`
   - Legacy analyzer phase extraction (`seed/slice/finalize/validate`) wired for shadowable execution.
-  - Shadow diff categorization + summary and selected fixture parity gate:
+  - Shadow diff categorization + summary and full fixture parity gate:
     - `analysis::pipeline::tests::pipeline_digest_diff_summary_categorizes_delta_types`
-    - `analysis::pipeline::tests::shadow_corpus_selected_fixtures_match_legacy_pipeline_digest`
+    - `analysis::pipeline::tests::shadow_corpus_full_fixtures_match_legacy_pipeline_digest`
+  - Structured VM shadow diff report + categorized regression tests:
+    - `analysis::vm2::VmShadowDiffReport::from_legacy_pair`
+    - `analysis::vm2::tests::vm2_shadow_diff_report_is_empty_for_exact_legacy_mapping`
+    - `analysis::vm2::tests::vm2_shadow_diff_report_categorizes_mismatch_types`
   - New VM2 shadow tests:
     - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
     - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
