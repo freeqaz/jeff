@@ -641,19 +641,21 @@ impl Vm2 {
             }
             // or rA, rS, rB
             Opcode::Or => {
-                // Register-copy form: preserve legacy stack-slot provenance natively when possible.
+                // Register-copy form: preserve legacy provenance semantics.
                 if ins.field_rs() == ins.field_rb() {
                     let src_reg = ins.field_rs() as usize;
                     let dst = ins.field_ra() as usize;
-                    let src = self.reg(ins.field_rs()).clone();
-                    if matches!(src.provenance, Provenance2::StackSlot { .. }) {
-                        self.gpr[dst] = src;
-                        let source_revision = self.reg_revisions[src_reg];
-                        self.reg_revisions[dst] = source_revision.saturating_add(1);
-                        return true;
-                    }
-                    // Keep bridging for non-stack register copies to preserve legacy provenance parity.
-                    return false;
+                    let source_revision = self.reg_revisions[src_reg];
+                    let mut copied = self.reg(ins.field_rs()).clone();
+                    copied.provenance = match copied.provenance {
+                        Provenance2::StackSlot { offset, .. } => {
+                            Provenance2::StackSlot { offset, revision: source_revision }
+                        }
+                        _ => Provenance2::Reg { reg: src_reg as u8, revision: source_revision },
+                    };
+                    self.gpr[dst] = copied;
+                    self.reg_revisions[dst] = source_revision.saturating_add(1);
+                    return true;
                 }
                 let dst = ins.field_ra() as usize;
                 let value = match (
@@ -1297,6 +1299,28 @@ mod tests {
     }
 
     #[test]
+    fn vm2_step_shadow_native_handles_register_copy_or() {
+        let obj = make_obj_with_words(0x1000, &[0x7C64_1B78]); // or r4, r3, r3
+        let mut legacy = VM::default();
+        legacy.gpr[3].value = GprValue::Constant(1);
+        legacy.gpr[3].source.kind = GprSourceLocation::Register(3);
+        legacy.gpr[3].source.version = 2;
+        legacy.gpr[3].version = 2;
+
+        let mut vm2 = Vm2::from_legacy_vm(&legacy);
+        let or_copy = Ins::new(0x7C64_1B78, Extensions::xenon());
+        assert!(
+            vm2.step_shadow_native(&obj, SectionAddress::new(0, 0x1000), or_copy),
+            "register-copy OR should be handled natively"
+        );
+
+        let _ = step(&mut legacy, &obj, 0x1000, 0x7C64_1B78);
+        let diff = VmShadowDiffReport::from_legacy_pair(&legacy, &vm2);
+        assert_eq!(diff.summary.total(), 0, "{diff:?}");
+        assert!(matches!(vm2.reg(4).provenance, Provenance2::Reg { reg: 3, .. }));
+    }
+
+    #[test]
     fn vm2_step_shadow_native_handles_stack_store_stw() {
         let obj = make_obj_with_words(0x1000, &[0x90A1_0050]); // stw r5, 80(r1)
         let mut legacy = VM::default();
@@ -1434,9 +1458,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_vm_shadow_report_native_mode_bridges_or_register_copy() {
+    fn runtime_vm_shadow_report_native_mode_handles_or_register_copy() {
         // li r3,1
-        // or r4,r3,r3 (register-copy form should bridge to preserve provenance parity)
+        // or r4,r3,r3 (register-copy form should be native with parity-preserving provenance)
         // blr
         let obj = make_obj_with_words(0x1000, &[0x3860_0001, 0x7C64_1B78, 0x4E80_0020]);
         let starts = [SectionAddress::new(0, 0x1000)];
@@ -1452,12 +1476,9 @@ mod tests {
         let function_report = &report.function_reports[0];
         assert!(
             function_report.native_steps >= 1,
-            "expected surrounding instructions to remain native"
+            "register-copy sequence should stay native"
         );
-        assert!(
-            function_report.bridged_steps >= 1,
-            "register-copy OR should bridge to preserve legacy provenance behavior"
-        );
+        assert_eq!(function_report.bridged_steps, 0);
         assert_eq!(report.native_steps, function_report.native_steps);
         assert_eq!(report.bridged_steps, function_report.bridged_steps);
         assert_eq!(report.total_diffs(), 0);

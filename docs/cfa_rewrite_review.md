@@ -282,7 +282,7 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 3 passed
-- `cargo test analysis::vm2::tests::` -> 22 passed
+- `cargo test analysis::vm2::tests::` -> 23 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
 - `cargo test analysis::pipeline::tests::` -> 15 passed
 - `cargo test util::xex::tests::` -> 5 passed
@@ -589,6 +589,9 @@ Open technical debt (non-blocking for this branch state):
       - Consolidated cutover gate rerun:
         - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r16-cutover` -> `PASS`
         - baseline/shadow/native-VM2 `cfa_tests` all `20/20`, then default + strict parity both passed.
+      - Post full register-copy OR native handling rerun:
+        - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull` -> `PASS`
+        - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`

@@ -43,7 +43,7 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
-  - `cargo test analysis::vm2::tests::` (22/22)
+  - `cargo test analysis::vm2::tests::` (23/23)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
   - `cargo test analysis::pipeline::tests::` (15/15)
   - `cargo test util::xex::tests::` (5/5)
@@ -101,6 +101,9 @@ Follow-up status:
     - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r16-cutover`
     - `cfa_tests` baseline/shadow/native-VM2 gates all passed (`20/20` each).
     - default + strict DC3 parity legs both passed with non-trivial diff counts `0`.
+  - Scripted workflow smoke (`r17-orfull`) after full native register-copy OR handling:
+    - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull`
+    - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
 - Rewrite-readiness kickoff is now active:
   - VM rewrite RFC: `docs/cfa_vm_rewrite_rfc.md`
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
@@ -194,11 +197,12 @@ Follow-up status:
     - `analysis::vm2::tests::vm2_step_shadow_native_handles_relative_jump_table_sequence`
     - `analysis::vm2::tests::vm2_step_shadow_native_handles_lwzx_and_lhzx_parity`
     - `analysis::vm2::tests::vm2_step_shadow_native_handles_stack_provenance_register_copy_or`
+    - `analysis::vm2::tests::vm2_step_shadow_native_handles_register_copy_or`
     - `analysis::vm2::tests::vm2_step_shadow_native_handles_stack_store_stw`
     - `analysis::vm2::tests::vm2_step_shadow_native_handles_stack_load_lwz`
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_stack_store_and_load`
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
-    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_bridges_or_register_copy`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_or_register_copy`
   - New rewrite-baseline tests:
     - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
     - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`
