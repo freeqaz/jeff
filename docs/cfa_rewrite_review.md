@@ -399,7 +399,8 @@ Open technical debt (non-blocking for this branch state):
 
 - **Phase E2e complete (R7 native VM2 shadow scaffold)**: runtime VM shadow can now execute VM2 natively with safe bridging.
   - Added `runtime_vm_shadow_report_with_mode(..., native_vm2)` in `analysis::vm2`.
-  - Added conservative native opcode handling (`nop`/no-op `ori`, non-link branches, illegal).
+  - Added initial native opcode handling (`addis`, `addi`/`addic`/`addic.`, `ori`, no-op branch/illegal cases),
+    including relocation-aware value synthesis where available.
   - Unsupported opcodes bridge VM2 state from legacy VM for deterministic fallback-safe shadowing.
   - Runtime reports now include native/bridged step counters:
     - total: `VmRuntimeShadowReport::{native_steps, bridged_steps}`
@@ -507,7 +508,7 @@ Open technical debt (non-blocking for this branch state):
      (seed/slice/finalization micro-change with parity proof and rollback path).
    - Keep legacy analyzer default unless checkpoint + digest parity remain clean.
 2. **R7 implementation: operational fallback routing (B7/B8)**:
-   - Expand native VM2 opcode coverage in runtime shadow to reduce bridge dependency.
+   - Continue expanding native VM2 opcode coverage in runtime shadow to reduce bridge dependency.
    - Keep bridge fallback deterministic and bounded while coverage grows.
    - Emit structured mismatch logs with actionable fixture-level summaries.
 3. **Real-XEX parity proof loop**:

@@ -103,6 +103,8 @@ Follow-up status:
       - `analysis::vm2::runtime_vm_shadow_report_with_mode(...)`
       - CFA fallback path now logs bounded mismatched function summaries.
       - Runtime report now tracks `native_steps` and `bridged_steps` (total + per-function).
+      - Native VM2 mode currently handles `addis`, `addi`/`addic`/`addic.`, `ori`, and no-op
+        branch/illegal cases, with legacy bridge fallback for unsupported opcodes.
   - Candidate pipeline lane update:
     - Added `analysis::pipeline::CandidatePipelineEngine` (parity-mirrored implementation stage).
     - Runtime shadow compares legacy vs candidate pipeline engines.

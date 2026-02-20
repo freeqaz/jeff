@@ -8,6 +8,7 @@ use powerpc::{Ins, Opcode};
 use crate::analysis::{
     disassemble,
     cfa::SectionAddress,
+    relocation_target_for,
     vm::{Cr, Gpr, GprSourceLocation, GprValue, JumpTableType, StepResult, VM},
     RelocationTarget,
 };
@@ -220,13 +221,84 @@ impl Vm2 {
         self.stack_slots.get(&offset)
     }
 
+    #[inline]
+    fn fact_from_value(value: Value2) -> ValueFact2 {
+        let confidence = if value == Value2::Top { Confidence2::Low } else { Confidence2::High };
+        ValueFact2 { value, provenance: Provenance2::None, confidence }
+    }
+
     /// Best-effort native VM2 runtime-shadow step.
     /// Returns `true` when the opcode is handled natively; callers should bridge from legacy VM
     /// state when `false`.
-    pub fn step_shadow_native(&mut self, ins: Ins) -> bool {
+    pub fn step_shadow_native(&mut self, obj: &ObjInfo, ins_addr: SectionAddress, ins: Ins) -> bool {
         match ins.op {
             // `ori rX, rX, 0` / `nop`: no semantic state change.
             Opcode::Ori if ins.field_uimm() == 0 && ins.field_ra() == ins.field_rs() => true,
+            // addis rD, rA, SIMM
+            Opcode::Addis => {
+                let dst = ins.field_rd() as usize;
+                let value = if let Some(target) =
+                    relocation_target_for(obj, ins_addr, None /* TODO */).ok().flatten()
+                {
+                    Value2::Address(target)
+                } else {
+                    let left = if ins.field_ra() == 0 {
+                        Some(0)
+                    } else {
+                        match self.reg(ins.field_ra()).value {
+                            Value2::Const(value) => Some(value),
+                            _ => None,
+                        }
+                    };
+                    match left {
+                        Some(value) => Value2::Const(value.wrapping_add((ins.field_simm() as u64) << 16)),
+                        None => Value2::Top,
+                    }
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // addi/addic/addic. rD, rA, SIMM
+            Opcode::Addi | Opcode::Addic | Opcode::Addic_ => {
+                let dst = ins.field_rd() as usize;
+                let value = if let Some(target) =
+                    relocation_target_for(obj, ins_addr, None /* TODO */).ok().flatten()
+                {
+                    Value2::Address(target)
+                } else {
+                    let load_zero = ins.field_ra() == 0 && ins.op == Opcode::Addi;
+                    let left = if load_zero {
+                        Value2::Const(0)
+                    } else {
+                        self.reg(ins.field_ra()).value.clone()
+                    };
+                    match left {
+                        Value2::Const(value) => Value2::Const(value.wrapping_add(ins.field_simm() as u64)),
+                        Value2::Address(RelocationTarget::Address(address)) => {
+                            Value2::Address(RelocationTarget::Address(address.offset(ins.field_simm() as i32)))
+                        }
+                        _ => Value2::Top,
+                    }
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
+            // ori rA, rS, UIMM
+            Opcode::Ori => {
+                let dst = ins.field_ra() as usize;
+                let value = if let Some(target) =
+                    relocation_target_for(obj, ins_addr, None /* TODO */).ok().flatten()
+                {
+                    Value2::Address(target)
+                } else {
+                    match self.reg(ins.field_rs()).value {
+                        Value2::Const(value) => Value2::Const(value | ins.field_uimm() as u64),
+                        _ => Value2::Top,
+                    }
+                };
+                self.gpr[dst] = Self::fact_from_value(value);
+                true
+            }
             // Non-link branches do not update architectural value state tracked by VM2.
             Opcode::B | Opcode::Bc | Opcode::Bcctr | Opcode::Bclr if !ins.field_lk() => true,
             // Illegal decode terminates execution in both VMs without mutating tracked facts.
@@ -530,7 +602,7 @@ pub fn runtime_vm_shadow_report_with_mode(
             report.steps_sampled += 1;
 
             let native_handled = if let Some(vm2) = vm2_native.as_mut() {
-                vm2.step_shadow_native(ins)
+                vm2.step_shadow_native(obj, addr, ins)
             } else {
                 false
             };
@@ -712,7 +784,8 @@ mod tests {
 
     #[test]
     fn runtime_vm_shadow_report_native_mode_tracks_native_and_bridged_steps() {
-        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x3860_0001, 0x4E80_0020]);
+        // nop -> unsupported lbzx -> blr
+        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x7C0C_58AE, 0x4E80_0020]);
         let starts = [SectionAddress::new(0, 0x1000)];
         let report = runtime_vm_shadow_report_with_mode(
             &obj,

@@ -25,6 +25,8 @@ Current implementation snapshot:
   - Runtime mode options:
     - mapped baseline (`runtime_vm_shadow_report(...)`)
     - native VM2 shadow with legacy bridge fallback (`runtime_vm_shadow_report_with_mode(..., true)`)
+      - current native coverage includes `addis`, `addi`/`addic`/`addic.`, `ori`, and no-op
+        branch/illegal handling.
   - Runtime sampling API:
     - `runtime_vm_shadow_summary(...)`
     - `runtime_vm_shadow_report(...)`
