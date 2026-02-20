@@ -403,6 +403,17 @@ Open technical debt (non-blocking for this branch state):
     - `cargo test util::xex::tests::` (`5/5`)
     - real-XEX split smoke with both shadow gates enabled (`rc=0`, `4448` files, `2223` `.obj`).
 
+- **Phase E1d complete (R6 finalization divergence)**: candidate finalization phase now has independent implementation.
+  - `CandidatePipelineEngine::phase_finalization` now runs candidate-owned finalization
+    (calls `phase_discover_remaining_functions` + `phase_finalize_and_validate`) instead of
+    the prior parity-mirrored method body.
+  - Added parity regression:
+    - `analysis::pipeline::tests::candidate_finalization_phase_matches_legacy_finalization_phase`
+  - Full corpus shadow parity remains zero-delta with both shadow gates enabled.
+  - Real-XEX smoke with both shadow gates after finalization divergence:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-finalization-<timestamp>`
+    - Result: `rc=0`, `4448` files, `2223` `.obj`.
+
 - **Phase E validation complete**: real-XEX parity smoke on external corpora.
   - Built release `dtk` from current branch and ran real DC3 split flow to `/tmp`:
     - `dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-<timestamp>`
@@ -429,7 +440,8 @@ Open technical debt (non-blocking for this branch state):
 ### Next Phase Queue
 
 1. **R6 implementation: candidate phase component spikes (B8)**:
-   - Implement first candidate finalization divergence inside `CandidatePipelineEngine`.
+   - Start first candidate heuristic refinement behind `CandidatePipelineEngine` gates
+     (seed/slice/finalization micro-change with parity proof and rollback path).
    - Keep legacy analyzer default unless checkpoint + digest parity remain clean.
 2. **R7 implementation: operational fallback routing (B7/B8)**:
    - Replace mapped-legacy VM shadow baseline with true VM2-executed runtime deltas.

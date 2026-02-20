@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete, S2b runtime shadow routing active, S2c candidate seed/slice divergence active
+- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete, S2b runtime shadow routing active, S2c candidate seed/slice/finalization divergence active
 - Initial scaffold: `src/analysis/pipeline.rs`
 
 Current implementation snapshot:
@@ -12,6 +12,7 @@ Current implementation snapshot:
 - Candidate pipeline lane is now explicit via `CandidatePipelineEngine` (parity-mirrored stage).
 - Candidate seed phase is now implemented directly in `CandidatePipelineEngine`.
 - Candidate slice phase is now implemented directly in `CandidatePipelineEngine`.
+- Candidate finalization phase is now implemented directly in `CandidatePipelineEngine`.
 - `analysis::pipeline` now exposes phase outputs and a run report model.
 - Digest comparison now includes categorized diff entries and summary counters.
 - Full CFA fixture shadow parity gate is active with zero-diff totals and per-fixture reporting.
@@ -20,6 +21,8 @@ Current implementation snapshot:
   - `analysis::pipeline::tests::candidate_seed_phase_matches_legacy_seed_phase`
 - Candidate slice parity test is active:
   - `analysis::pipeline::tests::candidate_slice_phase_matches_legacy_slice_phase`
+- Candidate finalization parity test is active:
+  - `analysis::pipeline::tests::candidate_finalization_phase_matches_legacy_finalization_phase`
 - Phase-level checkpoint diffing is now available via:
   - `PhaseCheckpointDigest`
   - `PhaseCheckpointDiffEntry` / `PhaseCheckpointDiffSummary`

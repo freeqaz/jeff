@@ -483,6 +483,15 @@ impl CandidatePipelineEngine {
         }
         Ok(SliceExplorationOutput { processed_seed_count: seed_addrs.len() })
     }
+
+    fn candidate_finalization(&mut self, obj: &ObjInfo) -> Result<FinalizationOutput> {
+        self.state.phase_discover_remaining_functions(obj)?;
+        self.state.phase_finalize_and_validate(obj)?;
+        Ok(FinalizationOutput {
+            function_count: self.state.functions.len(),
+            jump_table_count: self.state.jump_tables.len(),
+        })
+    }
 }
 
 impl CfaPipelineEngine for CandidatePipelineEngine {
@@ -499,12 +508,7 @@ impl CfaPipelineEngine for CandidatePipelineEngine {
     }
 
     fn phase_finalization(&mut self, obj: &ObjInfo) -> Result<FinalizationOutput> {
-        self.state.phase_discover_remaining_functions(obj)?;
-        self.state.phase_finalize_and_validate(obj)?;
-        Ok(FinalizationOutput {
-            function_count: self.state.functions.len(),
-            jump_table_count: self.state.jump_tables.len(),
-        })
+        self.candidate_finalization(obj)
     }
 
     fn phase_apply(&self, obj: &mut ObjInfo) -> Result<ApplyOutput> {
@@ -918,6 +922,46 @@ mod tests {
             candidate_digest.diff_summary(&legacy_digest).total(),
             0,
             "candidate slice stage should preserve legacy digest parity"
+        );
+    }
+
+    #[test]
+    fn candidate_finalization_phase_matches_legacy_finalization_phase() {
+        let mut obj = make_obj(0x1000, &[NOP, BLR, NOP, BLR, NOP, BLR]);
+        obj.known_functions.insert(SectionAddress::new(0, 0x1000), Some(8));
+
+        let mut legacy = LegacyPipelineEngine::new(BTreeMap::new());
+        let legacy_seed = legacy
+            .phase_seed_discovery(&obj)
+            .expect("legacy seed phase should succeed");
+        legacy
+            .phase_slice_exploration(&obj, &legacy_seed)
+            .expect("legacy slice phase should succeed");
+        let legacy_finalization = legacy
+            .phase_finalization(&obj)
+            .expect("legacy finalization should succeed");
+        let legacy_digest = legacy.digest();
+
+        let mut candidate = CandidatePipelineEngine::new(BTreeMap::new());
+        let candidate_seed = candidate
+            .phase_seed_discovery(&obj)
+            .expect("candidate seed phase should succeed");
+        candidate
+            .phase_slice_exploration(&obj, &candidate_seed)
+            .expect("candidate slice phase should succeed");
+        let candidate_finalization = candidate
+            .phase_finalization(&obj)
+            .expect("candidate finalization should succeed");
+        let candidate_digest = candidate.digest();
+
+        assert_eq!(
+            candidate_finalization, legacy_finalization,
+            "candidate finalization output should match legacy during parity stage"
+        );
+        assert_eq!(
+            candidate_digest.diff_summary(&legacy_digest).total(),
+            0,
+            "candidate finalization stage should preserve legacy digest parity"
         );
     }
 
