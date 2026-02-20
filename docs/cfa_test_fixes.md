@@ -43,7 +43,7 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
-  - `cargo test analysis::vm2::tests::` (2/2)
+  - `cargo test analysis::vm2::tests::` (4/4)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
   - `cargo test analysis::pipeline::tests::` (6/6)
   - `cargo test util::xex::tests::` (5/5)
@@ -62,10 +62,14 @@ Follow-up status:
   - Pipeline/shadow RFC: `docs/cfa_pipeline_rewrite_rfc.md`
   - VM2 scaffold module: `src/analysis/vm2.rs`
   - Pipeline interface scaffold module: `src/analysis/pipeline.rs`
+  - VM2 shadow bridge from legacy VM: `Vm2::from_legacy_vm` in `src/analysis/vm2.rs`
   - Legacy analyzer phase extraction (`seed/slice/finalize/validate`) wired for shadowable execution.
   - Shadow diff categorization + summary and selected fixture parity gate:
     - `analysis::pipeline::tests::pipeline_digest_diff_summary_categorizes_delta_types`
     - `analysis::pipeline::tests::shadow_corpus_selected_fixtures_match_legacy_pipeline_digest`
+  - New VM2 shadow tests:
+    - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
+    - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
   - New rewrite-baseline tests:
     - `analysis::vm::tests::relative_byte_jump_table_base_propagates_to_bctr`
     - `analysis::cfa::tests::test_shadow_digest_is_deterministic_for_legacy_analyzer`

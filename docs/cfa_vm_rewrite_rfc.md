@@ -4,8 +4,14 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: RFC + spike baseline (initial implementation scaffold merged)
+- Phase: M1 complete, M2 shadow-bridge baseline active
 - Initial scaffold: `src/analysis/vm2.rs`
+
+Current implementation snapshot:
+- VM2 now supports shadow ingestion from legacy VM state (`Vm2::from_legacy_vm`).
+- Legacy-to-VM2 mapping covers constant/address/range/compare/indexed-load facts.
+- Legacy provenance is mapped into VM2 provenance (`register`, `stack slot`, legacy memory forms).
+- New VM2 parity tests include relative jump-table propagation from real legacy VM execution.
 
 ## Why this rewrite exists
 
@@ -86,12 +92,12 @@ Confidence is attached to derived indexed-load and branch-target facts. Consumer
 - Keep legacy VM as source of truth.
 - Add regression tests for stack-shuffle and indexed-load provenance paths.
 
-### M1: VM2 skeleton
+### M1: VM2 skeleton (complete)
 
 - Introduce VM2 types + transfer dispatch in parallel module.
 - No CFA integration yet; test-only execution.
 
-### M2: Shadow execution
+### M2: Shadow execution (baseline in progress)
 
 - Run legacy VM and VM2 side-by-side on selected corpus.
 - Compare emitted branch/jump-table facts and range outcomes.

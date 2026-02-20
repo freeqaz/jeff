@@ -227,9 +227,17 @@ Implemented in this branch:
   - Added instruction-gap and register-rename VM tests.
 
 - **B7 in progress (RFC + baseline complete)**:
+- **B7 in progress (M2 shadow-bridge baseline active)**:
   - Added decision-complete VM rewrite RFC (`docs/cfa_vm_rewrite_rfc.md`).
   - Added VM baseline test for relative jump-table base propagation through `lbzx + rlwinm + add + bctr`.
   - Added VM2 parallel model scaffold in code (`src/analysis/vm2.rs`) with value/provenance/confidence primitives (no behavior switch yet).
+  - Added VM2 legacy-shadow bridge (`Vm2::from_legacy_vm`) and mapping for:
+    - value kinds (`Const`, `Address`, `Range`, `IndexedLoad`, comparison tags),
+    - provenance (`Reg`, `StackSlot`, legacy memory forms),
+    - CTR/LR + stack-slot snapshots.
+  - Added VM2 shadow parity tests:
+    - `analysis::vm2::tests::vm2_from_legacy_vm_maps_core_value_and_provenance`
+    - `analysis::vm2::tests::vm2_shadow_tracks_relative_jump_table_from_legacy_vm_execution`
 
 - **B8 in progress (RFC + shadow scaffolding complete)**:
   - Added decision-complete pipeline/shadow RFC (`docs/cfa_pipeline_rewrite_rfc.md`).
@@ -252,6 +260,8 @@ Validation run:
 - `cargo test analysis::tests::`
 - `cargo test analysis::vm::tests::`
 - `cargo test analysis::pipeline::tests::`
+- `cargo test analysis::vm2::tests::`
+- `cargo test util::xex::tests::`
 
 ## Current Status Snapshot (2026-02-20)
 
@@ -265,9 +275,10 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 3 passed
-- `cargo test analysis::vm2::tests::` -> 2 passed
+- `cargo test analysis::vm2::tests::` -> 4 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
 - `cargo test analysis::pipeline::tests::` -> 6 passed
+- `cargo test util::xex::tests::` -> 5 passed
 
 Open technical debt (non-blocking for this branch state):
 
@@ -299,8 +310,8 @@ Open technical debt (non-blocking for this branch state):
 ### Next Phase Queue
 
 1. **R4: VM2 shadow execution hooks (B7)**:
-   - Execute VM2 in parallel (shadow-only) on selected switch fixtures.
-   - Compare VM2-derived jump-table provenance against legacy VM facts.
+   - Expand `Vm2::from_legacy_vm` parity checks from unit fixtures to selected CFA corpus paths.
+   - Add structured VM shadow-diff reporting to support CI gates.
 2. **R5: Shadow corpus expansion + CI-style gate (B8)**:
    - Expand selected fixture set for digest parity.
    - Keep diff-summary gate at zero unresolved deltas.
