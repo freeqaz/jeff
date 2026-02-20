@@ -6,7 +6,7 @@ mod symbols;
 
 use std::{
     cmp::{max, min},
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     hash::Hash,
 };
 
@@ -86,6 +86,10 @@ pub struct ObjInfo {
     /// Module ID (0 for main)
     pub module_id: u32,
     pub unresolved_relocations: Vec<RelReloc>,
+
+    /// Symbol names that should be emitted as COMDAT (IMAGE_COMDAT_SELECT_ANY)
+    /// in COFF output. Populated by split_obj() for globally-duplicated symbols.
+    pub comdat_symbols: HashSet<String>,
 }
 
 impl ObjInfo {
@@ -119,6 +123,7 @@ impl ObjInfo {
             pdata_funcs: Default::default(),
             module_id: 0,
             unresolved_relocations: vec![],
+            comdat_symbols: Default::default(),
         }
     }
 

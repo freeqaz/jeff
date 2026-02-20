@@ -1437,6 +1437,44 @@ pub fn split_obj(
         }
     }
 
+    // Mark all global defined symbols in split objects as COMDAT (SELECT_ANY).
+    // This prevents LNK4006 warnings in two scenarios:
+    // 1. Same symbol duplicated across multiple split objects (inline/template)
+    // 2. Split object symbols conflicting with decomp source objects
+    let mut comdat_symbols: HashSet<String> = HashSet::new();
+    for obj in &objects {
+        for (_, sym) in obj.symbols.iter() {
+            if sym.flags.is_global()
+                && sym.section.is_some()
+                && sym.kind != ObjSymbolKind::Section
+                && !sym.name.starts_with("lbl_")
+                && !sym.name.starts_with("pdata@")
+                && !sym.name.starts_with("except_data_")
+                && !sym.name.starts_with("except_record_")
+                && !sym.name.starts_with("__unwind$")
+            {
+                comdat_symbols.insert(sym.name.clone());
+            }
+        }
+    }
+    if !comdat_symbols.is_empty() {
+        log::debug!("Marking {} symbols as COMDAT", comdat_symbols.len());
+        for obj in &mut objects {
+            // Only store symbols that exist in this object (avoids cloning 88K strings * 2K objects = 28GB OOM)
+            let local: HashSet<String> = obj
+                .symbols
+                .iter()
+                .filter(|(_, sym)| {
+                    sym.flags.is_global()
+                        && sym.section.is_some()
+                        && comdat_symbols.contains(&sym.name)
+                })
+                .map(|(_, sym)| sym.name.clone())
+                .collect();
+            obj.comdat_symbols = local;
+        }
+    }
+
     Ok(objects)
 }
 

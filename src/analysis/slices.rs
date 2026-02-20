@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use object::Section;
 // use ppc750cl::{Ins, Opcode};
 use powerpc::{Ins, Opcode};
 
@@ -14,7 +13,7 @@ use crate::{
         disassemble,
         executor::{ExecCbData, ExecCbResult, Executor},
         uniq_jump_table_entries,
-        vm::{section_address_for, BranchTarget, GprValue, JumpTableType, StepResult, VM},
+        vm::{section_address_for, BranchTarget, JumpTableType, StepResult, VM},
         RelocationTarget,
     },
     obj::{ObjInfo, ObjKind, ObjSection, ObjSymbolKind},
@@ -34,6 +33,10 @@ pub struct FunctionSlices {
     pub has_rfi: bool,
     pub finalized: bool,
     pub has_r1_load: bool, // Possibly instead of a prologue
+    pub possible_explore_cap_hits: u32,
+    pub unvisited_seed_cap_hits: u32,
+    pub total_block_cap_hits: u32,
+    pub rejected_unvisited_seed_count: u32,
 }
 
 pub enum TailCallResult {
@@ -46,6 +49,14 @@ pub enum TailCallResult {
 type BlockRange = Range<SectionAddress>;
 
 type InsCheck = dyn Fn(Ins) -> bool;
+
+const MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION: usize = 512;
+const MAX_UNVISITED_SEEDS_PER_FUNCTION: usize = 128;
+const MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION: usize = 4096;
+
+const UNVISITED_SEED_REASON_PDATA_RANGE: u32 = 1 << 0;
+const UNVISITED_SEED_REASON_GAP_BOUNDARY: u32 = 1 << 1;
+const UNVISITED_SEED_REASON_PROLOGUE_OR_EPILOGUE: u32 = 1 << 2;
 
 /// Stop searching for prologue/epilogue sequences if the next instruction
 /// is a branch or uses r0 or r1.
@@ -112,16 +123,47 @@ fn check_prologue_sequence(
         ins.op == Opcode::Stw && ins.field_rs() == 0 && ins.field_ra() == 1
     }
     #[inline(always)]
-    fn is_bl(ins: Ins) -> bool { ins.op == Opcode::B && ins.field_lk() }
+    fn is_bl(ins: Ins) -> bool {
+        ins.op == Opcode::B && ins.field_lk()
+    }
     #[inline(always)]
     fn is_subi(ins: Ins) -> bool {
         ins.op == Opcode::Addi && ins.field_simm() < 0 && ins.field_simm() != -0x8000
     }
-    check_sequence(section, addr, ins, &[
-        (&is_mflr, &is_stw),
-        (&is_mflr, &is_bl),
-        (&is_subi, &is_mflr),
-    ])
+    check_sequence(
+        section,
+        addr,
+        ins,
+        &[(&is_mflr, &is_stw), (&is_mflr, &is_bl), (&is_subi, &is_mflr)],
+    )
+}
+
+fn check_epilogue_sequence(
+    section: &ObjSection,
+    addr: SectionAddress,
+    ins: Option<Ins>,
+) -> Result<bool> {
+    #[inline(always)]
+    fn is_mtlr(ins: Ins) -> bool {
+        // mtspr LR, r0
+        ins.op == Opcode::Mtspr && ins.field_rs() == 12 && ins.field_spr() == 8
+    }
+    #[inline(always)]
+    fn is_addi(ins: Ins) -> bool {
+        // addi r1, r1, SIMM
+        ins.op == Opcode::Addi && ins.field_rd() == 1 && ins.field_ra() == 1
+    }
+    #[inline(always)]
+    fn is_or(ins: Ins) -> bool {
+        // or r1, rA, rB
+        ins.op == Opcode::Or && ins.field_rd() == 1
+    }
+    check_sequence(
+        section,
+        addr,
+        ins,
+        &[(&is_mtlr, &is_addi), (&is_mtlr, &is_or), (&is_or, &is_mtlr)],
+    )
 }
 
 impl FunctionSlices {
@@ -134,6 +176,18 @@ impl FunctionSlices {
     }
 
     pub fn add_block_start(&mut self, addr: SectionAddress) -> bool {
+        if !self.blocks.contains_key(&addr)
+            && self.blocks.len() >= MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION
+        {
+            self.total_block_cap_hits += 1;
+            log::debug!(
+                "Block discovery cap reached ({}) while adding {:#010X}",
+                MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION,
+                addr
+            );
+            return false;
+        }
+
         // Slice previous block.
         if let Some((_, end)) = self.blocks.range_mut(..addr).next_back() {
             if let Some(last_end) = *end {
@@ -225,11 +279,12 @@ impl FunctionSlices {
             ins.op == Opcode::Or && ins.field_rd() == 1
         }
 
-        if check_sequence(section, addr, Some(ins), &[
-            (&is_mtlr, &is_addi),
-            (&is_mtlr, &is_or),
-            (&is_or, &is_mtlr),
-        ])? {
+        if check_sequence(
+            section,
+            addr,
+            Some(ins),
+            &[(&is_mtlr, &is_addi), (&is_mtlr, &is_or), (&is_or, &is_mtlr)],
+        )? {
             if let Some(epilogue) = self.epilogue {
                 if epilogue != addr {
                     bail!("Found duplicate epilogue: {:#010X} and {:#010X}", epilogue, addr)
@@ -395,8 +450,8 @@ impl FunctionSlices {
 
                     // Only inline jump tables (immediately after bctr) extend block end.
                     // External jump tables in data sections should not affect block end.
-                    let is_inline = jt == JumpTableType::Absolute
-                        && address.address == ins_addr.address + 4;
+                    let is_inline =
+                        jt == JumpTableType::Absolute && address.address == ins_addr.address + 4;
                     let next_addr_size = if is_inline { actual_size } else { 0 };
 
                     // End of block - now uses actual size for inline tables
@@ -547,6 +602,9 @@ impl FunctionSlices {
             // }
         }
 
+        let mut possible_block_explores = 0usize;
+        let mut unvisited_seed_count = 0usize;
+
         // Speculatively follow possible_blocks entries.
         // These are forward branches that couldn't be proven internal during Pass 1
         // (because they're beyond the currently-known function end). Common case:
@@ -556,7 +614,20 @@ impl FunctionSlices {
         // (between the branch and its target) that contain unreachable but valid code
         // such as switch dispatch blocks or tail blocks.
         loop {
+            if possible_block_explores >= MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION {
+                self.possible_explore_cap_hits += 1;
+                let dropped = self.possible_blocks.len();
+                self.possible_blocks.clear();
+                log::debug!(
+                    "Reached possible-block exploration cap ({}) for function {:#010X}; dropped {} unresolved candidates",
+                    MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION,
+                    function_start,
+                    dropped
+                );
+                break;
+            }
             let Some((&addr, _)) = self.possible_blocks.first_key_value() else { break };
+            possible_block_explores += 1;
             let vm = self.possible_blocks.remove(&addr).unwrap();
             if !self.add_block_start(addr) {
                 continue;
@@ -579,11 +650,7 @@ impl FunctionSlices {
             // Block processed. Re-run gap detection since function bounds may have extended.
             while let Some((first, _)) = self.first_disconnected_block() {
                 let gap_vm = self.possible_blocks.remove(&first.start);
-                executor.push(
-                    first.end,
-                    gap_vm.unwrap_or_else(|| VM::new_from_obj(obj)),
-                    true,
-                );
+                executor.push(first.end, gap_vm.unwrap_or_else(|| VM::new_from_obj(obj)), true);
                 if matches!(
                     executor.run(obj, |data| {
                         self.instruction_callback(
@@ -599,6 +666,154 @@ impl FunctionSlices {
                     return Ok(false);
                 }
             }
+        }
+
+        // Scan for unvisited code inside the current function range. This catches
+        // .pdata-covered helper/handler blocks with no CFG edge from entry.
+        let scan_end = self.scan_end(obj, function_start, function_end, known_functions);
+        let mut scan_cursor = function_start;
+        while let Some(candidate) = self.next_unvisited_candidate(obj, scan_cursor, scan_end) {
+            if unvisited_seed_count >= MAX_UNVISITED_SEEDS_PER_FUNCTION {
+                self.unvisited_seed_cap_hits += 1;
+                log::debug!(
+                    "Reached unvisited-seed cap ({}) for function {:#010X}",
+                    MAX_UNVISITED_SEEDS_PER_FUNCTION,
+                    function_start
+                );
+                break;
+            }
+            let reason_flags =
+                self.unvisited_seed_reason_flags(obj, candidate, function_start, function_end)?;
+            if reason_flags == 0 {
+                self.rejected_unvisited_seed_count += 1;
+                log::debug!(
+                    "Rejected unvisited seed @ {:#010X} in function {:#010X}: no corroborators",
+                    candidate,
+                    function_start
+                );
+                scan_cursor = candidate + 4;
+                continue;
+            }
+
+            if self.add_block_start(candidate) {
+                unvisited_seed_count += 1;
+                log::debug!(
+                    "Accepted unvisited seed @ {:#010X} in function {:#010X} with reason flags {:#X}",
+                    candidate,
+                    function_start,
+                    reason_flags
+                );
+                executor.push(candidate, VM::new_from_obj(obj), true);
+                if matches!(
+                    executor.run(obj, |data| {
+                        self.instruction_callback(
+                            data,
+                            obj,
+                            function_start,
+                            function_end,
+                            known_functions,
+                        )
+                    })?,
+                    Some(false)
+                ) {
+                    return Ok(false);
+                }
+
+                // Re-run disconnected/possible block processing after each seeded block.
+                while let Some((first, _)) = self.first_disconnected_block() {
+                    let gap_vm = self.possible_blocks.remove(&first.start);
+                    executor.push(first.end, gap_vm.unwrap_or_else(|| VM::new_from_obj(obj)), true);
+                    if matches!(
+                        executor.run(obj, |data| {
+                            self.instruction_callback(
+                                data,
+                                obj,
+                                function_start,
+                                function_end,
+                                known_functions,
+                            )
+                        })?,
+                        Some(false)
+                    ) {
+                        return Ok(false);
+                    }
+                }
+
+                loop {
+                    if possible_block_explores >= MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION {
+                        self.possible_explore_cap_hits += 1;
+                        let dropped = self.possible_blocks.len();
+                        self.possible_blocks.clear();
+                        log::debug!(
+                            "Reached possible-block exploration cap ({}) for function {:#010X}; dropped {} unresolved candidates",
+                            MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION,
+                            function_start,
+                            dropped
+                        );
+                        break;
+                    }
+                    let Some((&addr, _)) = self.possible_blocks.first_key_value() else { break };
+                    possible_block_explores += 1;
+                    let vm = self.possible_blocks.remove(&addr).unwrap();
+                    if !self.add_block_start(addr) {
+                        continue;
+                    }
+                    executor.push(addr, vm, true);
+                    if matches!(
+                        executor.run(obj, |data| {
+                            self.instruction_callback(
+                                data,
+                                obj,
+                                function_start,
+                                function_end,
+                                known_functions,
+                            )
+                        })?,
+                        Some(false)
+                    ) {
+                        return Ok(false);
+                    }
+                    while let Some((first, _)) = self.first_disconnected_block() {
+                        let gap_vm = self.possible_blocks.remove(&first.start);
+                        executor.push(
+                            first.end,
+                            gap_vm.unwrap_or_else(|| VM::new_from_obj(obj)),
+                            true,
+                        );
+                        if matches!(
+                            executor.run(obj, |data| {
+                                self.instruction_callback(
+                                    data,
+                                    obj,
+                                    function_start,
+                                    function_end,
+                                    known_functions,
+                                )
+                            })?,
+                            Some(false)
+                        ) {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+
+            scan_cursor = self.block_end_containing(candidate).unwrap_or(candidate + 4);
+        }
+
+        if self.possible_explore_cap_hits > 0
+            || self.unvisited_seed_cap_hits > 0
+            || self.total_block_cap_hits > 0
+            || self.rejected_unvisited_seed_count > 0
+        {
+            log::debug!(
+                "Function {:#010X} analysis counters: possible_cap_hits={}, unvisited_cap_hits={}, total_block_cap_hits={}, rejected_unvisited_seeds={}",
+                function_start,
+                self.possible_explore_cap_hits,
+                self.unvisited_seed_cap_hits,
+                self.total_block_cap_hits,
+                self.rejected_unvisited_seed_count
+            );
         }
 
         // Visit trailing blocks
@@ -648,7 +863,9 @@ impl FunctionSlices {
         Ok(true)
     }
 
-    pub fn can_finalize(&self) -> bool { self.possible_blocks.is_empty() }
+    pub fn can_finalize(&self) -> bool {
+        self.possible_blocks.is_empty()
+    }
 
     pub fn finalize(
         &mut self,
@@ -749,6 +966,11 @@ impl FunctionSlices {
     ) -> TailCallResult {
         // TODO: check if jump target is a reg intrinsic, as if it is, it might *not* be a tail call
         // you'd also have to check if there are visited addresses that go beyond the addr of the jump instruction
+
+        // If this function came from .pdata, prefer the known bounds over tail-call heuristics.
+        if obj.pdata_funcs.contains(&function_start) {
+            return TailCallResult::Not;
+        }
 
         // If jump target is already a known block or within known function bounds, not a tail call.
         if self.blocks.contains_key(&addr) {
@@ -875,6 +1097,128 @@ impl FunctionSlices {
             }
         }
     }
+
+    fn block_end_containing(&self, addr: SectionAddress) -> Option<SectionAddress> {
+        let (&start, &end) = self.blocks.range(..=addr).next_back()?;
+        let end = end?;
+        if addr >= start && addr < end {
+            Some(end)
+        } else {
+            None
+        }
+    }
+
+    fn jump_table_end_containing(&self, addr: SectionAddress) -> Option<SectionAddress> {
+        let (&jt_addr, &size) = self.jump_table_references.range(..=addr).next_back()?;
+        if jt_addr.section != addr.section {
+            return None;
+        }
+        let jt_end = jt_addr + size;
+        if addr >= jt_addr && addr < jt_end {
+            Some(jt_end)
+        } else {
+            None
+        }
+    }
+
+    fn is_adjacent_to_block_gap_boundary(&self, candidate: SectionAddress) -> bool {
+        if let Some((_, &Some(prev_end))) = self.blocks.range(..=candidate).next_back() {
+            if prev_end == candidate {
+                return true;
+            }
+        }
+        let next_addr = candidate + 4;
+        if let Some((&next_start, _)) = self.blocks.range(next_addr..).next() {
+            if next_start == next_addr {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn unvisited_seed_reason_flags(
+        &self,
+        obj: &ObjInfo,
+        candidate: SectionAddress,
+        function_start: SectionAddress,
+        function_end: Option<SectionAddress>,
+    ) -> Result<u32> {
+        let mut reason_flags = 0u32;
+
+        if obj.pdata_funcs.contains(&function_start)
+            && function_end.is_some_and(|end| candidate >= function_start && candidate < end)
+        {
+            reason_flags |= UNVISITED_SEED_REASON_PDATA_RANGE;
+        }
+
+        if self.is_adjacent_to_block_gap_boundary(candidate) {
+            reason_flags |= UNVISITED_SEED_REASON_GAP_BOUNDARY;
+        }
+
+        let section = &obj.sections[candidate.section];
+        if let Some(ins) = disassemble(section, candidate.address) {
+            if check_prologue_sequence(section, candidate, Some(ins))?
+                || check_epilogue_sequence(section, candidate, Some(ins))?
+            {
+                reason_flags |= UNVISITED_SEED_REASON_PROLOGUE_OR_EPILOGUE;
+            }
+        }
+
+        Ok(reason_flags)
+    }
+
+    fn scan_end(
+        &self,
+        obj: &ObjInfo,
+        function_start: SectionAddress,
+        function_end: Option<SectionAddress>,
+        known_functions: &BTreeMap<SectionAddress, FunctionInfo>,
+    ) -> SectionAddress {
+        let section = &obj.sections[function_start.section];
+        let section_start = SectionAddress::new(function_start.section, section.address as u32);
+        let section_end = section_start + section.size as u32;
+
+        let mut end = function_end.unwrap_or(section_end);
+        if end > section_end {
+            end = section_end;
+        }
+
+        // No known end: don't scan across the next known function boundary.
+        if function_end.is_none() {
+            if let Some((&next_start, _)) =
+                known_functions.range(function_start + 4..section_end).next()
+            {
+                if next_start.section == function_start.section && next_start < end {
+                    end = next_start;
+                }
+            }
+        }
+        end
+    }
+
+    fn next_unvisited_candidate(
+        &self,
+        obj: &ObjInfo,
+        mut addr: SectionAddress,
+        end: SectionAddress,
+    ) -> Option<SectionAddress> {
+        while addr < end {
+            if let Some(block_end) = self.block_end_containing(addr) {
+                addr = block_end;
+                continue;
+            }
+            if let Some(jt_end) = self.jump_table_end_containing(addr) {
+                addr = jt_end;
+                continue;
+            }
+            let ins = disassemble(&obj.sections[addr.section], addr.address)?;
+            if ins.op != Opcode::Illegal && ins.code != 0 && !is_nop(ins) {
+                return Some(addr);
+            }
+            addr += 4;
+        }
+        None
+    }
 }
 
 #[inline]
@@ -886,4 +1230,234 @@ fn is_conditional_blr(ins: Ins) -> bool {
 fn is_nop(ins: Ins) -> bool {
     // ori r0, r0, 0
     ins.code == 0x60000000
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{
+        FunctionSlices, TailCallResult, MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION,
+        MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION,
+    };
+    use crate::{
+        analysis::{cfa::SectionAddress, vm::VM},
+        obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind},
+    };
+
+    fn make_code_section(name: &str, base_addr: u32, instructions: &[u32]) -> ObjSection {
+        let data: Vec<u8> = instructions.iter().flat_map(|ins| ins.to_be_bytes()).collect();
+        ObjSection {
+            name: name.into(),
+            kind: ObjSectionKind::Code,
+            address: base_addr as u64,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            ..Default::default()
+        }
+    }
+
+    fn build_tail_call_fixture(marked_in_pdata: bool) -> (ObjInfo, SectionAddress, SectionAddress) {
+        let code_section = make_code_section(".text", 0x1000, &[0x6000_0000; 0x20]);
+        let other_code_section = make_code_section(".text$x", 0x2000, &[0x6000_0000; 4]);
+        let function_start = SectionAddress::new(0, 0x1008);
+        let function_end = SectionAddress::new(0, 0x1040);
+
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "tail-call-fixture".into(),
+            vec![],
+            vec![code_section, other_code_section],
+        );
+        if marked_in_pdata {
+            obj.pdata_funcs.push(function_start);
+        }
+        (obj, function_start, function_end)
+    }
+
+    #[test]
+    fn tail_call_guard_pdata_known_function_returns_not() {
+        let (obj, function_start, function_end) = build_tail_call_fixture(true);
+        let mut slices = FunctionSlices::default();
+        let known_functions = BTreeMap::new();
+        let cross_section_target = SectionAddress::new(1, 0x2000);
+
+        let result = slices.check_tail_call(
+            &obj,
+            cross_section_target,
+            function_start,
+            Some(function_end),
+            &known_functions,
+            None,
+        );
+
+        assert!(matches!(result, TailCallResult::Not));
+    }
+
+    #[test]
+    fn tail_call_non_pdata_path_preserves_existing_heuristic() {
+        let (obj, function_start, function_end) = build_tail_call_fixture(false);
+        let mut slices = FunctionSlices::default();
+        let known_functions = BTreeMap::new();
+        let cross_section_target = SectionAddress::new(1, 0x2000);
+
+        let result = slices.check_tail_call(
+            &obj,
+            cross_section_target,
+            function_start,
+            Some(function_end),
+            &known_functions,
+            None,
+        );
+
+        assert!(matches!(result, TailCallResult::Is));
+    }
+
+    #[test]
+    fn tail_call_guard_pdata_precedes_all_other_heuristics() {
+        let (mut obj, function_start, function_end) = build_tail_call_fixture(true);
+        let before_function_target = SectionAddress::new(0, 0x1004);
+        let known_functions = BTreeMap::new();
+
+        let mut slices = FunctionSlices::default();
+        let guarded_result = slices.check_tail_call(
+            &obj,
+            before_function_target,
+            function_start,
+            Some(function_end),
+            &known_functions,
+            None,
+        );
+        assert!(matches!(guarded_result, TailCallResult::Not));
+
+        obj.pdata_funcs.clear();
+        let mut slices_without_guard = FunctionSlices::default();
+        let heuristic_result = slices_without_guard.check_tail_call(
+            &obj,
+            before_function_target,
+            function_start,
+            Some(function_end),
+            &known_functions,
+            None,
+        );
+        assert!(matches!(heuristic_result, TailCallResult::Is));
+    }
+
+    #[test]
+    fn speculative_possible_block_exploration_honors_cap() {
+        let instruction_count = MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION + 256;
+        let code_section =
+            make_code_section(".text", 0x3000, &vec![0x4E80_0020; instruction_count]);
+        let obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "possible-cap".into(),
+            vec![],
+            vec![code_section],
+        );
+
+        let mut slices = FunctionSlices::default();
+        for i in 1..(MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION + 128) {
+            let addr = SectionAddress::new(0, 0x3000 + (i as u32 * 4));
+            slices.possible_blocks.insert(addr, VM::new_from_obj(&obj));
+        }
+
+        let function_start = SectionAddress::new(0, 0x3000);
+        let analyzed = slices
+            .analyze(
+                &obj,
+                function_start,
+                function_start,
+                Some(function_start + 4),
+                &BTreeMap::new(),
+                None,
+            )
+            .expect("analysis should not error");
+        assert!(analyzed);
+        assert!(slices.possible_explore_cap_hits > 0);
+        assert!(slices.blocks.len() <= MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION);
+    }
+
+    #[test]
+    fn unvisited_seed_discovers_detached_helper_in_pdata_range() {
+        let instructions = [
+            0x4E80_0020, // blr
+            0x6000_0000,
+            0x6000_0000,
+            0x6000_0000,
+            0x4E80_0020, // detached helper blr at +0x10
+            0x6000_0000,
+            0x6000_0000,
+            0x6000_0000,
+        ];
+        let code_section = make_code_section(".text", 0x4000, &instructions);
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "pdata-detached".into(),
+            vec![],
+            vec![code_section],
+        );
+
+        let function_start = SectionAddress::new(0, 0x4000);
+        obj.pdata_funcs.push(function_start);
+        let function_end = SectionAddress::new(0, 0x4020);
+
+        let mut slices = FunctionSlices::default();
+        let analyzed = slices
+            .analyze(
+                &obj,
+                function_start,
+                function_start,
+                Some(function_end),
+                &BTreeMap::new(),
+                None,
+            )
+            .expect("analysis should not error");
+        assert!(analyzed);
+        assert!(slices.blocks.contains_key(&SectionAddress::new(0, 0x4010)));
+    }
+
+    #[test]
+    fn unvisited_seed_rejects_embedded_data_without_corroborator() {
+        let instructions = [
+            0x4E80_0020, // blr
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000,
+            0x6042_0001, // ori r2, r2, 1 (data-like legal instruction)
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000,
+        ];
+        let code_section = make_code_section(".text", 0x5000, &instructions);
+        let obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "embedded-data".into(),
+            vec![],
+            vec![code_section],
+        );
+
+        let function_start = SectionAddress::new(0, 0x5000);
+        let mut slices = FunctionSlices::default();
+        let analyzed = slices
+            .analyze(&obj, function_start, function_start, None, &BTreeMap::new(), None)
+            .expect("analysis should not error");
+        assert!(analyzed);
+        assert!(!slices.blocks.contains_key(&SectionAddress::new(0, 0x5010)));
+        assert!(slices.rejected_unvisited_seed_count > 0);
+    }
+
+    #[test]
+    fn add_block_start_caps_total_discovered_blocks() {
+        let mut slices = FunctionSlices::default();
+        for i in 0..(MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION + 64) {
+            let _ = slices.add_block_start(SectionAddress::new(0, 0x6000 + (i as u32 * 4)));
+        }
+        assert_eq!(slices.blocks.len(), MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION);
+        assert!(slices.total_block_cap_hits > 0);
+    }
 }

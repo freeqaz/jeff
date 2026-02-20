@@ -10,7 +10,9 @@ use crate::{
 };
 
 fn bytestr_to_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let hex_str = String::deserialize(deserializer)?;
 
     if hex_str.len() % 2 != 0 {
@@ -27,7 +29,9 @@ where D: Deserializer<'de> {
 }
 
 fn get_fn_start<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let hex_str = String::deserialize(deserializer)?;
     if hex_str.len() != 8 {
         return Err(D::Error::custom(format!("expected 8 hex chars, got {}", hex_str.len())));
@@ -136,6 +140,83 @@ fn test_super_basic_cfa() -> Result<()> {
 //     RelativeShortsTimes2(Option<RelocationTarget>),
 // }
 
+// Absolute general skeleton:
+// lis r12, <jump_table_addr-hi>
+// addi r12, r12, <jump_table_addr-lo>
+// rlwinm r0, rX, 0x2, 0x0, 0x1d
+// lwzx r0, r12, r0
+// mtctr r0
+// bctr
+// <jump_table_addr>
+
+// Relative bytes (no rlwinm) general skeleton:
+// cmplwi crN, rX, <limit>
+// bgt crN, default
+// lis r12, <jump_table_addr-hi>
+// addi r12, r12, <jump_table_addr-lo>
+// lbzx r0, r12, rX
+// slwi r0, r0, 0x2
+// lis r12, <start_of_the_cases-hi>
+// nop
+// addi r12, r12, <start_of_the_cases-lo>
+// add r12, r12, r0
+// mtctr r12
+// bctr
+// <start_of_the_cases>
+// ...
+// <default>
+
+// Relative bytes (no rlwinm) alternate skeleton:
+// cmplwi crN, rX, <limit>
+// bgt crN, default
+// lis r12, <jump_table_addr-hi>
+// addi r12, r12, <jump_table_addr-lo>
+// lbzx r0, r12, rX
+// lis r12, <start_of_the_cases-hi>
+// addi r12, r12, <start_of_the_cases-lo>
+// add r12, r12, r0
+// mtctr r12
+// nop
+// nop
+// bctr
+// <start_of_the_cases>
+// ...
+// <default>
+
+// Relative bytes (rlwinm after lbzx) skeleton:
+// cmplwi crN, rX, <limit>
+// bgt crN, default
+// lis r12, <jump_table_addr-hi>
+// addi r12, r12, <jump_table_addr-lo>
+// lbzx r0, r12, rX
+// rlwinm r0, r0, 0x2, 0x0, 0x1d
+// lis r12, <start_of_the_cases-hi>
+// nop
+// addi r12, r12, <start_of_the_cases-lo>
+// add r12, r12, r0
+// mtctr r12
+// bctr
+// <start_of_the_cases>
+// ...
+// <default>
+
+// Relative shorts (rlwinm before lhzx) skeleton:
+// cmplwi crN, rX, <limit>
+// bgt crN, default
+// lis r12, <jump_table_addr-hi>
+// addi r12, r12, <jump_table_addr-lo>
+// rlwinm r0, rX, 0x1, 0x0, 0x1e
+// lhzx r0, r12, r0
+// lis r12, <start_of_the_cases-hi>
+// addi r12, r12, <start_of_the_cases-lo>
+// add r12, r12, r0
+// mtctr r12
+// nop
+// bctr
+// <start_of_the_cases>
+// ...
+// <default>
+
 #[test]
 fn test_jump_table_absolute_1() -> Result<()> {
     let test_cfg: Vec<TestConfig> =
@@ -166,10 +247,9 @@ fn test_jump_table_absolute_1() -> Result<()> {
     let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x820869fc));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
-    // we should also have a lotta basic blocks
     assert!(func.slices.is_some());
     let slices = func.slices.as_ref().unwrap();
-    assert!(slices.blocks.len() > 5); // idk the exact number but i know it's more than 5
+    assert_eq!(slices.blocks.len(), 12);
     Ok(())
 }
 
@@ -203,10 +283,9 @@ fn test_jump_table_absolute_2() -> Result<()> {
     let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x827f9434));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
-    // we should also have a lotta basic blocks
     assert!(func.slices.is_some());
     let slices = func.slices.as_ref().unwrap();
-    assert!(slices.blocks.len() > 5); // idk the exact number but i know it's more than 5
+    assert_eq!(slices.blocks.len(), 12);
     Ok(())
 }
 
@@ -232,9 +311,8 @@ fn test_jump_table_absolute_3() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // Trailing bytes (0x64) are unreachable: the code at the tail starts with lfs (float load)
-    // and has no backward branches to the main body. Only discoverable via .pdata context.
-    assert_eq!(func.end, Some(SectionAddress::new(0, 0x82FBB4B8)));
+    // does the detected function end match our expected end?
+    assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
     assert_eq!(state.jump_tables.len(), 1);
@@ -242,10 +320,9 @@ fn test_jump_table_absolute_3() -> Result<()> {
     let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x82fbb464));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
-    // we should also have a lotta basic blocks
     assert!(func.slices.is_some());
     let slices = func.slices.as_ref().unwrap();
-    assert!(slices.blocks.len() > 5);
+    assert_eq!(slices.blocks.len(), 11);
     Ok(())
 }
 
@@ -280,7 +357,9 @@ fn test_jump_table_relative_bytes_1() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 105);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 50);
     Ok(())
 }
 
@@ -315,7 +394,9 @@ fn test_jump_table_relative_bytes_2() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x1c);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 55);
     Ok(())
 }
 
@@ -350,7 +431,9 @@ fn test_jump_table_relative_bytes_3() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 11);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 58);
     Ok(())
 }
 
@@ -385,7 +468,9 @@ fn test_jump_table_relative_bytes_4() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 12);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 71);
     Ok(())
 }
 
@@ -411,9 +496,8 @@ fn test_jump_table_relative_bytes_5() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // Trailing bytes (0x28) are unreachable: starts with subi r31, r12, XXXX (unwind helper)
-    // with no backward branches to the main body. Only discoverable via .pdata context.
-    assert_eq!(func.end, Some(SectionAddress::new(1, 0x82317C50)));
+    // does the detected function end match our expected end?
+    assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
     assert_eq!(state.jump_tables.len(), 1);
@@ -421,6 +505,9 @@ fn test_jump_table_relative_bytes_5() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 12);
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 76);
     Ok(())
 }
 
@@ -455,7 +542,9 @@ fn test_jump_table_relative_bytes_6() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 10);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 55);
     Ok(())
 }
 
@@ -481,9 +570,8 @@ fn test_jump_table_relative_bytes_7() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // Trailing bytes (0x80) are unreachable: starts with mfspr r12, LR (own prologue)
-    // — a separate function or exception handler within the .pdata range.
-    assert_eq!(func.end, Some(SectionAddress::new(1, 0x82592F50)));
+    // does the detected function end match our expected end?
+    assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
     assert_eq!(state.jump_tables.len(), 1);
@@ -491,6 +579,9 @@ fn test_jump_table_relative_bytes_7() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x15);
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 43);
     Ok(())
 }
 
@@ -530,7 +621,9 @@ fn test_jump_table_relative_shorts_1() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 28);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 57);
     Ok(())
 }
 
@@ -566,6 +659,9 @@ fn test_jump_table_relative_shorts_2() -> Result<()> {
     assert!(jump_table_entry.is_some());
     // 94 bytes = 47 entries (cmplwi r28, 46 → 0..46 inclusive)
     assert_eq!(*jump_table_entry.unwrap(), 94);
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 100);
     Ok(())
 }
 
@@ -600,7 +696,9 @@ fn test_jump_table_relative_shorts_3() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 128);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 134);
     Ok(())
 }
 
@@ -626,9 +724,8 @@ fn test_jump_table_relative_shorts_4() -> Result<()> {
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
-    // Trailing bytes (0x68) are unreachable: starts with mfspr r12, LR (own prologue)
-    // — a separate function or exception handler within the .pdata range.
-    assert_eq!(func.end, Some(SectionAddress::new(1, 0x823F7C90)));
+    // does the detected function end match our expected end?
+    assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
     assert_eq!(state.jump_tables.is_empty(), false);
     assert_eq!(state.jump_tables.len(), 1);
@@ -636,6 +733,9 @@ fn test_jump_table_relative_shorts_4() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 172);
     Ok(())
 }
 
@@ -670,7 +770,9 @@ fn test_jump_table_relative_shorts_5() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 20);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 201);
     Ok(())
 }
 
@@ -705,7 +807,9 @@ fn test_jump_table_relative_shorts_6() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x38);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 92);
     Ok(())
 }
 
@@ -740,7 +844,9 @@ fn test_jump_table_relative_shorts_7() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 60);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 99);
     Ok(())
 }
 
@@ -775,7 +881,9 @@ fn test_jump_table_relative_shorts_8() -> Result<()> {
         state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 20);
-    // TODO: verify basic block count
+    assert!(func.slices.is_some());
+    let slices = func.slices.as_ref().unwrap();
+    assert_eq!(slices.blocks.len(), 135);
     Ok(())
 }
 
@@ -812,9 +920,8 @@ fn test_jump_table_absolute_stack_meme() -> Result<()> {
     let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x82185be8));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x5A4);
-    // we should also have a lotta basic blocks
     assert!(func.slices.is_some());
     let slices = func.slices.as_ref().unwrap();
-    assert!(slices.blocks.len() > 5); // idk the exact number but i know it's more than 5
+    assert_eq!(slices.blocks.len(), 189);
     Ok(())
 }

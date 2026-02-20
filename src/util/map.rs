@@ -946,6 +946,7 @@ pub fn create_obj(result: &MapInfo) -> Result<ObjInfo> {
         pdata_funcs: Default::default(),
         module_id: 0,
         unresolved_relocations: vec![],
+        comdat_symbols: Default::default(),
     };
 
     // If every symbol the map has alignment 4, it's likely bogus
