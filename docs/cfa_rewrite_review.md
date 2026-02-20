@@ -228,8 +228,7 @@ Validation run:
 
 - Branch: `cfa_fix`
 - Version: `1.9.2`
-- Commit head: `161dd81` (`Bump project version to 1.9.2`)
-- Working tree: clean after validation
+- Working tree: Phase A/B follow-up in progress (`util/obj` warning triage + shared negative fixtures)
 - Dev branch delta: only one version-bump commit (`1.9.1`) remains on `dev`, superseded by `1.9.2` here
 
 Current observed test state on this branch:
@@ -237,8 +236,37 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 2 passed
+- `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
 
 Open technical debt (non-blocking for this branch state):
 
-- Existing compiler warnings outside CFA modules (`src/util/*`, `src/obj/*`)
 - Legacy VM pattern-specific hacks still present, though now partially insulated by stack-slot provenance and new regression tests
+
+## 2026-02-20 Phase A/B Follow-Up (Robustness Execution Loop)
+
+- **Phase A complete**: triaged warning backlog in `src/util/*` and `src/obj/*`.
+  - Removed stale imports/variables and unreachable warning sites.
+  - Added targeted `#[allow(dead_code)]` markers for intentionally retained split helpers in `src/util/split.rs`.
+  - Result: `cargo check --tests --message-format short` reduced from 39 warnings to 4 (remaining warnings are in `src/analysis/*` only).
+
+- **DC3 split stability check complete**:
+  - Rebuilt release `dtk` and ran:
+    - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke2`
+  - Result: split completed successfully (`exit=0`), confirming split pipeline is operational for `dc3-decomp`.
+
+- **Phase B complete**: added shared negative jump-table fixtures and unit coverage.
+  - New asset: `assets/tests/jump_table_negative_snippets.txt`
+  - New test: `analysis::tests::test_negative_jump_table_fixtures_are_rejected`
+  - Coverage includes:
+    - absolute single-entry non-corroborated candidate,
+    - absolute `.rdata` data-array candidate,
+    - relative-bytes unaligned candidate,
+    - relative-shorts out-of-bounds candidate.
+
+### Next Phase Queue
+
+1. **Phase E (docs consolidation + rewrite readiness)**:
+   - Keep this review doc and `docs/cfa_test_fixes.md` synchronized with test/validation outcomes.
+   - Maintain per-phase commit traceability (`implementation + docs` in the same commit).
+2. **Rewrite kickoff (after robustness phases)**:
+   - Start B7/B8 RFC workstreams (VM rewrite spike + CFA pipeline rewrite shadow plan) with explicit parity/rollback gates.

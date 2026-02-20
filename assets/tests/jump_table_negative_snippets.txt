@@ -1,0 +1,5 @@
+# name|type|table_section|table_addr|from_addr|function_start|function_end|relative_base|entries
+abs_single_text_no_corroborator|absolute|text|0x80000040|0x80000010|0x80000000|0x80000100|-|80000020 00000000
+abs_rdata_targets_non_code|absolute|rdata|0x82000040|0x80000080|0x80000000|0x80000100|-|82000080 82000084 00000000
+relbytes_unaligned_targets|relative_bytes|rdata|0x82000050|0x80000080|0x80000000|0x80000100|0x80000000|11 22 00
+relshorts_outside_function|relative_shorts|rdata|0x82000060|0x80000080|0x80000000|0x80000100|0x80000000|0300 0310 0000

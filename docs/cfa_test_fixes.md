@@ -43,9 +43,16 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (2/2)
-- Worktree state after validation: clean
+  - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
+- Shared negative fixture asset:
+  - `assets/tests/jump_table_negative_snippets.txt`
 
-Primary remaining follow-up is cleanup of unrelated compiler warnings; CFA robustness work targeted here is stable and covered by regression tests.
+Follow-up status:
+
+- `src/util/*` + `src/obj/*` warning backlog has been triaged and reduced.
+- `dc3-decomp` split smoke validation with local release `dtk` succeeded:
+  - `~/code/milohax/jeff/target/release/dtk xex split config/373307D9/config.yml /tmp/dc3-split-smoke2` -> `exit=0`
+- Next track is rewrite-readiness documentation and RFC kickoff (B7/B8) with parity and rollback gates.
 
 ## Background: How CFA Detects Jump Tables
 

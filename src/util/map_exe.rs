@@ -1,22 +1,18 @@
 use std::{
-    collections::{btree_map, BTreeMap, BTreeSet, HashMap},
+    collections::{btree_map, BTreeMap, HashMap},
     fs::read_to_string,
-    str::SplitWhitespace,
 };
 
 use anyhow::{bail, Result};
-use indexmap::IndexMap;
-use itertools::Itertools;
 use multimap::MultiMap;
-use typed_path::{Utf8NativePath, Utf8NativePathBuf};
+use typed_path::Utf8NativePathBuf;
 
 use crate::{
     analysis::cfa::SectionAddress,
     obj::{
-        ObjInfo, ObjReloc, ObjSection, ObjSectionKind, ObjSplit, ObjSymbol, ObjSymbolFlagSet,
-        ObjSymbolFlags, ObjSymbolKind, ObjUnit,
+        ObjInfo, ObjSectionKind, ObjSplit, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags,
+        ObjSymbolKind, ObjUnit,
     },
-    util::map::{MapInfo, SectionInfo, SymbolEntry, SymbolRef},
 };
 
 // SymbolRef: the symbol name, and the obj it came from
@@ -204,9 +200,9 @@ pub fn is_reg_intrinsic(name: &String) -> bool {
         && (name.contains("gpr") || name.contains("fpr") || name.contains("vmx"))
 }
 
-pub fn apply_map_exe(mut result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
+pub fn apply_map_exe(result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
     // apply map symbols to ObjInfo
-    for (idx, entries) in result.section_symbols.iter().enumerate() {
+    for entries in &result.section_symbols {
         for sym in entries {
             // we want to skip imps and save/restore reg intrinsics, since we'll find those ourselves later
             if !sym.symbol.contains("__imp_")
@@ -215,7 +211,6 @@ pub fn apply_map_exe(mut result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
             {
                 match obj.sections.at_address(sym.addr) {
                     Ok((sec_idx, sec)) => {
-                        let mut sym_to_add: ObjSymbol = ObjSymbol::default();
                         let sym_name = if result.merged_addrs.contains(&sym.addr) {
                             format!("merged_{:08X}", sym.addr)
                         } else {
@@ -223,8 +218,8 @@ pub fn apply_map_exe(mut result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
                         };
                         // if func came from pdata, DO NOT override the size
                         let the_sec_addr = SectionAddress::new(sec_idx, sym.addr);
-                        if obj.pdata_funcs.contains(&the_sec_addr) {
-                            sym_to_add = ObjSymbol {
+                        let sym_to_add = if obj.pdata_funcs.contains(&the_sec_addr) {
+                            ObjSymbol {
                                 name: sym_name,
                                 address: sym.addr as u64,
                                 section: Some(sec_idx),
@@ -241,9 +236,9 @@ pub fn apply_map_exe(mut result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
                                     ObjSymbolKind::Object
                                 },
                                 ..Default::default()
-                            };
+                            }
                         } else {
-                            sym_to_add = ObjSymbol {
+                            ObjSymbol {
                                 name: sym_name,
                                 address: sym.addr as u64,
                                 section: Some(sec_idx),
@@ -259,19 +254,19 @@ pub fn apply_map_exe(mut result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
                                     ObjSymbolKind::Object
                                 },
                                 ..Default::default()
-                            };
-                        }
+                            }
+                        };
                         obj.add_symbol(sym_to_add, true)?;
                     }
                     // if we couldn't find the section (like maybe it was stripped), just continue on
-                    Err(e) => continue,
+                    Err(_) => continue,
                 };
             }
         }
     }
 
     fn fix_split_name(orig_name: String) -> String {
-        let mut ret = orig_name.replace(":", "/");
+        let ret = orig_name.replace(":", "/");
         if orig_name.contains(".obj") {
             ret.replace(".obj", ".cpp")
         }
@@ -290,9 +285,9 @@ pub fn apply_map_exe(mut result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
         }
 
         let section_name = result.sections[idx].name.clone();
-        let (target_sec_idx, target_sec) = match obj.sections.at_address_mut(entries[0].addr) {
-            Ok((target_sec_idx, target_sec)) => (target_sec_idx, target_sec),
-            Err(e) => continue,
+        let target_sec = match obj.sections.at_address_mut(entries[0].addr) {
+            Ok((_, target_sec)) => target_sec,
+            Err(_) => continue,
         };
         let section_start = target_sec.address as u32 + result.sections[idx].offset;
         let section_end = section_start + result.sections[idx].size;

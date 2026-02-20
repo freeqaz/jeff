@@ -639,6 +639,7 @@ mod tests {
     use crate::obj::{
         ObjArchitecture, ObjInfo, ObjKind, ObjRelocations, ObjSection, ObjSectionKind, ObjSplits,
     };
+    use anyhow::{bail, Context, Result};
     use std::num::NonZeroU32;
 
     fn make_test_section(
@@ -988,5 +989,177 @@ mod tests {
         assert!(entries.contains(&SectionAddress::new(0, 0x80000010)));
         assert!(entries.contains(&SectionAddress::new(0, 0x80000020)));
         assert!(entries.contains(&SectionAddress::new(0, 0x80000030)));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FixtureJumpType {
+        Absolute,
+        RelativeBytes,
+        RelativeShorts,
+    }
+
+    #[derive(Debug)]
+    struct NegativeJumpTableFixture {
+        name: String,
+        jump_type: FixtureJumpType,
+        table_section: ObjSectionKind,
+        table_addr: u32,
+        from_addr: u32,
+        function_start: u32,
+        function_end: u32,
+        relative_base: Option<u32>,
+        table_data: Vec<u8>,
+    }
+
+    fn parse_hex_u32(token: &str) -> Result<u32> {
+        let token = token.trim_start_matches("0x");
+        Ok(u32::from_str_radix(token, 16)?)
+    }
+
+    fn parse_hex_u16(token: &str) -> Result<u16> {
+        let token = token.trim_start_matches("0x");
+        Ok(u16::from_str_radix(token, 16)?)
+    }
+
+    fn parse_hex_u8(token: &str) -> Result<u8> {
+        let token = token.trim_start_matches("0x");
+        Ok(u8::from_str_radix(token, 16)?)
+    }
+
+    fn parse_negative_fixture(line: &str) -> Result<NegativeJumpTableFixture> {
+        let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+        if parts.len() != 9 {
+            bail!("Expected 9 columns, found {}", parts.len());
+        }
+        let jump_type = match parts[1] {
+            "absolute" => FixtureJumpType::Absolute,
+            "relative_bytes" => FixtureJumpType::RelativeBytes,
+            "relative_shorts" => FixtureJumpType::RelativeShorts,
+            other => bail!("Unknown fixture jump type '{other}'"),
+        };
+        let table_section = match parts[2] {
+            "text" => ObjSectionKind::Code,
+            "rdata" => ObjSectionKind::ReadOnlyData,
+            other => bail!("Unknown fixture table section '{other}'"),
+        };
+        let table_addr = parse_hex_u32(parts[3])?;
+        let from_addr = parse_hex_u32(parts[4])?;
+        let function_start = parse_hex_u32(parts[5])?;
+        let function_end = parse_hex_u32(parts[6])?;
+        let relative_base = if parts[7] == "-" { None } else { Some(parse_hex_u32(parts[7])?) };
+
+        let mut table_data = Vec::new();
+        for token in parts[8].split_whitespace() {
+            match jump_type {
+                FixtureJumpType::Absolute => {
+                    table_data.extend_from_slice(&parse_hex_u32(token)?.to_be_bytes());
+                }
+                FixtureJumpType::RelativeBytes => table_data.push(parse_hex_u8(token)?),
+                FixtureJumpType::RelativeShorts => {
+                    table_data.extend_from_slice(&parse_hex_u16(token)?.to_be_bytes());
+                }
+            }
+        }
+
+        Ok(NegativeJumpTableFixture {
+            name: parts[0].to_string(),
+            jump_type,
+            table_section,
+            table_addr,
+            from_addr,
+            function_start,
+            function_end,
+            relative_base,
+            table_data,
+        })
+    }
+
+    fn load_negative_jump_table_fixtures() -> Result<Vec<NegativeJumpTableFixture>> {
+        let content = std::fs::read_to_string("assets/tests/jump_table_negative_snippets.txt")
+            .context("Failed to read negative jump-table fixture file")?;
+        let mut fixtures = Vec::new();
+        for (line_no, raw_line) in content.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fixture = parse_negative_fixture(line).with_context(|| {
+                format!("Failed to parse negative jump-table fixture line {}", line_no + 1)
+            })?;
+            fixtures.push(fixture);
+        }
+        Ok(fixtures)
+    }
+
+    #[test]
+    fn test_negative_jump_table_fixtures_are_rejected() {
+        let fixtures = load_negative_jump_table_fixtures().expect("Failed to load fixtures");
+        assert!(
+            !fixtures.is_empty(),
+            "Expected at least one negative jump-table fixture"
+        );
+
+        for fixture in fixtures {
+            let mut text_data = vec![0u8; 0x800];
+            let mut rdata_data = vec![0u8; 0x800];
+            match fixture.table_section {
+                ObjSectionKind::Code => {
+                    let offset = (fixture.table_addr - 0x8000_0000) as usize;
+                    let end = offset + fixture.table_data.len();
+                    text_data[offset..end].copy_from_slice(&fixture.table_data);
+                }
+                ObjSectionKind::ReadOnlyData => {
+                    let offset = (fixture.table_addr - 0x8200_0000) as usize;
+                    let end = offset + fixture.table_data.len();
+                    rdata_data[offset..end].copy_from_slice(&fixture.table_data);
+                }
+                _ => unreachable!(),
+            }
+
+            let text_section = make_test_section(".text", ObjSectionKind::Code, 0x8000_0000, text_data);
+            let rdata_section =
+                make_test_section(".rdata", ObjSectionKind::ReadOnlyData, 0x8200_0000, rdata_data);
+            let obj = make_test_obj(vec![text_section, rdata_section]);
+
+            let jump_table_type = match fixture.jump_type {
+                FixtureJumpType::Absolute => JumpTableType::Absolute,
+                FixtureJumpType::RelativeBytes => {
+                    JumpTableType::RelativeBytes(fixture.relative_base.map(|addr| {
+                        RelocationTarget::Address(SectionAddress::new(0, addr))
+                    }))
+                }
+                FixtureJumpType::RelativeShorts => {
+                    JumpTableType::RelativeShorts(fixture.relative_base.map(|addr| {
+                        RelocationTarget::Address(SectionAddress::new(0, addr))
+                    }))
+                }
+            };
+
+            let (entries, size) = uniq_jump_table_entries(
+                &obj,
+                SectionAddress::new(
+                    if fixture.table_section == ObjSectionKind::Code { 0 } else { 1 },
+                    fixture.table_addr,
+                ),
+                jump_table_type,
+                None,
+                SectionAddress::new(0, fixture.from_addr),
+                SectionAddress::new(0, fixture.function_start),
+                Some(SectionAddress::new(0, fixture.function_end)),
+            )
+            .unwrap_or_else(|e| panic!("fixture '{}' failed with error: {e:#}", fixture.name));
+
+            assert!(
+                entries.is_empty(),
+                "fixture '{}' should be rejected, got {} entries",
+                fixture.name,
+                entries.len()
+            );
+            assert_eq!(
+                size, 0,
+                "fixture '{}' should not consume table bytes when rejected",
+                fixture.name
+            );
+        }
     }
 }
