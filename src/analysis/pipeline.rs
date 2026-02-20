@@ -386,11 +386,25 @@ impl CfaPipelineEngine for LegacyPipelineEngine {
 
 pub struct CandidatePipelineEngine {
     pub state: AnalyzerState,
+    pub config: CandidatePipelineConfig,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub struct CandidatePipelineConfig {
+    /// Candidate-only seed refinement (default-off): drop seeds that are not in code sections.
+    pub strict_code_seeds: bool,
 }
 
 impl CandidatePipelineEngine {
     pub fn new(skip_ranges: BTreeMap<SectionAddress, SectionAddress>) -> Self {
-        Self { state: AnalyzerState::new(skip_ranges) }
+        Self::new_with_config(skip_ranges, CandidatePipelineConfig::default())
+    }
+
+    pub fn new_with_config(
+        skip_ranges: BTreeMap<SectionAddress, SectionAddress>,
+        config: CandidatePipelineConfig,
+    ) -> Self {
+        Self { state: AnalyzerState::new(skip_ranges), config }
     }
 
     fn candidate_seed_discovery(&mut self, obj: &ObjInfo) -> Vec<FunctionSeed> {
@@ -430,12 +444,26 @@ impl CandidatePipelineEngine {
             self.state.functions.entry(section_start).or_default();
         }
 
-        self.state
+        let seeds = self
+            .state
             .functions
             .keys()
             .copied()
             .map(|address| FunctionSeed { address, source: classify_seed_source(obj, address) })
-            .collect()
+            .filter(|seed| {
+                if !self.config.strict_code_seeds {
+                    return true;
+                }
+                matches!(
+                    obj.sections.get(seed.address.section),
+                    Some(section)
+                        if section.kind == ObjSectionKind::Code
+                            && section.contains(seed.address.address)
+                )
+            })
+            .collect();
+
+        seeds
     }
 
     fn candidate_slice_exploration(
@@ -556,7 +584,7 @@ mod tests {
     use serde::{de::Error, Deserialize, Deserializer};
 
     use super::*;
-    use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection};
+    use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSymbol, ObjSymbolKind};
 
     const NOP: u32 = 0x60000000;
     const BLR: u32 = 0x4E800020;
@@ -888,6 +916,66 @@ mod tests {
         assert_eq!(
             candidate_functions, legacy_functions,
             "candidate seed phase should materialize the same initial function map"
+        );
+    }
+
+    #[test]
+    fn candidate_seed_phase_strict_code_filter_drops_non_code_function_symbol() {
+        let code = make_code_section_bytes(0x1000, &[0x60, 0x00, 0x00, 0x00, 0x4E, 0x80, 0x00, 0x20]);
+        let data = make_data_section_bytes(0x2000, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "candidate-seed-filter-test".into(),
+            vec![],
+            vec![data, code],
+        );
+        obj.add_symbol(
+            ObjSymbol {
+                name: "bad_data_function".into(),
+                address: 0x2000,
+                section: Some(0),
+                size: 4,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("should add non-code function symbol for filter test");
+
+        let mut default_candidate = CandidatePipelineEngine::new(BTreeMap::new());
+        let default_seed = default_candidate
+            .phase_seed_discovery(&obj)
+            .expect("default candidate seed should succeed");
+        assert!(
+            default_seed
+                .seeds
+                .iter()
+                .any(|seed| seed.address == SectionAddress::new(0, 0x2000)),
+            "default candidate mode should still include non-code symbol seed for parity"
+        );
+
+        let mut strict_candidate = CandidatePipelineEngine::new_with_config(
+            BTreeMap::new(),
+            CandidatePipelineConfig { strict_code_seeds: true },
+        );
+        let strict_seed = strict_candidate
+            .phase_seed_discovery(&obj)
+            .expect("strict candidate seed should succeed");
+        assert!(
+            !strict_seed
+                .seeds
+                .iter()
+                .any(|seed| seed.address == SectionAddress::new(0, 0x2000)),
+            "strict code-seed mode should drop non-code function symbol seeds"
+        );
+        assert!(
+            strict_seed
+                .seeds
+                .iter()
+                .any(|seed| seed.address == SectionAddress::new(1, 0x1000)),
+            "strict code-seed mode should preserve valid code section seeds"
         );
     }
 

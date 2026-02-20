@@ -4,7 +4,7 @@
 
 - Date: 2026-02-20
 - Owner: `cfa_fix`
-- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete, S2b runtime shadow routing active, S2c candidate seed/slice/finalization divergence active
+- Phase: S1 complete, S2 corpus-gated parity active, S2a checkpoint-diff prep complete, S2b runtime shadow routing active, S2c candidate seed/slice/finalization divergence active, S2d gated heuristic hook active
 - Initial scaffold: `src/analysis/pipeline.rs`
 
 Current implementation snapshot:
@@ -13,6 +13,8 @@ Current implementation snapshot:
 - Candidate seed phase is now implemented directly in `CandidatePipelineEngine`.
 - Candidate slice phase is now implemented directly in `CandidatePipelineEngine`.
 - Candidate finalization phase is now implemented directly in `CandidatePipelineEngine`.
+- Candidate config hook now exists (`CandidatePipelineConfig::strict_code_seeds`) for
+  default-off seed refinement experiments.
 - `analysis::pipeline` now exposes phase outputs and a run report model.
 - Digest comparison now includes categorized diff entries and summary counters.
 - Full CFA fixture shadow parity gate is active with zero-diff totals and per-fixture reporting.

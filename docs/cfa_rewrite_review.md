@@ -414,6 +414,16 @@ Open technical debt (non-blocking for this branch state):
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-finalization-<timestamp>`
     - Result: `rc=0`, `4448` files, `2223` `.obj`.
 
+- **Phase E1e complete (R6 gated heuristic hook)**: candidate seed refinement gate introduced.
+  - Added `CandidatePipelineConfig { strict_code_seeds }` (default `false`).
+  - Candidate seed phase now supports strict mode that drops seeds not in code sections.
+  - Added regression:
+    - `analysis::pipeline::tests::candidate_seed_phase_strict_code_filter_drops_non_code_function_symbol`
+  - Default behavior remains parity-preserving (strict mode off in runtime path).
+  - Real-XEX smoke with both shadow gates remains stable after hook addition:
+    - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-strictseed-<timestamp>`
+    - Result: `rc=0`, `4448` files, `2223` `.obj`.
+
 - **Phase E validation complete**: real-XEX parity smoke on external corpora.
   - Built release `dtk` from current branch and ran real DC3 split flow to `/tmp`:
     - `dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-<timestamp>`

@@ -101,6 +101,7 @@ Follow-up status:
     - Added parity test:
       - `analysis::pipeline::tests::candidate_pipeline_run_matches_legacy_pipeline_digest`
       - `analysis::pipeline::tests::candidate_seed_phase_matches_legacy_seed_phase`
+      - `analysis::pipeline::tests::candidate_seed_phase_strict_code_filter_drops_non_code_function_symbol`
       - `analysis::pipeline::tests::candidate_slice_phase_matches_legacy_slice_phase`
       - `analysis::pipeline::tests::candidate_finalization_phase_matches_legacy_finalization_phase`
     - Runtime env-gated smoke:
