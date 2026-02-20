@@ -427,6 +427,12 @@ Open technical debt (non-blocking for this branch state):
     - `DTK_CFA_ENABLE_PIPELINE_SHADOW=1 DTK_CFA_ENABLE_VM2_SHADOW=1 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1 DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=8 DTK_CFA_VM_SHADOW_MAX_STEPS=64 dtk xex split config/373307D9/config.yml /tmp/jeff-parity-dc3-digeststate-<timestamp>`
     - Result: `rc=0`, `4448` files, `2223` `.obj`, no non-trivial diffs vs strict-symbol baseline.
 
+- **Phase E2g complete (R7 fallback summary logging)**: fallback logs now include categorized summaries.
+  - CFA fallback path now logs:
+    - phase checkpoint summary counts (`seed_count`, `processed_seed_count`, `function_count`, `jump_table_count`)
+    - pipeline digest summary counts (`function_presence`, `function_end`, `function_state`, `jump_table_presence`, `jump_table_size`)
+  - Existing bounded per-entry logging remains unchanged for deep triage.
+
 - **Phase E1 complete (R6 kickoff)**: explicit candidate pipeline lane created.
   - Added `analysis::pipeline::CandidatePipelineEngine` as a separate engine type.
   - Runtime shadow now compares `LegacyPipelineEngine` vs `CandidatePipelineEngine`.

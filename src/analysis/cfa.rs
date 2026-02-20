@@ -17,7 +17,8 @@ use crate::{
         pipeline::{
             compare_phase_checkpoints, phase_checkpoint_diff_entries, CandidatePipelineConfig,
             CandidatePipelineEngine, CfaPipelineEngine, LegacyPipelineEngine,
-            PhaseCheckpointDiffEntry, PipelineDiffEntry,
+            PhaseCheckpointDiffEntry, PhaseCheckpointDiffSummary, PipelineDiffEntry,
+            PipelineDiffSummary,
         },
         slices::{FunctionSlices, TailCallResult},
         vm::{BranchTarget, GprValue, StepResult, VM},
@@ -197,6 +198,19 @@ fn log_phase_checkpoint_delta_entries(entries: &[PhaseCheckpointDiffEntry]) {
     }
 }
 
+fn log_phase_checkpoint_delta_summary(summary: &PhaseCheckpointDiffSummary) {
+    if summary.total() == 0 {
+        return;
+    }
+    log::warn!(
+        "Phase checkpoint delta summary: seed_count={} processed_seed_count={} function_count={} jump_table_count={}",
+        summary.seed_count,
+        summary.processed_seed_count,
+        summary.function_count,
+        summary.jump_table_count
+    );
+}
+
 fn log_pipeline_digest_delta_entries(entries: &[PipelineDiffEntry]) {
     if entries.is_empty() {
         return;
@@ -212,6 +226,20 @@ fn log_pipeline_digest_delta_entries(entries: &[PipelineDiffEntry]) {
             entry.right
         );
     }
+}
+
+fn log_pipeline_digest_delta_summary(summary: &PipelineDiffSummary) {
+    if summary.total() == 0 {
+        return;
+    }
+    log::warn!(
+        "Pipeline digest delta summary: function_presence={} function_end={} function_state={} jump_table_presence={} jump_table_size={}",
+        summary.function_presence,
+        summary.function_end,
+        summary.function_state,
+        summary.jump_table_presence,
+        summary.jump_table_size
+    );
 }
 
 fn log_vm_runtime_shadow_function_entries(report: &VmRuntimeShadowReport) {
@@ -713,6 +741,7 @@ impl AnalyzerState {
         let phase_checkpoint_entries = phase_checkpoint_diff_entries(&legacy_report, &candidate_report);
         let phase_checkpoint_deltas = phase_checkpoint_summary.total();
         let digest_entries = legacy_digest.diff_entries(&candidate_digest);
+        let digest_summary = legacy_digest.diff_summary(&candidate_digest);
         let digest_deltas = digest_entries.len();
 
         let mut decision = evaluate_candidate_shadow_decision(
@@ -737,6 +766,8 @@ impl AnalyzerState {
             if let Some(vm_shadow_report) = vm_shadow_report.as_ref() {
                 log_vm_runtime_shadow_function_entries(vm_shadow_report);
             }
+            log_phase_checkpoint_delta_summary(&phase_checkpoint_summary);
+            log_pipeline_digest_delta_summary(&digest_summary);
             log_phase_checkpoint_delta_entries(&phase_checkpoint_entries);
             log_pipeline_digest_delta_entries(&digest_entries);
             *self = legacy_pipeline.state;
