@@ -600,6 +600,12 @@ Open technical debt (non-blocking for this branch state):
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
       - `/home/free/code/milohax/milo-executable-library/dc1/TU0/default.xex`
       - `/home/free/code/milohax/milo-executable-library/gh2/360 TU0 Strum Limit Fix/default.xex`
+    - Revalidated on current branch tip (`r19`) with debug `dtk`:
+      - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
+      - `/home/free/code/milohax/milo-executable-library/dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
+      - `/home/free/code/milohax/milo-executable-library/dc1/TU0/default.xex`
+      - `/home/free/code/milohax/milo-executable-library/gh2/360 TU0 Strum Limit Fix/default.xex`
+      - all `xex info` calls returned `status=0`.
 
 #### Useful XEX Links (Local Workspace)
 
