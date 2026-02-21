@@ -282,7 +282,7 @@ Current observed test state on this branch:
 - `cargo test cfa_tests` -> 20 passed
 - `cargo test analysis::slices::tests::tail_call` -> 3 passed
 - `cargo test analysis::vm::tests::` -> 3 passed
-- `cargo test analysis::vm2::tests::` -> 23 passed
+- `cargo test analysis::vm2::tests::` -> 24 passed
 - `cargo test test_negative_jump_table_fixtures_are_rejected` -> 1 passed
 - `cargo test analysis::pipeline::tests::` -> 15 passed
 - `cargo test util::xex::tests::` -> 5 passed
@@ -444,7 +444,7 @@ Open technical debt (non-blocking for this branch state):
     `Top`/`Range`/`IndexedLoad`/`CompareTag` classes.
   - Added regressions:
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
-    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_bridges_or_register_copy`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_or_register_copy`
 
 - **Phase E2i complete (R7 runtime opcode telemetry)**: VM shadow reporting now tracks native-vs-bridged opcode coverage.
   - `VmRuntimeShadowReport` and `VmRuntimeShadowFunctionReport` now include:

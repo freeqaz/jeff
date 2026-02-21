@@ -45,7 +45,7 @@ New regression coverage includes:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
   - `cargo test analysis::vm::tests::` (3/3)
-  - `cargo test analysis::vm2::tests::` (23/23)
+- `cargo test analysis::vm2::tests::` (24/24)
   - `cargo test test_negative_jump_table_fixtures_are_rejected` (1/1)
   - `cargo test analysis::pipeline::tests::` (15/15)
   - `cargo test util::xex::tests::` (5/5)
