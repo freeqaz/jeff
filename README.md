@@ -15,8 +15,9 @@
 **Jump table analysis improvements** — Support for absolute jump tables in `.rdata` sections, fixes for jump table bounds inflation when the VM over-estimates table size, and crash fixes for edge cases in the jump table VM.
 
 **CFA cutover workflow scripts** — Added repeatable DC3 parity/cutover checks:
-- `scripts/dc3_cfa_parity_smoke.sh`: baseline/shadow/candidate split parity with optional strict candidate flags.
-- `scripts/cfa_cutover_gate.sh`: consolidated `cfa_tests` gates plus default/strict DC3 parity runs.
+- `scripts/dc3_cfa_parity_smoke.sh`: baseline/shadow/candidate split parity with optional strict candidate flags and optional shadow VM telemetry thresholds.
+- `scripts/cfa_cutover_gate.sh`: consolidated legacy/default/native-VM2/candidate-strict `cfa_tests` gates plus default/strict DC3 parity runs.
+- `scripts/xex_info_mode_matrix.sh`: real-XEX parser compatibility matrix across `legacy`/`shadow`/`candidate` modes.
 
 **Upstream sync** — Includes all upstream decomp-toolkit changes through v1.8.0 (DWARF dump improvements, `skip_cfa_ranges` config option, relocation fixes, and more).
 

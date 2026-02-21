@@ -290,6 +290,31 @@ impl Vm2 {
     }
 
     #[inline]
+    fn apply_update_form_base_register(
+        &mut self,
+        obj: &ObjInfo,
+        ins_addr: SectionAddress,
+        ra: u8,
+        simm: i16,
+    ) {
+        let index = ra as usize;
+        let next_value = match self.reg(ra).value.clone() {
+            Value2::Address(target) => Value2::Address(target),
+            Value2::Const(base) => {
+                let addr = (base as u32).wrapping_add_signed(simm as i32);
+                if let Some(target) = section_address_for(obj, ins_addr, addr) {
+                    Value2::Address(target)
+                } else {
+                    Value2::Top
+                }
+            }
+            _ => Value2::Top,
+        };
+        self.gpr[index] = Self::fact_from_value(next_value);
+        self.bump_reg_revision(index);
+    }
+
+    #[inline]
     fn value_as_address(
         obj: &ObjInfo,
         ins_addr: SectionAddress,
@@ -601,16 +626,21 @@ impl Vm2 {
                 true
             }
             // lwz rD, offset(r1): mirror native stack-slot reload when a tracked slot exists.
-            Opcode::Lwz if ins.field_ra() == 1 => {
+            Opcode::Lwz => {
                 let dst = ins.field_rd() as usize;
-                let offset = ins.field_offset() as i16;
-                let Some(mut loaded) = self.read_stack_slot(offset).cloned() else {
-                    return false;
-                };
-                let revision = self.stack_slot_revisions.get(&offset).copied().unwrap_or_default();
-                loaded.provenance = Provenance2::StackSlot { offset, revision };
-                self.gpr[dst] = loaded;
-                self.reg_revisions[dst] = revision.saturating_add(1);
+                if ins.field_ra() == 1 {
+                    let offset = ins.field_offset() as i16;
+                    if let Some(mut loaded) = self.read_stack_slot(offset).cloned() {
+                        let revision =
+                            self.stack_slot_revisions.get(&offset).copied().unwrap_or_default();
+                        loaded.provenance = Provenance2::StackSlot { offset, revision };
+                        self.gpr[dst] = loaded;
+                        self.reg_revisions[dst] = revision.saturating_add(1);
+                        return true;
+                    }
+                }
+                self.gpr[dst] = ValueFact2::top();
+                self.bump_reg_revision(dst);
                 true
             }
             // stw rS, offset(r1): track stack-slot writes natively for provenance continuity.
@@ -637,6 +667,48 @@ impl Vm2 {
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
                 self.bump_reg_revision(dst);
+                true
+            }
+            // lbz rD, offset(rA): treat as generic load (unknown value).
+            Opcode::Lbz => {
+                let dst = ins.field_rd() as usize;
+                self.gpr[dst] = ValueFact2::top();
+                self.bump_reg_revision(dst);
+                true
+            }
+            // lbzu rD, offset(rA): generic load plus update-form base register semantics.
+            Opcode::Lbzu => {
+                let dst = ins.field_rd() as usize;
+                self.gpr[dst] = ValueFact2::top();
+                self.bump_reg_revision(dst);
+                self.apply_update_form_base_register(
+                    obj,
+                    ins_addr,
+                    ins.field_ra(),
+                    ins.field_simm(),
+                );
+                true
+            }
+            // stb rS, offset(rA): no tracked GPR state mutation.
+            Opcode::Stb => true,
+            // stbu rS, offset(rA): update-form base register semantics.
+            Opcode::Stbu => {
+                self.apply_update_form_base_register(
+                    obj,
+                    ins_addr,
+                    ins.field_ra(),
+                    ins.field_simm(),
+                );
+                true
+            }
+            // stwu rS, offset(rA): update-form base register semantics.
+            Opcode::Stwu => {
+                self.apply_update_form_base_register(
+                    obj,
+                    ins_addr,
+                    ins.field_ra(),
+                    ins.field_simm(),
+                );
                 true
             }
             // or rA, rS, rB
@@ -1195,8 +1267,8 @@ mod tests {
 
     #[test]
     fn runtime_vm_shadow_report_native_mode_tracks_native_and_bridged_steps() {
-        // nop -> unsupported lwz -> blr
-        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x8061_0000, 0x4E80_0020]);
+        // nop -> unsupported lwzu -> blr
+        let obj = make_obj_with_words(0x1000, &[0x6000_0000, 0x8461_0000, 0x4E80_0020]);
         let starts = [SectionAddress::new(0, 0x1000)];
         let report = runtime_vm_shadow_report_with_mode(
             &obj,
@@ -1218,10 +1290,51 @@ mod tests {
         );
         assert_eq!(report.native_steps, function_report.native_steps);
         assert_eq!(report.bridged_steps, function_report.bridged_steps);
-        assert_eq!(function_report.bridged_opcode_counts.get("Lwz"), Some(&1));
-        assert_eq!(report.bridged_opcode_counts.get("Lwz"), Some(&1));
+        assert_eq!(function_report.bridged_opcode_counts.get("Lwzu"), Some(&1));
+        assert_eq!(report.bridged_opcode_counts.get("Lwzu"), Some(&1));
         assert!(function_report.native_opcode_counts.get("Ori").is_some());
         assert!(report.native_opcode_counts.get("Ori").is_some());
+        assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_native_mode_handles_generic_load_store_tranche() {
+        // li r3,1
+        // stwu r1,-0x10(r1)
+        // stb r3,0(r1)
+        // lbz r4,0(r1)
+        // lwz r5,4(r1)
+        // blr
+        let obj = make_obj_with_words(
+            0x1000,
+            &[0x3860_0001, 0x9421_FFF0, 0x9861_0000, 0x8881_0000, 0x80A1_0004, 0x4E80_0020],
+        );
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report_with_mode(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+            true,
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 1);
+        assert_eq!(report.function_reports.len(), 1);
+        let function_report = &report.function_reports[0];
+        assert!(
+            function_report.steps_sampled >= 5,
+            "expected generic load/store tranche sequence to be sampled"
+        );
+        assert_eq!(
+            function_report.bridged_steps, 0,
+            "generic lbz/stb/stwu/lwz tranche should now be native"
+        );
+        assert_eq!(report.bridged_steps, 0);
+        assert!(report.bridged_opcode_counts.is_empty());
+        assert!(function_report.bridged_opcode_counts.is_empty());
+        assert!(function_report.native_opcode_counts.get("Lbz").is_some());
+        assert!(function_report.native_opcode_counts.get("Stb").is_some());
+        assert!(function_report.native_opcode_counts.get("Stwu").is_some());
+        assert!(function_report.native_opcode_counts.get("Lwz").is_some());
         assert_eq!(report.total_diffs(), 0);
     }
 

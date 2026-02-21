@@ -11,6 +11,8 @@ RUN_ID="$(date +%Y%m%d-%H%M%S)"
 BUILD_BIN=1
 STRICT_CODE_SEEDS=0
 STRICT_SYMBOL_SIZE=0
+MAX_SHADOW_VM_DIFFS=""
+MAX_SHADOW_BRIDGED_STEPS=""
 
 usage() {
     cat <<'EOF'
@@ -24,6 +26,10 @@ Options:
   --strict-code-seeds Enable `DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1` for shadow/candidate runs
   --strict-symbol-size
                      Enable `DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1` for shadow/candidate runs
+  --max-shadow-vm-diffs <n>
+                     Require shadow run VM telemetry `total_diffs` <= n (reads shadow log)
+  --max-shadow-bridged-steps <n>
+                     Require shadow run VM telemetry `bridged_steps` <= n (reads shadow log)
   -h, --help          Show this help
 
 The script runs:
@@ -63,6 +69,14 @@ while [[ $# -gt 0 ]]; do
         --strict-symbol-size)
             STRICT_SYMBOL_SIZE=1
             shift
+            ;;
+        --max-shadow-vm-diffs)
+            MAX_SHADOW_VM_DIFFS="$2"
+            shift 2
+            ;;
+        --max-shadow-bridged-steps)
+            MAX_SHADOW_BRIDGED_STEPS="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -119,6 +133,11 @@ if [[ $STRICT_SYMBOL_SIZE -eq 1 ]]; then
     SHARED_STRICT_ENV+=(DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1)
 fi
 
+SHADOW_LOG_ENV=()
+if [[ -n "$MAX_SHADOW_VM_DIFFS" || -n "$MAX_SHADOW_BRIDGED_STEPS" ]]; then
+    SHADOW_LOG_ENV+=(RUST_LOG="${RUST_LOG:-debug}")
+fi
+
 echo "[dc3-parity] Running baseline split..."
 BASE_RC=0
 split_cmd "$BASE_DIR" DTK_CFA_PIPELINE_MODE=legacy >"$BASE_LOG" 2>&1 || BASE_RC=$?
@@ -127,6 +146,7 @@ echo "[dc3-parity] Running shadow split..."
 SHADOW_RC=0
 split_cmd \
     "$SHADOW_DIR" \
+    "${SHADOW_LOG_ENV[@]}" \
     DTK_CFA_PIPELINE_MODE=shadow \
     DTK_CFA_ENABLE_PIPELINE_SHADOW=1 \
     DTK_CFA_ENABLE_VM2_SHADOW=1 \
@@ -142,6 +162,7 @@ echo "[dc3-parity] Running candidate split..."
 CAND_RC=0
 split_cmd \
     "$CAND_DIR" \
+    "${SHADOW_LOG_ENV[@]}" \
     DTK_CFA_PIPELINE_MODE=candidate \
     DTK_CFA_ENABLE_PIPELINE_SHADOW=1 \
     DTK_CFA_ENABLE_VM2_SHADOW=1 \
@@ -201,6 +222,19 @@ echo "    baseline: $BASE_LOG"
 echo "    shadow:   $SHADOW_LOG"
 echo "    candidate:$CAND_LOG"
 
+SHADOW_VM_TOTAL_DIFFS=""
+SHADOW_VM_BRIDGED_STEPS=""
+if [[ -n "$MAX_SHADOW_VM_DIFFS" || -n "$MAX_SHADOW_BRIDGED_STEPS" ]]; then
+    SHADOW_VM_LINE="$(grep -m1 "VM shadow report:" "$SHADOW_LOG" || true)"
+    if [[ -z "$SHADOW_VM_LINE" ]]; then
+        echo "[dc3-parity] FAIL: requested VM telemetry thresholds but no VM shadow report line was found in $SHADOW_LOG" >&2
+        exit 1
+    fi
+    SHADOW_VM_TOTAL_DIFFS="$(echo "$SHADOW_VM_LINE" | sed -n 's/.*total_diffs=\([0-9][0-9]*\).*/\1/p')"
+    SHADOW_VM_BRIDGED_STEPS="$(echo "$SHADOW_VM_LINE" | sed -n 's/.*bridged_steps=\([0-9][0-9]*\).*/\1/p')"
+    echo "  shadow_vm: total_diffs=$SHADOW_VM_TOTAL_DIFFS bridged_steps=$SHADOW_VM_BRIDGED_STEPS"
+fi
+
 if [[ $BASE_RC -ne 0 || $SHADOW_RC -ne 0 || $CAND_RC -ne 0 ]]; then
     echo "[dc3-parity] FAIL: non-zero split exit status detected." >&2
     exit 1
@@ -208,6 +242,16 @@ fi
 
 if [[ "$DIFF_NONTRIV_BASE_SHADOW" -ne 0 || "$DIFF_NONTRIV_BASE_CAND" -ne 0 ]]; then
     echo "[dc3-parity] FAIL: non-trivial parity diffs detected." >&2
+    exit 1
+fi
+
+if [[ -n "$MAX_SHADOW_VM_DIFFS" ]] && [[ "$SHADOW_VM_TOTAL_DIFFS" -gt "$MAX_SHADOW_VM_DIFFS" ]]; then
+    echo "[dc3-parity] FAIL: shadow VM total_diffs=$SHADOW_VM_TOTAL_DIFFS exceeds limit $MAX_SHADOW_VM_DIFFS" >&2
+    exit 1
+fi
+
+if [[ -n "$MAX_SHADOW_BRIDGED_STEPS" ]] && [[ "$SHADOW_VM_BRIDGED_STEPS" -gt "$MAX_SHADOW_BRIDGED_STEPS" ]]; then
+    echo "[dc3-parity] FAIL: shadow VM bridged_steps=$SHADOW_VM_BRIDGED_STEPS exceeds limit $MAX_SHADOW_BRIDGED_STEPS" >&2
     exit 1
 fi
 

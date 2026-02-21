@@ -458,6 +458,21 @@ Open technical debt (non-blocking for this branch state):
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_or_register_copy`
 
+- **Phase E2j complete (R7 telemetry-driven generic load/store tranche)**: native VM2 now covers high-frequency bridged scalar load/store forms.
+  - Added native VM2 handling for:
+    - `lbz` / `lbzu`
+    - `stb` / `stbu`
+    - `stwu`
+    - generic `lwz` fallback (non-stack-slot path)
+  - Added update-form base register helper to mirror legacy update behavior in native mode.
+  - Updated runtime native tests:
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_tracks_native_and_bridged_steps`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_generic_load_store_tranche`
+  - Real telemetry impact on DC3 shadow run:
+    - native steps increased from `83` to `100`.
+    - bridged steps reduced from `28` to `11`.
+    - unresolved VM shadow diffs stayed stable at `2` (no regression).
+
 - **Phase E1g complete (R6 cutover mode scaffold)**: CFA now has explicit execution-mode routing for staged default migration.
   - Added `PipelineExecutionMode` in `analysis::cfa` with env control:
     - `DTK_CFA_PIPELINE_MODE=legacy|shadow|candidate` (`auto` aliases `shadow`)
@@ -615,9 +630,19 @@ Open technical debt (non-blocking for this branch state):
         - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r20-opcodecounts` -> `PASS`
         - `cfa_tests` legacy/default/native-VM2 legs all passed (`20/20` each).
         - Default + strict parity legs passed (`baseline_mode: legacy`, non-trivial diffs `0`).
+      - Post telemetry-driven generic load/store tranche rerun:
+        - `RUST_LOG=debug scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r22b-tranche` -> `PASS`
+        - shadow VM telemetry: `total_diffs=2`, `bridged_steps=11`, top bridged opcodes now `Extsb`, `Std`, `Stw`, `Add`, `Cntlzw`.
+      - Promotion-gate consolidation rerun:
+        - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r23-promo` -> `PASS`
+        - includes candidate strict `cfa_tests` leg plus shadow VM telemetry thresholds.
+        - default + strict parity legs both passed with `shadow_vm: total_diffs=2 bridged_steps=11`.
       - Post full register-copy OR native handling rerun:
         - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull` -> `PASS`
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
+    - Real-XEX parser mode matrix:
+      - `scripts/xex_info_mode_matrix.sh --no-build --require-all` -> `PASS`
+      - `12/12` checks passed (`legacy`/`shadow`/`candidate` across 4 local XEX samples).
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
@@ -646,10 +671,13 @@ Open technical debt (non-blocking for this branch state):
    - Keep explicit legacy rollback path exercised in CI/scripts (`DTK_CFA_PIPELINE_MODE=legacy`).
    - Use `scripts/dc3_cfa_parity_smoke.sh` as the standard DC3 regression/parity harness.
    - Start controlled `DTK_CFA_PIPELINE_MODE=candidate` opt-in checks on bounded corpora.
-   - Define candidate-promotion thresholds before any default move beyond `shadow`.
+   - Keep candidate-promotion thresholds enforced in scripts:
+     - shadow VM telemetry bounds: `total_diffs<=2`, `bridged_steps<=16`
+     - candidate strict `cfa_tests` must pass.
 2. **R7 native VM2 coverage continuation**:
    - Extend native handling past tranche-1 (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) into selective branch-fact paths.
    - Use `bridged_opcode_counts` telemetry from runtime shadow reports to prioritize the next opcode tranche.
+   - Current top bridged targets after E2j: `Extsb`, `Std`, `Stw`, `Add`, `Cntlzw`, `Mullw`, `Divw`.
    - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
 3. **Real-XEX workflow promotion**:
    - Run explicit `legacy`/default(`shadow`)/`candidate` split comparisons on DC3 and sample executable-library XEX files.

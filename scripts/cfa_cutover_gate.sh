@@ -21,8 +21,9 @@ This script runs a consolidated cutover gate:
   1) cfa_tests forced to legacy mode
   2) cfa_tests in default mode
   3) cfa_tests under VM2 native shadow gate
-  4) DC3 parity smoke (default)
-  5) DC3 parity smoke (strict candidate flags)
+  4) cfa_tests in candidate mode with strict seed gates
+  5) DC3 parity smoke (default + VM telemetry thresholds)
+  6) DC3 parity smoke (strict candidate flags + VM telemetry thresholds)
 EOF
 }
 
@@ -76,14 +77,33 @@ DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=4 \
 DTK_CFA_VM_SHADOW_MAX_STEPS=64 \
 cargo test cfa_tests -- --nocapture
 
+echo "[cutover-gate] Running candidate-mode strict cfa_tests..."
+DTK_CFA_PIPELINE_MODE=candidate \
+DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS=1 \
+DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS=1 \
+DTK_CFA_ENABLE_PIPELINE_SHADOW=1 \
+DTK_CFA_ENABLE_VM2_SHADOW=1 \
+DTK_CFA_VM_SHADOW_NATIVE_VM2=1 \
+DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 \
+DTK_CFA_MAX_VM_SHADOW_DELTAS=0 \
+DTK_CFA_VM_SHADOW_MAX_FUNCTIONS=4 \
+DTK_CFA_VM_SHADOW_MAX_STEPS=64 \
+cargo test cfa_tests -- --nocapture
+
 echo "[cutover-gate] Running DC3 parity smoke (default)..."
-"$PARITY_SCRIPT" --no-build --run-id "${RUN_ID_PREFIX}-default"
+"$PARITY_SCRIPT" \
+    --no-build \
+    --max-shadow-vm-diffs 2 \
+    --max-shadow-bridged-steps 16 \
+    --run-id "${RUN_ID_PREFIX}-default"
 
 echo "[cutover-gate] Running DC3 parity smoke (strict)..."
 "$PARITY_SCRIPT" \
     --no-build \
     --strict-code-seeds \
     --strict-symbol-size \
+    --max-shadow-vm-diffs 2 \
+    --max-shadow-bridged-steps 16 \
     --run-id "${RUN_ID_PREFIX}-strict"
 
 echo "[cutover-gate] PASS"

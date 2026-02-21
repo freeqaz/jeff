@@ -65,9 +65,18 @@ Follow-up status:
   - Supports strict candidate-gate rehearsal:
     - `--strict-code-seeds`
     - `--strict-symbol-size`
+  - Supports shadow VM telemetry thresholds:
+    - `--max-shadow-vm-diffs`
+    - `--max-shadow-bridged-steps`
 - Consolidated cutover gate helper added:
   - `scripts/cfa_cutover_gate.sh`
-  - Runs baseline/shadow/native-VM2 `cfa_tests` + default/strict DC3 parity smokes.
+  - Runs legacy/default/native-VM2/candidate-strict `cfa_tests` + default/strict DC3 parity smokes.
+  - Enforces shadow VM telemetry promotion thresholds on parity runs:
+    - `total_diffs <= 2`
+    - `bridged_steps <= 16`
+- Real-XEX mode matrix helper added:
+  - `scripts/xex_info_mode_matrix.sh`
+  - Runs `dtk xex info` across `legacy`/`shadow`/`candidate` on local XEX corpus paths.
 - Current debug parity run status:
   - Tracker duplicate-relocation panic is fixed in `src/analysis/tracker.rs`.
   - New regression test: `analysis::tracker::tests::test_process_data_tolerates_existing_source_relocation`.
@@ -117,6 +126,17 @@ Follow-up status:
     - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r20-opcodecounts`
     - `cfa_tests` legacy/default/native-VM2 gates all passed (`20/20` each).
     - default + strict DC3 parity legs both passed with `baseline_mode: legacy` and non-trivial diff counts `0`.
+  - Scripted workflow smoke (`r22b-tranche`) after telemetry-driven generic load/store native tranche:
+    - `RUST_LOG=debug scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r22b-tranche`
+    - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
+    - shadow VM telemetry: `total_diffs=2`, `bridged_steps=11`.
+  - Consolidated promotion-gate smoke (`r23-promo`) after strict candidate lane + telemetry thresholds:
+    - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r23-promo`
+    - `cfa_tests` legacy/default/native-VM2/candidate-strict gates all passed (`20/20` each).
+    - default + strict DC3 parity legs both passed with `shadow_vm: total_diffs=2 bridged_steps=11`.
+  - Real-XEX mode matrix (`r23`) on local corpus:
+    - `scripts/xex_info_mode_matrix.sh --no-build --require-all`
+    - `pass=12`, `total=12`, `missing=0`.
   - Scripted workflow smoke (`r17-orfull`) after full native register-copy OR handling:
     - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull`
     - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
@@ -176,6 +196,11 @@ Follow-up status:
       - Runtime report now tracks opcode-level coverage for tranche planning:
         - aggregate + per-function `native_opcode_counts`
         - aggregate + per-function `bridged_opcode_counts`
+      - Telemetry-driven generic load/store native tranche now includes:
+        - `lbz` / `lbzu`
+        - `stb` / `stbu`
+        - `stwu`
+        - generic `lwz` fallback
       - Native VM2 mode currently handles:
         - `add`, `addis`, `addi`/`addic`/`addic.`
         - `subf`/`subfc`, `subfic`
