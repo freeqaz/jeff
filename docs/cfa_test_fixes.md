@@ -101,6 +101,10 @@ Follow-up status:
     - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r16-cutover`
     - `cfa_tests` baseline/shadow/native-VM2 gates all passed (`20/20` each).
     - default + strict DC3 parity legs both passed with non-trivial diff counts `0`.
+  - Consolidated cutover gate smoke (`r18-postor`) after full native register-copy OR handling:
+    - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r18-postor`
+    - `cfa_tests` baseline/shadow/native-VM2 gates all passed (`20/20` each).
+    - default + strict DC3 parity legs both passed with non-trivial diff counts `0`.
   - Scripted workflow smoke (`r17-orfull`) after full native register-copy OR handling:
     - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull`
     - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.

@@ -589,6 +589,9 @@ Open technical debt (non-blocking for this branch state):
       - Consolidated cutover gate rerun:
         - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r16-cutover` -> `PASS`
         - baseline/shadow/native-VM2 `cfa_tests` all `20/20`, then default + strict parity both passed.
+      - Post full register-copy OR handling consolidated gate rerun:
+        - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r18-postor` -> `PASS`
+        - baseline/shadow/native-VM2 `cfa_tests` all `20/20`, then default + strict parity both passed.
       - Post full register-copy OR native handling rerun:
         - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull` -> `PASS`
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
