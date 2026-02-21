@@ -36,9 +36,11 @@ New regression coverage includes:
 - Unvisited-seed positive (`.pdata` detached helper) and negative (embedded data) behavior.
 - VM stack-shuffle variants with instruction gaps and register rename.
 
-### Current Branch Status (2026-02-20)
+### Current Branch Status (2026-02-21)
 
 - Branch/version: `cfa_fix` on `1.9.2`
+- Default CFA pipeline mode is now `shadow` in `src/analysis/cfa.rs`.
+  - Rollback remains explicit via `DTK_CFA_PIPELINE_MODE=legacy`.
 - Core CFA suites currently passing:
   - `cargo test cfa_tests` (20/20)
   - `cargo test analysis::slices::tests::tail_call` (3/3)
@@ -105,6 +107,12 @@ Follow-up status:
     - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r18-postor`
     - `cfa_tests` baseline/shadow/native-VM2 gates all passed (`20/20` each).
     - default + strict DC3 parity legs both passed with non-trivial diff counts `0`.
+  - Consolidated cutover gate smoke (`shadow-default`) after promoting default mode to `shadow`:
+    - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix shadow-default`
+    - Explicit legacy `cfa_tests` gate passed (`DTK_CFA_PIPELINE_MODE=legacy`).
+    - Default-mode `cfa_tests` gate passed (default `shadow`).
+    - Native-VM2 `cfa_tests` gate passed (`DTK_CFA_PIPELINE_MODE=shadow` + VM shadow envs).
+    - Default + strict DC3 parity legs both passed with `baseline_mode: legacy` and non-trivial diff counts `0`.
   - Scripted workflow smoke (`r17-orfull`) after full native register-copy OR handling:
     - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull`
     - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.

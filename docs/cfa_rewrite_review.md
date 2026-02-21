@@ -449,7 +449,8 @@ Open technical debt (non-blocking for this branch state):
 - **Phase E1g complete (R6 cutover mode scaffold)**: CFA now has explicit execution-mode routing for staged default migration.
   - Added `PipelineExecutionMode` in `analysis::cfa` with env control:
     - `DTK_CFA_PIPELINE_MODE=legacy|shadow|candidate` (`auto` aliases `shadow`)
-  - Default remains conservative (`legacy`).
+  - Default is now `shadow` (promoted after sustained parity-gate passes).
+  - Explicit rollback remains available via `DTK_CFA_PIPELINE_MODE=legacy`.
   - `shadow` mode forces candidate-vs-legacy comparison path for rollout soak.
   - `candidate` mode enables direct candidate-lane execution for controlled opt-in trials.
   - Added regressions:
@@ -592,6 +593,12 @@ Open technical debt (non-blocking for this branch state):
       - Post full register-copy OR handling consolidated gate rerun:
         - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r18-postor` -> `PASS`
         - baseline/shadow/native-VM2 `cfa_tests` all `20/20`, then default + strict parity both passed.
+      - Post default-mode promotion (`shadow`) consolidated gate rerun:
+        - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix shadow-default` -> `PASS`
+        - Explicit legacy gate passed (`DTK_CFA_PIPELINE_MODE=legacy cargo test cfa_tests`).
+        - Default-mode gate passed (`cargo test cfa_tests`, now running `shadow` by default).
+        - Native-VM2 shadow gate passed (`DTK_CFA_PIPELINE_MODE=shadow` + VM shadow envs).
+        - Default + strict parity legs passed with `baseline_mode: legacy` and non-trivial diff counts `0`.
       - Post full register-copy OR native handling rerun:
         - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull` -> `PASS`
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
@@ -619,21 +626,22 @@ Open technical debt (non-blocking for this branch state):
 ### Next Phase Queue
 
 1. **R6 rollout prep (cutover scaffold utilization)**:
-   - Run `DTK_CFA_PIPELINE_MODE=shadow` soak across fixture + real-XEX workflows.
+   - Keep running default `shadow` soak across fixture + real-XEX workflows.
+   - Keep explicit legacy rollback path exercised in CI/scripts (`DTK_CFA_PIPELINE_MODE=legacy`).
    - Use `scripts/dc3_cfa_parity_smoke.sh` as the standard DC3 regression/parity harness.
    - Start controlled `DTK_CFA_PIPELINE_MODE=candidate` opt-in checks on bounded corpora.
-   - Keep default at `legacy` until parity + stability gates are met.
+   - Define candidate-promotion thresholds before any default move beyond `shadow`.
 2. **R7 native VM2 coverage continuation**:
    - Extend native handling past tranche-1 (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) into selective branch-fact paths.
    - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
 3. **Real-XEX workflow promotion**:
-   - Run `legacy`/`shadow`/`candidate` split comparisons on DC3 and sample executable-library XEX files.
-   - Keep parity checks strict (exclude only `config.json`/`dep`) before default-mode promotion.
+   - Run explicit `legacy`/default(`shadow`)/`candidate` split comparisons on DC3 and sample executable-library XEX files.
+   - Keep parity checks strict (exclude only `config.json`/`dep`) before any promotion beyond `shadow`.
 
 ### Immediate Execution Plan (Kickoff: 2026-02-20, updated post-Phase D)
 
 1. **Sprint F1 (cutover rehearsal)**:
-   - Validate `legacy` vs `shadow` vs `candidate` mode behavior on corpus + real-XEX samples.
+   - Validate explicit `legacy` vs default(`shadow`) vs `candidate` behavior on corpus + real-XEX samples.
 2. **Sprint F2 (native coverage growth)**:
    - Land the next native VM2 branch-fact/provenance tranche with bridge-safe tests and coverage metrics.
 3. **Sprint F3 (real-world stability gate)**:
