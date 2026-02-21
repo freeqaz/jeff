@@ -505,13 +505,21 @@ impl Vm2 {
                     _ => unreachable!(),
                 };
                 let crf = ins.field_crfd();
-                self.cr[crf as usize] = ValueFact2 {
-                    value: Value2::CompareTag { crf },
-                    provenance: Provenance2::None,
-                    confidence: Confidence2::Medium,
-                };
-                self.cr_compare[crf as usize] =
-                    Some(CrCompareState2 { left: left.clone(), right: right.clone(), signed });
+                // Mirror legacy behavior: when both operands are unknown (Top),
+                // the CR maps to Top and no compare state is tracked.  The GPR
+                // still receives CompareTag regardless of operand knowledge.
+                if left == Value2::Top && right == Value2::Top {
+                    self.cr[crf as usize] = ValueFact2::top();
+                    self.cr_compare[crf as usize] = None;
+                } else {
+                    self.cr[crf as usize] = ValueFact2 {
+                        value: Value2::CompareTag { crf },
+                        provenance: Provenance2::None,
+                        confidence: Confidence2::Medium,
+                    };
+                    self.cr_compare[crf as usize] =
+                        Some(CrCompareState2 { left: left.clone(), right: right.clone(), signed });
+                }
                 let provenance = self.gpr[left_reg].provenance.clone();
                 self.gpr[left_reg] = ValueFact2 {
                     value: Value2::CompareTag { crf },
@@ -694,8 +702,15 @@ impl Vm2 {
                 self.bump_reg_revision(dst);
                 true
             }
-            // lbz rD, offset(rA): treat as generic load (unknown value).
-            Opcode::Lbz => {
+            // lbz/lhz rD, offset(rA): treat as generic load (unknown value).
+            Opcode::Lbz | Opcode::Lhz => {
+                let dst = ins.field_rd() as usize;
+                self.gpr[dst] = ValueFact2::top();
+                self.bump_reg_revision(dst);
+                true
+            }
+            // ld rD, offset(rA): 64-bit load into GPR, treat as unknown value.
+            Opcode::Ld => {
                 let dst = ins.field_rd() as usize;
                 self.gpr[dst] = ValueFact2::top();
                 self.bump_reg_revision(dst);
@@ -714,8 +729,19 @@ impl Vm2 {
                 );
                 true
             }
-            // stb rS, offset(rA): no tracked GPR state mutation.
-            Opcode::Stb => true,
+            // stb/sth rS, offset(rA): no tracked GPR state mutation.
+            Opcode::Stb | Opcode::Sth => true,
+            // Float loads/stores and FPR-only ops: no GPR state mutation.
+            Opcode::Lfs | Opcode::Lfd | Opcode::Stfs | Opcode::Stfd
+            | Opcode::Fmr | Opcode::Fneg | Opcode::Fabs | Opcode::Frsp
+            | Opcode::Fcfid | Opcode::Fctiwz | Opcode::Fctidz
+            | Opcode::Fadds | Opcode::Fsubs | Opcode::Fmuls | Opcode::Fdivs
+            | Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv
+            | Opcode::Fmadds | Opcode::Fmsubs | Opcode::Fnmsubs | Opcode::Fnmadds
+            | Opcode::Fmadd | Opcode::Fmsub | Opcode::Fnmsub | Opcode::Fnmadd
+            | Opcode::Fcmpu | Opcode::Fcmpo
+            | Opcode::Fsel | Opcode::Fres | Opcode::Frsqrte
+            | Opcode::PsqL | Opcode::PsqSt => true,
             // stbu rS, offset(rA): update-form base register semantics.
             Opcode::Stbu => {
                 self.apply_update_form_base_register(
@@ -767,7 +793,13 @@ impl Vm2 {
                 true
             }
             // Legacy default behavior for these ops is to invalidate defined destination register facts.
-            Opcode::Extsb | Opcode::Cntlzw | Opcode::Mullw | Opcode::Divw | Opcode::Divwu => {
+            Opcode::Extsb | Opcode::Extsh | Opcode::Extsw
+            | Opcode::Cntlzw | Opcode::Mullw | Opcode::Mulhw | Opcode::Mulhwu
+            | Opcode::Divw | Opcode::Divwu
+            | Opcode::Srawi | Opcode::Sradi | Opcode::Sraw | Opcode::Srw | Opcode::Slw
+            | Opcode::Rldicl
+            | Opcode::Neg
+            | Opcode::Mftb => {
                 self.clear_defined_registers_to_top(ins);
                 true
             }
