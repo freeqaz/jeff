@@ -663,6 +663,34 @@ Open technical debt (non-blocking for this branch state):
     - Real-XEX parser mode matrix:
       - `scripts/xex_info_mode_matrix.sh --no-build --require-all` -> `PASS`
       - `12/12` checks passed (`legacy`/`shadow`/`candidate` across 4 local XEX samples).
+    - Tooling/telemetry hardening tranche (`2026-02-21`):
+      - `scripts/dc3_cfa_parity_smoke.sh` now supports:
+        - config override (`--config-rel`)
+        - `/tmp` cleanup + free-space guard (`--cleanup-old-artifacts`, `--cleanup-run-artifacts`, `--tmp-min-free-gb`)
+        - VM runtime sampling controls (`--vm-shadow-max-functions`, `--vm-shadow-max-steps`)
+        - failure-safe summaries when split outputs are missing.
+      - New real-workflow helpers:
+        - `scripts/xex_split_mode_matrix.sh`
+          - runs parity smoke over `label|repo|config` targets
+          - skips missing target assets by default (require-able via `--require-all`)
+        - `scripts/cfa_candidate_strict_soak.sh`
+          - repeats strict candidate parity runs with telemetry thresholds.
+      - Deeper telemetry sweep + native fix:
+        - `scripts/dc3_cfa_parity_smoke.sh --no-build --vm-shadow-max-functions 16 --vm-shadow-max-steps 128 --max-shadow-vm-diffs 0 --max-shadow-bridged-steps 0 --run-id opcode-scan-deeper`
+        - detected `top_bridged_opcodes=[B:6]` with `total_diffs=0`
+        - landed VM2 native link-branch handling for `Opcode::B` and test:
+          - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_link_branch_b`
+        - rerun after rebuild:
+          - `scripts/dc3_cfa_parity_smoke.sh --no-build --vm-shadow-max-functions 16 --vm-shadow-max-steps 128 --max-shadow-vm-diffs 0 --max-shadow-bridged-steps 0 --run-id opcode-scan-deeper3` -> `PASS`
+          - telemetry: `total_diffs=0`, `bridged_steps=0`
+      - New scripted gates:
+        - `scripts/xex_split_mode_matrix.sh --no-build --tmp-min-free-gb 0 --run-id-prefix split-matrix-r3` -> `PASS`
+          - summary: `pass=1 total=1 missing=2` (RB3 targets skipped: missing source XEX assets)
+        - `scripts/cfa_candidate_strict_soak.sh --no-build --iterations 2 --tmp-min-free-gb 0 --run-id-prefix candidate-soak-r1` -> `PASS`
+          - summary: `pass=2 total=2`, strict + telemetry `0/0` held
+        - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r30-tooling` -> `PASS`
+          - legacy/default/native-VM2/candidate-strict `cfa_tests`: all `20/20`
+          - default + strict parity legs: both `total_diffs=0`, `bridged_steps=0`
   - Parser smoke remains healthy:
     - `dtk xex info` succeeds on:
       - `/home/free/code/milohax/dc3-decomp/orig/373307D9/default.xex`
@@ -683,6 +711,9 @@ Open technical debt (non-blocking for this branch state):
   - `/home/free/code/milohax/milo-executable-library/dc3/9.16.12 (Final Debug)/ham_xbox_r.xex`
   - `/home/free/code/milohax/milo-executable-library/dc1/TU0/default.xex`
   - `/home/free/code/milohax/milo-executable-library/gh2/360 TU0 Strum Limit Fix/default.xex`
+- Additional split-config targets (currently missing local source object assets):
+  - `/home/free/code/milohax/rb3/config/SZBE69/config.yml` (expects `object: orig/SZBE69/sys/main.dol`)
+  - `/home/free/code/milohax/rb3/config/SZBE69_B8/config.yml` (expects `object: orig/SZBE69_B8/sys/main.dol`)
 
 ### Next Phase Queue
 
@@ -696,13 +727,15 @@ Open technical debt (non-blocking for this branch state):
      - candidate strict `cfa_tests` must pass.
 2. **R7 native VM2 coverage continuation**:
    - Extend native handling past tranche-1 (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) into selective branch-fact paths.
+   - `Opcode::B` link-branch form is now native in runtime shadow; next focus is branch-conditional/link edge coverage where telemetry shows bridges.
    - Use `bridged_opcode_counts` telemetry from runtime shadow reports to prioritize the next opcode tranche.
-   - Current sampled gate telemetry reports no bridged or unresolved native-vs-legacy deltas.
+   - Current sampled gate telemetry reports no bridged or unresolved native-vs-legacy deltas at both `8x64` and `16x128` sample bounds.
    - Continue expanding sample breadth (`max_functions`, additional corpora) before declaring broad native parity.
    - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
 3. **Real-XEX workflow promotion**:
    - Run explicit `legacy`/default(`shadow`)/`candidate` split comparisons on DC3 and sample executable-library XEX files.
    - Keep parity checks strict (exclude only `config.json`/`dep`) before any promotion beyond `shadow`.
+   - Populate missing RB3 source-object assets so split matrix can validate RB3 targets as non-skipped legs.
 
 ### Immediate Execution Plan (Kickoff: 2026-02-20, updated post-Phase D)
 
