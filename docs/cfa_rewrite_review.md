@@ -717,37 +717,24 @@ Open technical debt (non-blocking for this branch state):
 
 ### Next Phase Queue
 
-1. **R6 rollout prep (cutover scaffold utilization)**:
-   - Keep running default `shadow` soak across fixture + real-XEX workflows.
-   - Keep explicit legacy rollback path exercised in CI/scripts (`DTK_CFA_PIPELINE_MODE=legacy`).
-   - Use `scripts/dc3_cfa_parity_smoke.sh` as the standard DC3 regression/parity harness.
-   - Start controlled `DTK_CFA_PIPELINE_MODE=candidate` opt-in checks on bounded corpora.
-   - Keep candidate-promotion thresholds enforced in scripts:
-     - shadow VM telemetry bounds: `total_diffs=0`, `bridged_steps=0`
-     - candidate strict `cfa_tests` must pass.
-2. **R7 native VM2 coverage continuation**:
-   - Extend native handling past tranche-1 (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) into selective branch-fact paths.
-   - `Opcode::B` link-branch form is now native in runtime shadow; next focus is branch-conditional/link edge coverage where telemetry shows bridges.
-   - Use `bridged_opcode_counts` telemetry from runtime shadow reports to prioritize the next opcode tranche.
-   - Current sampled gate telemetry reports no bridged or unresolved native-vs-legacy deltas at both `8x64` and `16x128` sample bounds.
-   - Continue expanding sample breadth (`max_functions`, additional corpora) before declaring broad native parity.
-   - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
-3. **Real-XEX workflow promotion**:
-   - Run explicit `legacy`/default(`shadow`)/`candidate` split comparisons on DC3 and sample executable-library XEX files.
-   - Keep parity checks strict (exclude only `config.json`/`dep`) before any promotion beyond `shadow`.
-   - Populate missing RB3 source-object assets so split matrix can validate RB3 targets as non-skipped legs.
+**CANDIDATE PROMOTED** (2026-02-21): `DEFAULT_PIPELINE_EXECUTION_MODE` changed from `Shadow` to `Candidate`.
 
-### Immediate Execution Plan (Kickoff: 2026-02-20, updated post-Phase D)
+Promotion evidence:
+- DC3 parity: 0 non-trivial diffs (default + strict) at all sampling bounds
+- VM2 native coverage: 0 bridged steps at 128x1024 (128 functions / ~5.7% of DC3)
+- VM2 native diffs: 0 total diffs at 128x1024
+- Candidate soak: 5 iterations at 128x1024, 0 diffs per iteration
+- Test suite: cfa 20/20, vm2 25/25, pipeline 15/15
+- Cutover gate: 6/6 legs passed post-promotion
+- Legacy rollback: verified functional via `DTK_CFA_PIPELINE_MODE=legacy`
 
-1. **Sprint F1 (cutover rehearsal)**:
-   - Validate explicit `legacy` vs default(`shadow`) vs `candidate` behavior on corpus + real-XEX samples.
-2. **Sprint F2 (native coverage growth)**:
-   - Land the next native VM2 branch-fact/provenance tranche with bridge-safe tests and coverage metrics.
-3. **Sprint F3 (real-world stability gate)**:
-   - Expand real-XEX mode parity evidence (`legacy`/`shadow`/`candidate`) and document promotion criteria.
+Key fixes landed during F1-F3 sprints:
+- Compare handler (Cmp/Cmpi/Cmpl/Cmpli): set CR to Top when both operands are Unknown, matching legacy mapping. Fixed shadow diffs exposed at 64x512+.
+- Broad native opcode coverage: 42+ native opcode kinds (FPR arithmetic, doubleword loads, shift/extend, time base, etc.) eliminated all bridged steps.
+- Shadow infrastructure kept intact for rollback safety.
 
-Exit criteria for next implementation pass:
-
-- Candidate execution-mode routing is validated on real workloads.
-- Native VM2 shadow coverage improves without increasing unresolved diff counts.
+Remaining work:
+1. **Merge to dev/main**: resolve version bump conflicts, re-run gate post-merge.
+2. **RB3 corpus validation**: populate missing RB3 source-object assets so split matrix can validate RB3 targets.
+3. **Further native VM2 growth**: expand sample breadth beyond 128 functions; land branch-fact paths where telemetry shows gaps at wider bounds.
 - Real-XEX parity evidence is maintained across `legacy`/`shadow`/`candidate` (excluding `config.json`/`dep` run artifacts).

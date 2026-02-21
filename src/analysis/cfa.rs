@@ -155,7 +155,7 @@ pub(crate) const ENV_CANDIDATE_STRICT_CODE_SEEDS: &str = "DTK_CFA_CANDIDATE_STRI
 pub(crate) const ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS: &str =
     "DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS";
 const MAX_LOGGED_SHADOW_DELTA_ENTRIES: usize = 8;
-const DEFAULT_PIPELINE_EXECUTION_MODE: PipelineExecutionMode = PipelineExecutionMode::Shadow;
+const DEFAULT_PIPELINE_EXECUTION_MODE: PipelineExecutionMode = PipelineExecutionMode::Candidate;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub(crate) enum PipelineExecutionMode {
