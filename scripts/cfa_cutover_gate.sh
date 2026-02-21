@@ -93,8 +93,8 @@ cargo test cfa_tests -- --nocapture
 echo "[cutover-gate] Running DC3 parity smoke (default)..."
 "$PARITY_SCRIPT" \
     --no-build \
-    --max-shadow-vm-diffs 2 \
-    --max-shadow-bridged-steps 16 \
+    --max-shadow-vm-diffs 0 \
+    --max-shadow-bridged-steps 0 \
     --run-id "${RUN_ID_PREFIX}-default"
 
 echo "[cutover-gate] Running DC3 parity smoke (strict)..."
@@ -102,8 +102,8 @@ echo "[cutover-gate] Running DC3 parity smoke (strict)..."
     --no-build \
     --strict-code-seeds \
     --strict-symbol-size \
-    --max-shadow-vm-diffs 2 \
-    --max-shadow-bridged-steps 16 \
+    --max-shadow-vm-diffs 0 \
+    --max-shadow-bridged-steps 0 \
     --run-id "${RUN_ID_PREFIX}-strict"
 
 echo "[cutover-gate] PASS"

@@ -72,8 +72,8 @@ Follow-up status:
   - `scripts/cfa_cutover_gate.sh`
   - Runs legacy/default/native-VM2/candidate-strict `cfa_tests` + default/strict DC3 parity smokes.
   - Enforces shadow VM telemetry promotion thresholds on parity runs:
-    - `total_diffs <= 2`
-    - `bridged_steps <= 16`
+    - `total_diffs = 0`
+    - `bridged_steps = 0`
 - Real-XEX mode matrix helper added:
   - `scripts/xex_info_mode_matrix.sh`
   - Runs `dtk xex info` across `legacy`/`shadow`/`candidate` on local XEX corpus paths.
@@ -134,6 +134,14 @@ Follow-up status:
     - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r23-promo`
     - `cfa_tests` legacy/default/native-VM2/candidate-strict gates all passed (`20/20` each).
     - default + strict DC3 parity legs both passed with `shadow_vm: total_diffs=2 bridged_steps=11`.
+  - Scripted workflow smoke (`r27-lwzfix`) after native provenance closure:
+    - `RUST_LOG=debug scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r27-lwzfix`
+    - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts remained `0`.
+    - shadow VM telemetry reached exact parity: `total_diffs=0`, `bridged_steps=0`.
+  - Consolidated final gate smoke (`r28-final`) with strict zero-delta telemetry thresholds:
+    - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r28-final`
+    - `cfa_tests` legacy/default/native-VM2/candidate-strict gates all passed (`20/20` each).
+    - default + strict DC3 parity legs both passed with `shadow_vm: total_diffs=0 bridged_steps=0`.
   - Real-XEX mode matrix (`r23`) on local corpus:
     - `scripts/xex_info_mode_matrix.sh --no-build --require-all`
     - `pass=12`, `total=12`, `missing=0`.
@@ -201,6 +209,12 @@ Follow-up status:
         - `stb` / `stbu`
         - `stwu`
         - generic `lwz` fallback
+      - Additional parity-oriented native coverage now includes:
+        - `stw` (generic + stack path)
+        - `std` / `stdu`
+        - `extsb` / `cntlzw` / `mullw` / `divw` / `divwu`
+      - Runtime mismatch-introduction telemetry is available:
+        - aggregate + per-function `diff_opcode_counts`
       - Native VM2 mode currently handles:
         - `add`, `addis`, `addi`/`addic`/`addic.`
         - `subf`/`subfc`, `subfic`

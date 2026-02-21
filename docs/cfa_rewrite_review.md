@@ -473,6 +473,19 @@ Open technical debt (non-blocking for this branch state):
     - bridged steps reduced from `28` to `11`.
     - unresolved VM shadow diffs stayed stable at `2` (no regression).
 
+- **Phase E2k complete (R7 provenance-parity closure for native shadow sample)**: VM2 sampled shadow lane now runs without bridge or unresolved deltas on DC3 gate sample.
+  - Added parity-safe native handling/semantics refinements for:
+    - `stw` (generic no-op state mutation outside stack-slot tracking path),
+    - `std` / `stdu`,
+    - `extsb` / `cntlzw` / `mullw` / `divw` / `divwu` (legacy-equivalent def invalidation),
+    - `add` fallback-to-top parity behavior for previously bridged non-table forms.
+  - Added step-delta mismatch opcode telemetry (`diff_opcode_counts`) to isolate mismatch introduction points.
+  - Fixed stack `lwz` native revision bookkeeping to match legacy semantics (removed post-load revision bump).
+  - Result on sampled DC3 shadow gate:
+    - `native_steps=111`
+    - `bridged_steps=0`
+    - `total_diffs=0`
+
 - **Phase E1g complete (R6 cutover mode scaffold)**: CFA now has explicit execution-mode routing for staged default migration.
   - Added `PipelineExecutionMode` in `analysis::cfa` with env control:
     - `DTK_CFA_PIPELINE_MODE=legacy|shadow|candidate` (`auto` aliases `shadow`)
@@ -637,6 +650,13 @@ Open technical debt (non-blocking for this branch state):
         - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r23-promo` -> `PASS`
         - includes candidate strict `cfa_tests` leg plus shadow VM telemetry thresholds.
         - default + strict parity legs both passed with `shadow_vm: total_diffs=2 bridged_steps=11`.
+      - Post native provenance closure rerun:
+        - `RUST_LOG=debug scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r27-lwzfix` -> `PASS`
+        - shadow VM telemetry reached exact parity (`total_diffs=0`, `bridged_steps=0`).
+      - Final consolidated gate rerun:
+        - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r28-final` -> `PASS`
+        - legacy/default/native-VM2/candidate-strict `cfa_tests` all passed (`20/20` each).
+        - default + strict parity legs both passed with `shadow_vm: total_diffs=0 bridged_steps=0`.
       - Post full register-copy OR native handling rerun:
         - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull` -> `PASS`
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
@@ -672,12 +692,13 @@ Open technical debt (non-blocking for this branch state):
    - Use `scripts/dc3_cfa_parity_smoke.sh` as the standard DC3 regression/parity harness.
    - Start controlled `DTK_CFA_PIPELINE_MODE=candidate` opt-in checks on bounded corpora.
    - Keep candidate-promotion thresholds enforced in scripts:
-     - shadow VM telemetry bounds: `total_diffs<=2`, `bridged_steps<=16`
+     - shadow VM telemetry bounds: `total_diffs=0`, `bridged_steps=0`
      - candidate strict `cfa_tests` must pass.
 2. **R7 native VM2 coverage continuation**:
    - Extend native handling past tranche-1 (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) into selective branch-fact paths.
    - Use `bridged_opcode_counts` telemetry from runtime shadow reports to prioritize the next opcode tranche.
-   - Current top bridged targets after E2j: `Extsb`, `Std`, `Stw`, `Add`, `Cntlzw`, `Mullw`, `Divw`.
+   - Current sampled gate telemetry reports no bridged or unresolved native-vs-legacy deltas.
+   - Continue expanding sample breadth (`max_functions`, additional corpora) before declaring broad native parity.
    - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
 3. **Real-XEX workflow promotion**:
    - Run explicit `legacy`/default(`shadow`)/`candidate` split comparisons on DC3 and sample executable-library XEX files.
