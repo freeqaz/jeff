@@ -89,6 +89,7 @@ struct TopLevel {
 #[argp(subcommand)]
 enum SubCommand {
     Demangle(cmd::demangle::Args),
+    DisasmTests(cmd::disasm_tests::Args),
     Disc(cmd::disc::Args),
     Map(cmd::map::Args),
     Shasum(cmd::shasum::Args),
@@ -151,6 +152,7 @@ fn main() {
     }
     result = result.and_then(|_| match args.command {
         SubCommand::Demangle(c_args) => cmd::demangle::run(c_args),
+        SubCommand::DisasmTests(c_args) => cmd::disasm_tests::run(c_args),
         SubCommand::Disc(c_args) => cmd::disc::run(c_args),
         SubCommand::Map(c_args) => cmd::map::run(c_args),
         SubCommand::Shasum(c_args) => cmd::shasum::run(c_args),

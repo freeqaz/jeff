@@ -19,7 +19,178 @@ use crate::{
     util::{align_up, comment::MWComment, toposort::toposort},
 };
 
+/// Check if a symbol is part of a CRT initialization array.
+///
+/// The MSVC CRT uses arrays of function pointers bracketed by sentinel symbols
+/// (__x*_a / __x*_z) that are iterated via `_initterm()` during startup.
+/// Entries between sentinels (like `__pioinit`) are found by position, not by
+/// name, so they must NOT be COMDAT (the linker's /OPT:REF would drop them).
+///
+/// Sentinel patterns: __xri_a, __xri_z, __xc_a, __xc_z, __xi_a, __xi_z,
+///                    __xp_a, __xp_z, __xt_a, __xt_z
+/// Entry examples:    __pioinit (CRT$XRI), __onexitbegin (CRT$XRI)
+fn is_crt_array_symbol(name: &str) -> bool {
+    // CRT sentinels: __x{letters}_a or __x{letters}_z
+    if name.starts_with("__x") && (name.ends_with("_a") || name.ends_with("_z")) {
+        let middle = &name[3..name.len() - 2];
+        if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_lowercase()) {
+            return true;
+        }
+    }
+    // Known CRT array entries that sit between sentinels
+    matches!(name, "__pioinit" | "__onexitbegin" | "__onexitend")
+}
+
+/// Create splits for MSVC .CRT$XCU initializer function pointers.
+/// Each 4-byte entry in the .CRT section is an ADDR32 relocation targeting
+/// an initializer function (typically ??__E* symbols). We ensure each .CRT
+/// entry is in the same compilation unit as the function it references.
+fn split_crt_initializers(obj: &mut ObjInfo, section_index: crate::obj::SectionIndex) -> Result<()> {
+    let section = &obj.sections[section_index];
+    let start = SectionAddress::new(section_index, section.address as u32);
+    let end = start + section.size as u32;
+    let mut new_splits = BTreeMap::<SectionAddress, ObjSplit>::new();
+    let mut referenced_symbols = vec![];
+    let mut current_address = start;
+
+    log::info!(
+        "Processing .CRT initializers: {} entries from {:#010X} to {:#010X}",
+        section.size / 4,
+        start,
+        end
+    );
+
+    while current_address < end {
+        // Each entry is a 4-byte function pointer with an ADDR32 relocation
+        let word = read_u32(section, current_address.address);
+        if matches!(word, Some(0)) {
+            // Null entry — sentinel or padding, skip
+            current_address += 4;
+            continue;
+        }
+
+        // Find the relocation at this address to determine the target function
+        let target = relocation_target_for(obj, current_address, Some(ObjRelocKind::Absolute))?;
+        let Some(target) = target else {
+            log::warn!(
+                ".CRT entry at {:#010X} has no ADDR32 relocation (word={:#010X}), skipping",
+                current_address,
+                word.unwrap_or(0)
+            );
+            current_address += 4;
+            continue;
+        };
+        let function_addr = match target {
+            crate::analysis::RelocationTarget::Address(addr) => addr,
+            crate::analysis::RelocationTarget::External => {
+                log::warn!(
+                    ".CRT entry at {:#010X} points to external relocation, skipping",
+                    current_address
+                );
+                current_address += 4;
+                continue;
+            }
+        };
+
+        log::debug!(
+            "Found .CRT initializer entry: {:#010X} -> function {:#010X}",
+            current_address,
+            function_addr
+        );
+
+        // Try to find the target function symbol
+        let function_symbol_result = obj.symbols.kind_at_section_address(
+            function_addr.section,
+            function_addr.address,
+            ObjSymbolKind::Function,
+        )?;
+        let Some((function_symbol_idx, function_symbol)) = function_symbol_result else {
+            log::warn!(
+                "No function symbol at {:#010X} for .CRT entry at {:#010X}, skipping",
+                function_addr,
+                current_address
+            );
+            current_address += 4;
+            continue;
+        };
+        referenced_symbols.push(function_symbol_idx);
+
+        let text_section = &obj.sections[function_addr.section];
+        let crt_split = section.splits.for_address(current_address.address);
+        let function_split = text_section.splits.for_address(function_addr.address);
+
+        // Determine which unit both should belong to
+        let mut expected_unit = None;
+        if let Some((_, crt_split)) = crt_split {
+            expected_unit = Some(crt_split.unit.clone());
+        }
+        if let Some((_, function_split)) = function_split {
+            if let Some(ref unit) = expected_unit {
+                if unit != &function_split.unit {
+                    log::warn!(
+                        "Mismatched splits for .CRT {:#010X} ({}) and function {:#010X} ({}), \
+                         using function's unit",
+                        current_address,
+                        unit,
+                        function_addr,
+                        function_split.unit
+                    );
+                    expected_unit = Some(function_split.unit.clone());
+                }
+            } else {
+                expected_unit = Some(function_split.unit.clone());
+            }
+        }
+
+        if crt_split.is_none() || function_split.is_none() {
+            let unit = match expected_unit {
+                Some(unit) => unit,
+                None => auto_unit_name(obj, function_symbol, &new_splits)?,
+            };
+            log::debug!("Adding .CRT splits to unit {}", unit);
+
+            if crt_split.is_none() {
+                new_splits.insert(current_address, ObjSplit {
+                    unit: unit.clone(),
+                    end: current_address.address + 4,
+                    align: None,
+                    common: false,
+                    autogenerated: true,
+                    skip: false,
+                    rename: None,
+                });
+            }
+            if function_split.is_none() {
+                new_splits.insert(function_addr, ObjSplit {
+                    unit,
+                    end: function_addr.address + function_symbol.size as u32,
+                    align: None,
+                    common: false,
+                    autogenerated: true,
+                    skip: false,
+                    rename: None,
+                });
+            }
+        }
+
+        current_address += 4;
+    }
+
+    for (addr, split) in new_splits {
+        obj.add_split(addr.section, addr.address, split)?;
+    }
+
+    // Force-active to prevent deadstripping of CRT initializer functions
+    for symbol_idx in referenced_symbols {
+        obj.symbols.flags(symbol_idx).set_force_active(true);
+    }
+
+    log::info!("Finished processing .CRT initializers");
+    Ok(())
+}
+
 /// Create splits for function pointers in the given section.
+#[allow(dead_code)]
 fn split_ctors_dtors(obj: &mut ObjInfo, start: SectionAddress, end: SectionAddress) -> Result<()> {
     let ctors_section = &obj.sections[start.section];
     let mut new_splits = BTreeMap::<SectionAddress, ObjSplit>::new();
@@ -137,6 +308,7 @@ fn split_ctors_dtors(obj: &mut ObjInfo, start: SectionAddress, end: SectionAddre
 }
 
 /// Create splits for extabindex + extab entries.
+#[allow(dead_code)]
 fn split_extabindex(obj: &mut ObjInfo, start: SectionAddress) -> Result<()> {
     let section = &obj.sections[start.section];
     let mut new_splits = BTreeMap::<SectionAddress, ObjSplit>::new();
@@ -483,6 +655,7 @@ fn create_gap_splits(obj: &mut ObjInfo) -> Result<()> {
 }
 
 /// Ensures that all .bss splits following a common split are also marked as common.
+#[allow(dead_code)]
 fn update_common_splits(obj: &mut ObjInfo, common_start: Option<u32>) -> Result<()> {
     let Some(common_bss_start) = (match common_start {
         Some(addr) => Some(SectionAddress::new(
@@ -812,6 +985,7 @@ fn trim_split_alignment(obj: &mut ObjInfo) -> Result<()> {
 }
 
 /// Trim splits if they contain linker generated symbols.
+#[allow(dead_code)]
 fn trim_linker_generated_symbols(obj: &mut ObjInfo) -> Result<()> {
     for section_index in 0..obj.sections.len() {
         let section_end = end_for_section(obj, section_index)?;
@@ -842,7 +1016,7 @@ fn split_pdata(obj: &mut ObjInfo) -> Result<()> {
     // should we remove all pdata splits before doing this? so we avoid duplicates and false "overlaps with split" errors?
 
     // for each code split you find, you must give the appropriate pdata bound for the obj
-    for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
+    for (_section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
         for (start_addr, split) in section.splits.iter() {
             // we need the address of the first pdata entry where its target addr >= start_addr,
             // and the address of the first pdata entry where its target addr >= split.end
@@ -928,6 +1102,16 @@ pub fn update_splits(obj: &mut ObjInfo, common_start: Option<u32>, fill_gaps: bo
     //     }
     // }
 
+    // Create splits for .CRT initializer entries (MSVC Xbox 360)
+    // The .CRT section contains function pointers that the CRT calls during
+    // startup (_cinit / _initterm). We need to ensure each .CRT entry is
+    // co-located with the initializer function it references.
+    if let Some((section_index, section)) = obj.sections.by_name(".CRT")? {
+        if !section.data.is_empty() {
+            split_crt_initializers(obj, section_index)?;
+        }
+    }
+
     // Create splits for .pdata entries
     split_pdata(obj)?;
 
@@ -963,6 +1147,7 @@ pub fn update_splits(obj: &mut ObjInfo, common_start: Option<u32>, fill_gaps: bo
 /// There can be ambiguities, but any solution that satisfies the link order
 /// constraints is considered valid.
 #[instrument(level = "debug", skip(obj))]
+#[allow(dead_code)]
 fn resolve_link_order(obj: &ObjInfo) -> Result<Vec<ObjUnit>> {
     #[allow(dead_code)]
     #[derive(Debug, Copy, Clone)]
@@ -1189,8 +1374,11 @@ pub fn split_obj(
 
             // Determine section name and check for existing section to merge
             let section_name = split.rename.as_ref().unwrap_or(&section.name).clone();
+            // COFF $suffix sections (e.g., .text$yc) merge into the base section (.text)
+            let merge_name =
+                section_name.split('$').next().unwrap_or(&section_name).to_string();
             let (out_section_idx, merge_offset) =
-                match split_obj.sections.by_name(&section_name)? {
+                match split_obj.sections.by_name(&merge_name)? {
                     Some((idx, existing_sec)) => {
                         let raw_offset = existing_sec.size;
                         // Align merge offset if the new fragment requires stricter alignment
@@ -1298,7 +1486,7 @@ pub fn split_obj(
                     }
                 } else {
                     split_obj.sections.push(ObjSection {
-                        name: section_name,
+                        name: merge_name,
                         kind: section.kind,
                         address: 0,
                         size: fragment_size,
@@ -1431,6 +1619,62 @@ pub fn split_obj(
         }
         for (symbol_idx, symbol) in replace_symbols {
             obj.symbols.replace(symbol_idx, symbol)?;
+        }
+    }
+
+    // Mark all global defined symbols in split objects as COMDAT (SELECT_ANY).
+    // This prevents LNK4006 warnings in two scenarios:
+    // 1. Same symbol duplicated across multiple split objects (inline/template)
+    // 2. Split object symbols conflicting with decomp source objects
+    let mut comdat_symbols: HashSet<String> = HashSet::new();
+    for obj in &objects {
+        for (_, sym) in obj.symbols.iter() {
+            if sym.flags.is_global()
+                && sym.section.is_some()
+                && sym.kind != ObjSymbolKind::Section
+                && !sym.name.starts_with("lbl_")
+                && !sym.name.starts_with("pdata@")
+                && !sym.name.starts_with("except_data_")
+                && !sym.name.starts_with("except_record_")
+                && !sym.name.starts_with("__unwind$")
+                // CRT dynamic initializers (??__E*) must not be COMDAT —
+                // they are referenced by .CRT$XCU entries and must run exactly once.
+                && !sym.name.starts_with("??__E")
+                // CRT sentinel arrays (__x*_a / __x*_z) and entries between them
+                // (e.g., __pioinit) must not be COMDAT. The CRT iterates these
+                // arrays by position between sentinels using _initterm(). If an
+                // entry becomes COMDAT, /OPT:REF drops it (nothing references it
+                // by name), breaking CRT initialization (e.g., _ioinit never runs,
+                // __pioinfo stays NULL, __initstdio hangs).
+                && !is_crt_array_symbol(&sym.name)
+                // CRT save/restore stubs use fall-through execution — each entry
+                // saves/restores one register and falls into the next. Extracting
+                // them as COMDAT sections breaks this fall-through chain.
+                // Match both the base name (__savegprlr) and numbered entries (__savegprlr_14).
+                && !sym.name.starts_with("__savegprlr")
+                && !sym.name.starts_with("__restgprlr")
+                && !sym.name.starts_with("__savefpr")
+                && !sym.name.starts_with("__restfpr")
+            {
+                comdat_symbols.insert(sym.name.clone());
+            }
+        }
+    }
+    if !comdat_symbols.is_empty() {
+        log::debug!("Marking {} symbols as COMDAT", comdat_symbols.len());
+        for obj in &mut objects {
+            // Only store symbols that exist in this object (avoids cloning 88K strings * 2K objects = 28GB OOM)
+            let local: HashSet<String> = obj
+                .symbols
+                .iter()
+                .filter(|(_, sym)| {
+                    sym.flags.is_global()
+                        && sym.section.is_some()
+                        && comdat_symbols.contains(&sym.name)
+                })
+                .map(|(_, sym)| sym.name.clone())
+                .collect();
+            obj.comdat_symbols = local;
         }
     }
 
@@ -1919,6 +2163,165 @@ mod tests {
             "Second symbol address should be at aligned merge offset 0x10"
         );
     }
+
+    /// .text$yc (COFF dollar-suffix) sections should merge into .text,
+    /// so .pdata only references a single .text section.
+    #[test]
+    fn test_split_obj_merges_dollar_suffix_sections() {
+        // Section 0: .text at 0x1000, 0x80 bytes
+        let text_data = vec![0x60u8; 0x80]; // NOP fill
+        let mut text_sec = make_section(".text", ObjSectionKind::Code, 0x1000, text_data);
+
+        // Section 1: .text$yc at 0x1080, 0x20 bytes (dynamic initializer)
+        let textyc_data = vec![0x60u8; 0x20];
+        let mut textyc_sec =
+            make_section(".text$yc", ObjSectionKind::Code, 0x1080, textyc_data);
+
+        // Section 2: .pdata at 0x2000, 0x10 bytes (two 8-byte entries)
+        let mut pdata_data = vec![0u8; 0x10];
+        // Entry 0: refs .text function
+        pdata_data[0..4].copy_from_slice(&0x1000u32.to_be_bytes());
+        // Entry 1: refs .text$yc function
+        pdata_data[8..12].copy_from_slice(&0x1080u32.to_be_bytes());
+        let mut pdata_sec =
+            make_section(".pdata", ObjSectionKind::ReadOnlyData, 0x2000, pdata_data);
+
+        // Splits: all belong to TestUnit
+        text_sec.splits.push(0x1000, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x1080,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        textyc_sec.splits.push(0x1080, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x10A0,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        pdata_sec.splits.push(0x2000, ObjSplit {
+            unit: "TestUnit".into(),
+            end: 0x2010,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+
+        let mut obj = make_executable(vec![text_sec, textyc_sec, pdata_sec]);
+
+        // Symbols
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "text_func".into(),
+                address: 0x1000,
+                section: Some(0),
+                size: 0x80,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "textyc_func".into(),
+                address: 0x1080,
+                section: Some(1),
+                size: 0x20,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "pdata_entry".into(),
+                address: 0x2000,
+                section: Some(2),
+                size: 0x10,
+                size_known: true,
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // .pdata relocations pointing to each function
+        obj.sections[2].relocations = ObjRelocations::new(vec![
+            (0x2000, ObjReloc {
+                kind: ObjRelocKind::Absolute,
+                target_symbol: 0, // text_func
+                addend: 0,
+                module: None,
+            }),
+            (0x2008, ObjReloc {
+                kind: ObjRelocKind::Absolute,
+                target_symbol: 1, // textyc_func
+                addend: 0,
+                module: None,
+            }),
+        ])
+        .unwrap();
+
+        obj.link_order.push(ObjUnit {
+            name: "TestUnit".into(),
+            autogenerated: false,
+            comment_version: None,
+            order: None,
+        });
+
+        let result = split_obj(&obj, None, false).unwrap();
+        assert_eq!(result.len(), 1, "Expected 1 output object");
+        let out = &result[0];
+
+        // Should have exactly 1 .text section (no .text$yc)
+        let text_sections: Vec<_> = out
+            .sections
+            .iter()
+            .filter(|(_, s)| s.name == ".text")
+            .collect();
+        assert_eq!(
+            text_sections.len(),
+            1,
+            "Expected exactly 1 .text section after merge"
+        );
+
+        let textyc_sections: Vec<_> = out
+            .sections
+            .iter()
+            .filter(|(_, s)| s.name == ".text$yc")
+            .collect();
+        assert_eq!(
+            textyc_sections.len(),
+            0,
+            "Should have no .text$yc sections"
+        );
+
+        // Merged .text should contain both fragments
+        let (_, merged_text) = &text_sections[0];
+        assert_eq!(
+            merged_text.size, 0xA0,
+            "Merged .text should be 0x80 + 0x20 = 0xA0 bytes"
+        );
+
+        // textyc_func symbol should be at offset 0x80 in the merged section
+        let textyc_sym = out
+            .symbols
+            .iter()
+            .find(|(_, s)| s.name == "textyc_func")
+            .map(|(_, s)| s)
+            .expect("textyc_func not found");
+        assert_eq!(
+            textyc_sym.address, 0x80,
+            "textyc_func should be at offset 0x80 in merged .text"
+        );
+    }
 }
 
 /// Linker-generated symbols to extern
@@ -2039,6 +2442,7 @@ pub fn end_for_section(obj: &ObjInfo, section_index: SectionIndex) -> Result<Sec
 /// Generates a unit name for an autogenerated split.
 /// The name is based on the symbol name and section name.
 /// If the name is not unique, a number is appended to the end.
+#[allow(dead_code)]
 fn auto_unit_name(
     obj: &ObjInfo,
     symbol: &ObjSymbol,
@@ -2071,6 +2475,7 @@ fn auto_unit_name(
 }
 
 /// Check if a unit name exists in the object or pending splits.
+#[allow(dead_code)]
 fn unit_exists(
     unit_name: &str,
     obj: &ObjInfo,

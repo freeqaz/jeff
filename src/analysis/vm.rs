@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{collections::BTreeMap, num::NonZeroU32};
 
 use powerpc::{Argument, Ins, Opcode, GPR};
 
@@ -153,10 +153,14 @@ pub struct VM {
     pub ctr: GprValue,
     /// The last modified CR
     pub last_modified_cr: u8,
+    /// Stack slot tracking: maps r1-relative offsets to stored GPR values
+    pub stack_slots: BTreeMap<i16, Gpr>,
 }
 
 impl VM {
-    pub fn gpr_value(&self, reg: u8) -> GprValue { self.gpr[reg as usize].value }
+    pub fn gpr_value(&self, reg: u8) -> GprValue {
+        self.gpr[reg as usize].value
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -220,7 +224,9 @@ pub fn section_address_for(
 
 impl VM {
     #[inline]
-    pub fn new() -> Box<Self> { Box::default() }
+    pub fn new() -> Box<Self> {
+        Box::default()
+    }
 
     #[inline]
     pub fn new_from_obj(obj: &ObjInfo) -> Box<Self> {
@@ -265,7 +271,9 @@ impl VM {
     }
 
     #[inline]
-    pub fn clone_all(&self) -> Box<Self> { Box::new(self.clone()) }
+    pub fn clone_all(&self) -> Box<Self> {
+        Box::new(self.clone())
+    }
 
     pub fn step(&mut self, obj: &ObjInfo, ins_addr: SectionAddress, ins: Ins) -> StepResult {
         match ins.op {
@@ -516,8 +524,20 @@ impl VM {
             Opcode::Or => {
                 if ins.field_rs() == ins.field_rb() {
                     // Register copy
-                    self.gpr[ins.field_ra() as usize] = self.gpr[ins.field_rs() as usize];
-                    self.gpr[ins.field_ra() as usize].set_source(Some(ins.field_rs()));
+                    let src_reg = ins.field_rs() as usize;
+                    let dst_reg = ins.field_ra() as usize;
+                    let src = self.gpr[src_reg];
+                    self.gpr[dst_reg] = src;
+                    if let GprSourceLocation::Stack(offset) = src.source.kind {
+                        // Preserve stack-slot provenance across register renames.
+                        self.gpr[dst_reg].source = GprSource {
+                            kind: GprSourceLocation::Stack(offset),
+                            version: self.gpr[dst_reg].version,
+                        };
+                        self.gpr[dst_reg].version += 1;
+                    } else {
+                        self.gpr[dst_reg].set_source(Some(ins.field_rs()));
+                    }
                 } else {
                     let left = self.gpr[ins.field_rs() as usize].value;
                     let right = self.gpr[ins.field_rb() as usize].value;
@@ -857,7 +877,26 @@ impl VM {
                 } else if is_update_op(op) {
                     self.gpr[source].set_direct(GprValue::Unknown, None);
                 }
+                // Track stack stores: stw rS, offset(r1)
+                if op == Opcode::Stw && ins.field_ra() == 1 {
+                    let offset = ins.field_offset() as i16;
+                    let rs = ins.field_rs() as usize;
+                    self.stack_slots.insert(offset, self.gpr[rs]);
+                }
                 if op == Opcode::Lwz {
+                    // Check stack slot tracking first: lwz rD, offset(r1)
+                    if ins.field_ra() == 1 {
+                        let offset = ins.field_offset() as i16;
+                        if let Some(stored_gpr) = self.stack_slots.get(&offset).cloned() {
+                            let mut gpr = stored_gpr;
+                            gpr.source = GprSource {
+                                kind: GprSourceLocation::Stack(offset as usize),
+                                version: gpr.version,
+                            };
+                            self.gpr[ins.field_rd() as usize] = gpr;
+                            return result;
+                        }
+                    }
                     // the following sequence checkers are terrible hacks
                     // the "proper" way to do it would be to track values of stack offsets/memory offsets as they're written to/read from,
                     // but for the life me i can't figure out how to do that
@@ -941,6 +980,12 @@ impl VM {
         for gpr in &mut self.gpr {
             if gpr.value == GprValue::ComparisonResult(crf as u8) {
                 gpr.value = value;
+                // Propagate narrowed value back to the stack slot this register was loaded from
+                if let GprSourceLocation::Stack(offset) = gpr.source.kind {
+                    if let Some(slot) = self.stack_slots.get_mut(&(offset as i16)) {
+                        slot.value = value;
+                    }
+                }
             }
         }
     }
@@ -1121,6 +1166,134 @@ pub fn is_update_op(op: Opcode) -> bool {
             | Opcode::Stwu
             | Opcode::Stwux
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind};
+    use powerpc::Extensions;
+
+    fn make_obj(base: u32, instructions: &[u32]) -> ObjInfo {
+        let data: Vec<u8> = instructions.iter().flat_map(|ins| ins.to_be_bytes()).collect();
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base as u64,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "vm-test".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
+    fn make_obj_with_size(base: u32, size: usize) -> ObjInfo {
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base as u64,
+            size: size as u64,
+            data: vec![0u8; size],
+            align: 4,
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "vm-test-sized".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
+    fn step(vm: &mut VM, obj: &ObjInfo, addr: u32, code: u32) -> StepResult {
+        vm.step(obj, SectionAddress::new(0, addr), Ins::new(code, Extensions::xenon()))
+    }
+
+    #[test]
+    fn stack_slot_provenance_survives_instruction_gaps() {
+        let obj = make_obj(0x1000, &[0u32; 8]);
+        let mut vm = VM::new_from_obj(&obj);
+        vm.gpr[5].value = GprValue::Range { min: 0, max: u64::MAX, step: 1 };
+
+        let _ = step(&mut vm, &obj, 0x1000, 0x90A1_0050); // stw r5, 80(r1)
+        let _ = step(&mut vm, &obj, 0x1004, 0x8081_0050); // lwz r4, 80(r1)
+        let _ = step(&mut vm, &obj, 0x1008, 0x2B04_0010); // cmplwi cr6, r4, 0x10
+        let StepResult::Branch(mut branches) = step(&mut vm, &obj, 0x100C, 0x4199_0008) else {
+            panic!("expected conditional branch");
+        };
+
+        let mut fallthrough_vm = branches.remove(0).vm;
+        let _ = step(&mut fallthrough_vm, &obj, 0x1010, 0x6042_0001); // ori r2, r2, 1
+        let _ = step(&mut fallthrough_vm, &obj, 0x1014, 0x3863_0001); // addi r3, r3, 1
+        let _ = step(&mut fallthrough_vm, &obj, 0x1018, 0x8121_0050); // lwz r9, 80(r1)
+
+        assert_eq!(fallthrough_vm.gpr[9].value, GprValue::Range { min: 0, max: 0x10, step: 1 });
+    }
+
+    #[test]
+    fn stack_slot_provenance_survives_register_rename_before_compare() {
+        let obj = make_obj(0x2000, &[0u32; 8]);
+        let mut vm = VM::new_from_obj(&obj);
+        vm.gpr[5].value = GprValue::Range { min: 0, max: u64::MAX, step: 1 };
+
+        let _ = step(&mut vm, &obj, 0x2000, 0x90A1_0050); // stw r5, 80(r1)
+        let _ = step(&mut vm, &obj, 0x2004, 0x8081_0050); // lwz r4, 80(r1)
+        let _ = step(&mut vm, &obj, 0x2008, 0x7C89_2378); // or r9, r4, r4
+        let _ = step(&mut vm, &obj, 0x200C, 0x2B09_0020); // cmplwi cr6, r9, 0x20
+        let StepResult::Branch(mut branches) = step(&mut vm, &obj, 0x2010, 0x4199_0008) else {
+            panic!("expected conditional branch");
+        };
+
+        let mut fallthrough_vm = branches.remove(0).vm;
+        let _ = step(&mut fallthrough_vm, &obj, 0x2014, 0x80E1_0050); // lwz r7, 80(r1)
+        assert_eq!(fallthrough_vm.gpr[7].value, GprValue::Range { min: 0, max: 0x20, step: 1 });
+    }
+
+    #[test]
+    fn relative_byte_jump_table_base_propagates_to_bctr() {
+        let obj = make_obj_with_size(0x0, 0x400);
+        let mut vm = VM::new_from_obj(&obj);
+        vm.gpr[11].value = GprValue::Range { min: 0, max: 0x10, step: 1 };
+        vm.last_modified_cr = 0;
+        vm.cr[0].right = GprValue::Constant(0x10);
+
+        let _ = step(&mut vm, &obj, 0x0000, 0x3D80_0000); // lis r12, 0
+        let _ = step(&mut vm, &obj, 0x0004, 0x398C_0100); // addi r12, r12, 0x100 (table)
+        let _ = step(&mut vm, &obj, 0x0008, 0x7C0C_58AE); // lbzx r0, r12, r11
+        let _ = step(&mut vm, &obj, 0x000C, 0x5400_103A); // slwi r0, r0, 2
+        let _ = step(&mut vm, &obj, 0x0010, 0x3D80_0000); // lis r12, 0
+        let _ = step(&mut vm, &obj, 0x0014, 0x398C_0200); // addi r12, r12, 0x200 (base)
+        let _ = step(&mut vm, &obj, 0x0018, 0x7D8C_0214); // add r12, r12, r0
+        let _ = step(&mut vm, &obj, 0x001C, 0x7D89_03A6); // mtctr r12
+        let StepResult::Jump(BranchTarget::JumpTable {
+            jump_table_type,
+            jump_table_address,
+            size,
+        }) = step(&mut vm, &obj, 0x0020, 0x4E80_0420) // bctr
+        else {
+            panic!("expected bctr jump-table target");
+        };
+
+        assert_eq!(
+            jump_table_address,
+            RelocationTarget::Address(SectionAddress::new(0, 0x100))
+        );
+        assert_eq!(
+            jump_table_type,
+            JumpTableType::RelativeBytesTimes4(Some(RelocationTarget::Address(
+                SectionAddress::new(0, 0x200),
+            )))
+        );
+        assert_eq!(size, NonZeroU32::new(0x11));
+    }
 }
 
 // #[inline]

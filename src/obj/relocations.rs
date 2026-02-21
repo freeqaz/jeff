@@ -5,8 +5,8 @@ use std::{
     ops::RangeBounds,
 };
 
-use anyhow::{bail, Result};
-use object::{elf, pe, write::coff};
+use anyhow::Result;
+use object::{elf, pe};
 use serde::{Deserialize, Serialize};
 
 use crate::obj::SymbolIndex;
@@ -109,15 +109,14 @@ impl ObjReloc {
         match self.kind {
             ObjRelocKind::Absolute => pe::IMAGE_REL_PPC_ADDR32,
             ObjRelocKind::PpcAddr16Hi => {
-                unreachable!();
-                pe::IMAGE_REL_PPC_ABSOLUTE
+                panic!("PpcAddr16Hi relocations are not supported in COFF output")
             }
             ObjRelocKind::PpcAddr16Ha => pe::IMAGE_REL_PPC_REFHI,
             ObjRelocKind::PpcAddr16Lo => pe::IMAGE_REL_PPC_REFLO,
             ObjRelocKind::PpcRel24 => pe::IMAGE_REL_PPC_REL24,
             ObjRelocKind::PpcRel14 => pe::IMAGE_REL_PPC_REL14,
             ObjRelocKind::PpcEmbSda21 => {
-                unreachable!();
+                panic!("PpcEmbSda21 relocations are not supported in COFF output")
             }
         }
     }

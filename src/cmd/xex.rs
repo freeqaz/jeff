@@ -272,7 +272,7 @@ fn split_write_obj_exe(
 
     debug!("Splitting {} objects", module.obj.link_order.len());
     let module_name = module.config.name().to_string();
-    let split_objs = split_obj(&module.obj, None, false)?;
+    let split_objs = split_obj(&module.obj, None, config.globalize_symbols)?;
 
     debug!("Writing object files");
     DirBuilder::new()
