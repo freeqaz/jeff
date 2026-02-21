@@ -18,8 +18,8 @@ Options:
   -h, --help           Show this help
 
 This script runs a consolidated cutover gate:
-  1) cargo test cfa_tests
-  2) cfa_tests under pipeline shadow gate
+  1) cfa_tests forced to legacy mode
+  2) cfa_tests in default mode
   3) cfa_tests under VM2 native shadow gate
   4) DC3 parity smoke (default)
   5) DC3 parity smoke (strict candidate flags)
@@ -60,15 +60,15 @@ if [[ $BUILD_BIN -eq 1 ]]; then
     cargo build --bin dtk >/tmp/jeff-cutover-build-"$RUN_ID_PREFIX".log 2>&1
 fi
 
-echo "[cutover-gate] Running baseline cfa_tests..."
+echo "[cutover-gate] Running legacy-forced cfa_tests..."
+DTK_CFA_PIPELINE_MODE=legacy \
 cargo test cfa_tests -- --nocapture
 
-echo "[cutover-gate] Running shadow-gated cfa_tests..."
-DTK_CFA_ENABLE_PIPELINE_SHADOW=1 \
-DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS=0 \
+echo "[cutover-gate] Running default-mode cfa_tests..."
 cargo test cfa_tests -- --nocapture
 
 echo "[cutover-gate] Running native-VM2-gated cfa_tests..."
+DTK_CFA_PIPELINE_MODE=shadow \
 DTK_CFA_ENABLE_VM2_SHADOW=1 \
 DTK_CFA_VM_SHADOW_NATIVE_VM2=1 \
 DTK_CFA_MAX_VM_SHADOW_DELTAS=0 \

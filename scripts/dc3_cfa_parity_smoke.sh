@@ -27,7 +27,7 @@ Options:
   -h, --help          Show this help
 
 The script runs:
-  1) baseline split
+  1) legacy split
   2) shadow split
   3) candidate split
 
@@ -121,7 +121,7 @@ fi
 
 echo "[dc3-parity] Running baseline split..."
 BASE_RC=0
-split_cmd "$BASE_DIR" >"$BASE_LOG" 2>&1 || BASE_RC=$?
+split_cmd "$BASE_DIR" DTK_CFA_PIPELINE_MODE=legacy >"$BASE_LOG" 2>&1 || BASE_RC=$?
 
 echo "[dc3-parity] Running shadow split..."
 SHADOW_RC=0
@@ -182,6 +182,7 @@ DIFF_NONTRIV_BASE_CAND="$(
 
 echo "[dc3-parity] Summary"
 echo "  run_id: $RUN_ID"
+echo "  baseline_mode: legacy"
 echo "  strict_code_seeds: $STRICT_CODE_SEEDS"
 echo "  strict_symbol_size: $STRICT_SYMBOL_SIZE"
 echo "  baseline_rc: $BASE_RC"
