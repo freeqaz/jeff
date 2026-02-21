@@ -813,6 +813,8 @@ pub struct VmRuntimeShadowFunctionReport {
     pub steps_sampled: usize,
     pub native_steps: usize,
     pub bridged_steps: usize,
+    pub native_opcode_counts: BTreeMap<String, usize>,
+    pub bridged_opcode_counts: BTreeMap<String, usize>,
     pub summary: VmShadowDiffSummary,
 }
 
@@ -830,6 +832,8 @@ pub struct VmRuntimeShadowReport {
     pub steps_sampled: usize,
     pub native_steps: usize,
     pub bridged_steps: usize,
+    pub native_opcode_counts: BTreeMap<String, usize>,
+    pub bridged_opcode_counts: BTreeMap<String, usize>,
     pub function_reports: Vec<VmRuntimeShadowFunctionReport>,
 }
 
@@ -841,6 +845,11 @@ impl VmRuntimeShadowReport {
     pub fn functions_with_diffs(&self) -> usize {
         self.function_reports.iter().filter(|report| report.total_diffs() != 0).count()
     }
+}
+
+#[inline]
+fn record_opcode_count(counts: &mut BTreeMap<String, usize>, op: Opcode) {
+    *counts.entry(format!("{op:?}")).or_default() += 1;
 }
 
 impl VmShadowDiffReport {
@@ -977,6 +986,8 @@ pub fn runtime_vm_shadow_report_with_mode(
             steps_sampled: 0,
             native_steps: 0,
             bridged_steps: 0,
+            native_opcode_counts: BTreeMap::new(),
+            bridged_opcode_counts: BTreeMap::new(),
             summary: Default::default(),
         };
 
@@ -1003,10 +1014,14 @@ pub fn runtime_vm_shadow_report_with_mode(
                 if native_handled {
                     function_report.native_steps += 1;
                     report.native_steps += 1;
+                    record_opcode_count(&mut function_report.native_opcode_counts, ins.op);
+                    record_opcode_count(&mut report.native_opcode_counts, ins.op);
                 } else {
                     *vm2 = Vm2::from_legacy_vm(&vm);
                     function_report.bridged_steps += 1;
                     report.bridged_steps += 1;
+                    record_opcode_count(&mut function_report.bridged_opcode_counts, ins.op);
+                    record_opcode_count(&mut report.bridged_opcode_counts, ins.op);
                 }
                 let diff = VmShadowDiffReport::from_legacy_pair(&vm, vm2);
                 function_report.summary.accumulate(&diff.summary);
@@ -1168,8 +1183,12 @@ mod tests {
         assert_eq!(report.function_reports[0].steps_sampled, report.steps_sampled);
         assert_eq!(report.native_steps, 0);
         assert_eq!(report.bridged_steps, 0);
+        assert!(report.native_opcode_counts.is_empty());
+        assert!(report.bridged_opcode_counts.is_empty());
         assert_eq!(report.function_reports[0].native_steps, 0);
         assert_eq!(report.function_reports[0].bridged_steps, 0);
+        assert!(report.function_reports[0].native_opcode_counts.is_empty());
+        assert!(report.function_reports[0].bridged_opcode_counts.is_empty());
         assert_eq!(report.functions_with_diffs(), 0);
         assert_eq!(report.total_diffs(), 0);
     }
@@ -1199,6 +1218,10 @@ mod tests {
         );
         assert_eq!(report.native_steps, function_report.native_steps);
         assert_eq!(report.bridged_steps, function_report.bridged_steps);
+        assert_eq!(function_report.bridged_opcode_counts.get("Lwz"), Some(&1));
+        assert_eq!(report.bridged_opcode_counts.get("Lwz"), Some(&1));
+        assert!(function_report.native_opcode_counts.get("Ori").is_some());
+        assert!(report.native_opcode_counts.get("Ori").is_some());
         assert_eq!(report.total_diffs(), 0);
     }
 
@@ -1420,6 +1443,13 @@ mod tests {
             "all arithmetic/spr operations in this sequence should be native"
         );
         assert_eq!(report.bridged_steps, 0);
+        assert!(report.bridged_opcode_counts.is_empty());
+        assert!(function_report.bridged_opcode_counts.is_empty());
+        assert_eq!(
+            function_report.native_opcode_counts.values().sum::<usize>(),
+            function_report.native_steps
+        );
+        assert_eq!(report.native_opcode_counts.values().sum::<usize>(), report.native_steps);
         assert_eq!(function_report.native_steps, function_report.steps_sampled);
         assert_eq!(report.native_steps, report.steps_sampled);
         assert_eq!(report.total_diffs(), 0);
@@ -1452,6 +1482,8 @@ mod tests {
             "stack store/load path should now be handled natively"
         );
         assert_eq!(report.bridged_steps, 0);
+        assert!(report.bridged_opcode_counts.is_empty());
+        assert!(function_report.bridged_opcode_counts.is_empty());
         assert_eq!(function_report.native_steps, function_report.steps_sampled);
         assert_eq!(report.native_steps, report.steps_sampled);
         assert_eq!(report.total_diffs(), 0);
@@ -1481,6 +1513,10 @@ mod tests {
         assert_eq!(function_report.bridged_steps, 0);
         assert_eq!(report.native_steps, function_report.native_steps);
         assert_eq!(report.bridged_steps, function_report.bridged_steps);
+        assert!(report.bridged_opcode_counts.is_empty());
+        assert!(function_report.bridged_opcode_counts.is_empty());
+        assert!(function_report.native_opcode_counts.get("Or").is_some());
+        assert!(report.native_opcode_counts.get("Or").is_some());
         assert_eq!(report.total_diffs(), 0);
     }
 

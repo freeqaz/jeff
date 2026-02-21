@@ -446,6 +446,18 @@ Open technical debt (non-blocking for this branch state):
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
     - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_bridges_or_register_copy`
 
+- **Phase E2i complete (R7 runtime opcode telemetry)**: VM shadow reporting now tracks native-vs-bridged opcode coverage.
+  - `VmRuntimeShadowReport` and `VmRuntimeShadowFunctionReport` now include:
+    - `native_opcode_counts`
+    - `bridged_opcode_counts`
+  - Native runtime shadow sampling now records per-opcode coverage during both native and bridged paths.
+  - CFA VM-shadow debug telemetry now logs top bridged opcodes for rapid tranche planning.
+  - Updated runtime regressions verify opcode-count accounting in native and bridged scenarios:
+    - `analysis::vm2::tests::runtime_vm_shadow_report_tracks_sampling_counts`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_tracks_native_and_bridged_steps`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_arithmetic_and_spr_ops`
+    - `analysis::vm2::tests::runtime_vm_shadow_report_native_mode_handles_or_register_copy`
+
 - **Phase E1g complete (R6 cutover mode scaffold)**: CFA now has explicit execution-mode routing for staged default migration.
   - Added `PipelineExecutionMode` in `analysis::cfa` with env control:
     - `DTK_CFA_PIPELINE_MODE=legacy|shadow|candidate` (`auto` aliases `shadow`)
@@ -599,6 +611,10 @@ Open technical debt (non-blocking for this branch state):
         - Default-mode gate passed (`cargo test cfa_tests`, now running `shadow` by default).
         - Native-VM2 shadow gate passed (`DTK_CFA_PIPELINE_MODE=shadow` + VM shadow envs).
         - Default + strict parity legs passed with `baseline_mode: legacy` and non-trivial diff counts `0`.
+      - Post runtime opcode-telemetry wiring consolidated gate rerun:
+        - `scripts/cfa_cutover_gate.sh --no-build --run-id-prefix r20-opcodecounts` -> `PASS`
+        - `cfa_tests` legacy/default/native-VM2 legs all passed (`20/20` each).
+        - Default + strict parity legs passed (`baseline_mode: legacy`, non-trivial diffs `0`).
       - Post full register-copy OR native handling rerun:
         - `scripts/dc3_cfa_parity_smoke.sh --no-build --run-id r17-orfull` -> `PASS`
         - `baseline_rc=0`, `shadow_rc=0`, `candidate_rc=0`; non-trivial diff counts `0`.
@@ -633,6 +649,7 @@ Open technical debt (non-blocking for this branch state):
    - Define candidate-promotion thresholds before any default move beyond `shadow`.
 2. **R7 native VM2 coverage continuation**:
    - Extend native handling past tranche-1 (`cmp*`, `rlwinm/rlwnm`, `lwzx/lbzx/lhzx`, relative-base `add`) into selective branch-fact paths.
+   - Use `bridged_opcode_counts` telemetry from runtime shadow reports to prioritize the next opcode tranche.
    - Preserve deterministic bridge fallback for any provenance-sensitive gaps.
 3. **Real-XEX workflow promotion**:
    - Run explicit `legacy`/default(`shadow`)/`candidate` split comparisons on DC3 and sample executable-library XEX files.
