@@ -1562,6 +1562,8 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
             });
         if sect.kind != ObjSectionKind::Bss {
             cur_coff.append_section_data(sect_id, &data, sect.align);
+        } else {
+            cur_coff.append_section_bss(sect_id, sect.size, sect.align);
         }
         sect_map.insert(idx, sect_id);
     }

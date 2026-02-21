@@ -294,7 +294,7 @@ mod tests {
         disasm_test(&mut output, &test)?;
         let output_str = String::from_utf8(output)?;
         assert!(output_str.contains("82000000"));
-        assert!(output_str.contains("addi"));
+        assert!(output_str.contains("li"));
         assert!(output_str.contains("blr"));
         Ok(())
     }

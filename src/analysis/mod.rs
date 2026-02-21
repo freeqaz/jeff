@@ -15,12 +15,10 @@ pub mod cfa;
 pub mod executor;
 pub mod objects;
 pub mod pass;
-pub mod pipeline;
 pub mod signatures;
 pub mod slices;
 pub mod tracker;
 pub mod vm;
-pub mod vm2;
 
 pub fn disassemble(section: &ObjSection, address: u32) -> Option<Ins> {
     read_u32(section, address).map(|v| Ins::new(v, Extensions::xenon()))
