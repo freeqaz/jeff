@@ -313,7 +313,7 @@ fn log_vm_runtime_shadow_function_entries(report: &VmRuntimeShadowReport) {
     log::warn!("VM shadow function deltas (showing {} of {}):", shown, mismatched.len());
     for function_report in mismatched.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
         log::warn!(
-            "  {}: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) sampled_steps={} native_steps={} bridged_steps={} top_bridged_opcodes=[{}]",
+            "  {}: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) sampled_steps={} native_steps={} bridged_steps={} top_bridged_opcodes=[{}] top_diff_opcodes=[{}]",
             function_report.start,
             function_report.total_diffs(),
             function_report.summary.presence,
@@ -323,7 +323,8 @@ fn log_vm_runtime_shadow_function_entries(report: &VmRuntimeShadowReport) {
             function_report.steps_sampled,
             function_report.native_steps,
             function_report.bridged_steps,
-            format_top_opcode_counts(&function_report.bridged_opcode_counts, 3)
+            format_top_opcode_counts(&function_report.bridged_opcode_counts, 3),
+            format_top_opcode_counts(&function_report.diff_opcode_counts, 3)
         );
     }
 }
@@ -778,7 +779,7 @@ impl AnalyzerState {
                 vm_shadow_native_vm2,
             );
             log::debug!(
-                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} native_steps={} bridged_steps={} native_opcode_kinds={} bridged_opcode_kinds={} top_bridged_opcodes=[{}] mismatched_functions={} native_vm2={} max_functions={} max_steps={}",
+                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} native_steps={} bridged_steps={} native_opcode_kinds={} bridged_opcode_kinds={} diff_opcode_kinds={} top_bridged_opcodes=[{}] top_diff_opcodes=[{}] mismatched_functions={} native_vm2={} max_functions={} max_steps={}",
                 vm_shadow_report.total_diffs(),
                 vm_shadow_report.summary.presence,
                 vm_shadow_report.summary.value,
@@ -791,7 +792,9 @@ impl AnalyzerState {
                 vm_shadow_report.bridged_steps,
                 vm_shadow_report.native_opcode_counts.len(),
                 vm_shadow_report.bridged_opcode_counts.len(),
+                vm_shadow_report.diff_opcode_counts.len(),
                 format_top_opcode_counts(&vm_shadow_report.bridged_opcode_counts, 5),
+                format_top_opcode_counts(&vm_shadow_report.diff_opcode_counts, 5),
                 vm_shadow_report.functions_with_diffs(),
                 vm_shadow_native_vm2,
                 vm_shadow_config.max_functions,

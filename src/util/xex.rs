@@ -1446,6 +1446,22 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                                 .copy_from_slice(&new_insn.to_be_bytes());
                         }
                     }
+                    ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
+                        // REFHI/REFLO: 16-bit immediate in bits [15:0].
+                        // COFF relocations are additive — the linker reads the
+                        // existing immediate as an addend. The original XEX has
+                        // resolved addresses baked in (e.g., lis r11, 0x8200),
+                        // which would become spurious addends causing overflow.
+                        // Zero the immediate to match compiler output (addend=0).
+                        if offset + 4 <= data.len() {
+                            let insn = u32::from_be_bytes(
+                                data[offset..offset + 4].try_into().unwrap(),
+                            );
+                            let new_insn = insn & 0xFFFF0000;
+                            data[offset..offset + 4]
+                                .copy_from_slice(&new_insn.to_be_bytes());
+                        }
+                    }
                     _ => {}
                 }
             }

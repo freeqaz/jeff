@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU32,
 };
 
-use powerpc::{Ins, Opcode};
+use powerpc::{Argument, GPR, Ins, Opcode};
 
 use crate::analysis::{
     cfa::SectionAddress,
@@ -290,6 +290,17 @@ impl Vm2 {
     }
 
     #[inline]
+    fn clear_defined_registers_to_top(&mut self, ins: Ins) {
+        for argument in ins.defs() {
+            if let Argument::GPR(GPR(reg)) = argument {
+                let index = reg as usize;
+                self.gpr[index] = ValueFact2::top();
+                self.bump_reg_revision(index);
+            }
+        }
+    }
+
+    #[inline]
     fn apply_update_form_base_register(
         &mut self,
         obj: &ObjInfo,
@@ -389,7 +400,7 @@ impl Vm2 {
                             ))),
                         }
                     }
-                    _ => return false,
+                    _ => Value2::Top,
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
                 self.bump_reg_revision(dst);
@@ -635,7 +646,7 @@ impl Vm2 {
                             self.stack_slot_revisions.get(&offset).copied().unwrap_or_default();
                         loaded.provenance = Provenance2::StackSlot { offset, revision };
                         self.gpr[dst] = loaded;
-                        self.reg_revisions[dst] = revision.saturating_add(1);
+                        self.reg_revisions[dst] = revision;
                         return true;
                     }
                 }
@@ -643,13 +654,27 @@ impl Vm2 {
                 self.bump_reg_revision(dst);
                 true
             }
-            // stw rS, offset(r1): track stack-slot writes natively for provenance continuity.
-            Opcode::Stw if ins.field_ra() == 1 => {
-                let offset = ins.field_offset() as i16;
-                let source_reg = ins.field_rs() as usize;
-                let source = self.reg(ins.field_rs()).clone();
-                self.write_stack_slot(offset, source);
-                self.stack_slot_revisions.insert(offset, self.reg_revisions[source_reg]);
+            // stw rS, offset(rA): preserve stack-slot writes when rA == r1; otherwise no tracked state change.
+            Opcode::Stw => {
+                if ins.field_ra() == 1 {
+                    let offset = ins.field_offset() as i16;
+                    let source_reg = ins.field_rs() as usize;
+                    let source = self.reg(ins.field_rs()).clone();
+                    self.write_stack_slot(offset, source);
+                    self.stack_slot_revisions.insert(offset, self.reg_revisions[source_reg]);
+                }
+                true
+            }
+            // std rS, offset(rA): no tracked GPR state mutation.
+            Opcode::Std => true,
+            // stdu rS, offset(rA): update-form base register semantics.
+            Opcode::Stdu => {
+                self.apply_update_form_base_register(
+                    obj,
+                    ins_addr,
+                    ins.field_ra(),
+                    ins.field_simm(),
+                );
                 true
             }
             // ori rA, rS, UIMM
@@ -739,6 +764,11 @@ impl Vm2 {
                 };
                 self.gpr[dst] = Self::fact_from_value(value);
                 self.bump_reg_revision(dst);
+                true
+            }
+            // Legacy default behavior for these ops is to invalidate defined destination register facts.
+            Opcode::Extsb | Opcode::Cntlzw | Opcode::Mullw | Opcode::Divw | Opcode::Divwu => {
+                self.clear_defined_registers_to_top(ins);
                 true
             }
             // mtspr SPR, rS
@@ -887,6 +917,7 @@ pub struct VmRuntimeShadowFunctionReport {
     pub bridged_steps: usize,
     pub native_opcode_counts: BTreeMap<String, usize>,
     pub bridged_opcode_counts: BTreeMap<String, usize>,
+    pub diff_opcode_counts: BTreeMap<String, usize>,
     pub summary: VmShadowDiffSummary,
 }
 
@@ -906,6 +937,7 @@ pub struct VmRuntimeShadowReport {
     pub bridged_steps: usize,
     pub native_opcode_counts: BTreeMap<String, usize>,
     pub bridged_opcode_counts: BTreeMap<String, usize>,
+    pub diff_opcode_counts: BTreeMap<String, usize>,
     pub function_reports: Vec<VmRuntimeShadowFunctionReport>,
 }
 
@@ -1060,12 +1092,14 @@ pub fn runtime_vm_shadow_report_with_mode(
             bridged_steps: 0,
             native_opcode_counts: BTreeMap::new(),
             bridged_opcode_counts: BTreeMap::new(),
+            diff_opcode_counts: BTreeMap::new(),
             summary: Default::default(),
         };
 
         let mut vm = VM::new_from_obj(obj);
         let mut vm2_native = native_vm2.then(Vm2::new);
         let mut addr = start;
+        let mut prior_diff_total = 0usize;
         for _ in 0..config.max_steps_per_function {
             if !section.contains(addr.address) {
                 break;
@@ -1096,6 +1130,14 @@ pub fn runtime_vm_shadow_report_with_mode(
                     record_opcode_count(&mut report.bridged_opcode_counts, ins.op);
                 }
                 let diff = VmShadowDiffReport::from_legacy_pair(&vm, vm2);
+                let diff_total = diff.summary.total();
+                if diff_total > prior_diff_total {
+                    for _ in 0..(diff_total - prior_diff_total) {
+                        record_opcode_count(&mut function_report.diff_opcode_counts, ins.op);
+                        record_opcode_count(&mut report.diff_opcode_counts, ins.op);
+                    }
+                }
+                prior_diff_total = diff_total;
                 function_report.summary.accumulate(&diff.summary);
             } else {
                 // Baseline mode maps candidate facts from legacy VM state.
