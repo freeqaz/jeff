@@ -1545,8 +1545,16 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
             }
         }
 
+        // Rename .CRT sections to .CRT$XCU so the MSVC linker places them
+        // between .CRT$XCA (start sentinel) and .CRT$XCZ (end sentinel),
+        // which is required for CRT dynamic initializers to run at startup.
+        let coff_sect_name = if sect.name == ".CRT" {
+            b".CRT$XCU".to_vec()
+        } else {
+            sect.name.clone().into_bytes()
+        };
         let sect_id =
-            cur_coff.add_section(Vec::new(), sect.name.clone().into_bytes(), match sect.kind {
+            cur_coff.add_section(Vec::new(), coff_sect_name, match sect.kind {
                 ObjSectionKind::Code => SectionKind::Text,
                 ObjSectionKind::Data => SectionKind::Data,
                 ObjSectionKind::ReadOnlyData => SectionKind::ReadOnlyData,

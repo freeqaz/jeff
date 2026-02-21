@@ -19,6 +19,176 @@ use crate::{
     util::{align_up, comment::MWComment, toposort::toposort},
 };
 
+/// Check if a symbol is part of a CRT initialization array.
+///
+/// The MSVC CRT uses arrays of function pointers bracketed by sentinel symbols
+/// (__x*_a / __x*_z) that are iterated via `_initterm()` during startup.
+/// Entries between sentinels (like `__pioinit`) are found by position, not by
+/// name, so they must NOT be COMDAT (the linker's /OPT:REF would drop them).
+///
+/// Sentinel patterns: __xri_a, __xri_z, __xc_a, __xc_z, __xi_a, __xi_z,
+///                    __xp_a, __xp_z, __xt_a, __xt_z
+/// Entry examples:    __pioinit (CRT$XRI), __onexitbegin (CRT$XRI)
+fn is_crt_array_symbol(name: &str) -> bool {
+    // CRT sentinels: __x{letters}_a or __x{letters}_z
+    if name.starts_with("__x") && (name.ends_with("_a") || name.ends_with("_z")) {
+        let middle = &name[3..name.len() - 2];
+        if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_lowercase()) {
+            return true;
+        }
+    }
+    // Known CRT array entries that sit between sentinels
+    matches!(name, "__pioinit" | "__onexitbegin" | "__onexitend")
+}
+
+/// Create splits for MSVC .CRT$XCU initializer function pointers.
+/// Each 4-byte entry in the .CRT section is an ADDR32 relocation targeting
+/// an initializer function (typically ??__E* symbols). We ensure each .CRT
+/// entry is in the same compilation unit as the function it references.
+fn split_crt_initializers(obj: &mut ObjInfo, section_index: crate::obj::SectionIndex) -> Result<()> {
+    let section = &obj.sections[section_index];
+    let start = SectionAddress::new(section_index, section.address as u32);
+    let end = start + section.size as u32;
+    let mut new_splits = BTreeMap::<SectionAddress, ObjSplit>::new();
+    let mut referenced_symbols = vec![];
+    let mut current_address = start;
+
+    log::info!(
+        "Processing .CRT initializers: {} entries from {:#010X} to {:#010X}",
+        section.size / 4,
+        start,
+        end
+    );
+
+    while current_address < end {
+        // Each entry is a 4-byte function pointer with an ADDR32 relocation
+        let word = read_u32(section, current_address.address);
+        if matches!(word, Some(0)) {
+            // Null entry — sentinel or padding, skip
+            current_address += 4;
+            continue;
+        }
+
+        // Find the relocation at this address to determine the target function
+        let target = relocation_target_for(obj, current_address, Some(ObjRelocKind::Absolute))?;
+        let Some(target) = target else {
+            log::warn!(
+                ".CRT entry at {:#010X} has no ADDR32 relocation (word={:#010X}), skipping",
+                current_address,
+                word.unwrap_or(0)
+            );
+            current_address += 4;
+            continue;
+        };
+        let function_addr = match target {
+            crate::analysis::RelocationTarget::Address(addr) => addr,
+            crate::analysis::RelocationTarget::External => {
+                log::warn!(
+                    ".CRT entry at {:#010X} points to external relocation, skipping",
+                    current_address
+                );
+                current_address += 4;
+                continue;
+            }
+        };
+
+        log::debug!(
+            "Found .CRT initializer entry: {:#010X} -> function {:#010X}",
+            current_address,
+            function_addr
+        );
+
+        // Try to find the target function symbol
+        let function_symbol_result = obj.symbols.kind_at_section_address(
+            function_addr.section,
+            function_addr.address,
+            ObjSymbolKind::Function,
+        )?;
+        let Some((function_symbol_idx, function_symbol)) = function_symbol_result else {
+            log::warn!(
+                "No function symbol at {:#010X} for .CRT entry at {:#010X}, skipping",
+                function_addr,
+                current_address
+            );
+            current_address += 4;
+            continue;
+        };
+        referenced_symbols.push(function_symbol_idx);
+
+        let text_section = &obj.sections[function_addr.section];
+        let crt_split = section.splits.for_address(current_address.address);
+        let function_split = text_section.splits.for_address(function_addr.address);
+
+        // Determine which unit both should belong to
+        let mut expected_unit = None;
+        if let Some((_, crt_split)) = crt_split {
+            expected_unit = Some(crt_split.unit.clone());
+        }
+        if let Some((_, function_split)) = function_split {
+            if let Some(ref unit) = expected_unit {
+                if unit != &function_split.unit {
+                    log::warn!(
+                        "Mismatched splits for .CRT {:#010X} ({}) and function {:#010X} ({}), \
+                         using function's unit",
+                        current_address,
+                        unit,
+                        function_addr,
+                        function_split.unit
+                    );
+                    expected_unit = Some(function_split.unit.clone());
+                }
+            } else {
+                expected_unit = Some(function_split.unit.clone());
+            }
+        }
+
+        if crt_split.is_none() || function_split.is_none() {
+            let unit = match expected_unit {
+                Some(unit) => unit,
+                None => auto_unit_name(obj, function_symbol, &new_splits)?,
+            };
+            log::debug!("Adding .CRT splits to unit {}", unit);
+
+            if crt_split.is_none() {
+                new_splits.insert(current_address, ObjSplit {
+                    unit: unit.clone(),
+                    end: current_address.address + 4,
+                    align: None,
+                    common: false,
+                    autogenerated: true,
+                    skip: false,
+                    rename: None,
+                });
+            }
+            if function_split.is_none() {
+                new_splits.insert(function_addr, ObjSplit {
+                    unit,
+                    end: function_addr.address + function_symbol.size as u32,
+                    align: None,
+                    common: false,
+                    autogenerated: true,
+                    skip: false,
+                    rename: None,
+                });
+            }
+        }
+
+        current_address += 4;
+    }
+
+    for (addr, split) in new_splits {
+        obj.add_split(addr.section, addr.address, split)?;
+    }
+
+    // Force-active to prevent deadstripping of CRT initializer functions
+    for symbol_idx in referenced_symbols {
+        obj.symbols.flags(symbol_idx).set_force_active(true);
+    }
+
+    log::info!("Finished processing .CRT initializers");
+    Ok(())
+}
+
 /// Create splits for function pointers in the given section.
 #[allow(dead_code)]
 fn split_ctors_dtors(obj: &mut ObjInfo, start: SectionAddress, end: SectionAddress) -> Result<()> {
@@ -932,6 +1102,16 @@ pub fn update_splits(obj: &mut ObjInfo, common_start: Option<u32>, fill_gaps: bo
     //     }
     // }
 
+    // Create splits for .CRT initializer entries (MSVC Xbox 360)
+    // The .CRT section contains function pointers that the CRT calls during
+    // startup (_cinit / _initterm). We need to ensure each .CRT entry is
+    // co-located with the initializer function it references.
+    if let Some((section_index, section)) = obj.sections.by_name(".CRT")? {
+        if !section.data.is_empty() {
+            split_crt_initializers(obj, section_index)?;
+        }
+    }
+
     // Create splits for .pdata entries
     split_pdata(obj)?;
 
@@ -1457,6 +1637,16 @@ pub fn split_obj(
                 && !sym.name.starts_with("except_data_")
                 && !sym.name.starts_with("except_record_")
                 && !sym.name.starts_with("__unwind$")
+                // CRT dynamic initializers (??__E*) must not be COMDAT —
+                // they are referenced by .CRT$XCU entries and must run exactly once.
+                && !sym.name.starts_with("??__E")
+                // CRT sentinel arrays (__x*_a / __x*_z) and entries between them
+                // (e.g., __pioinit) must not be COMDAT. The CRT iterates these
+                // arrays by position between sentinels using _initterm(). If an
+                // entry becomes COMDAT, /OPT:REF drops it (nothing references it
+                // by name), breaking CRT initialization (e.g., _ioinit never runs,
+                // __pioinfo stays NULL, __initstdio hangs).
+                && !is_crt_array_symbol(&sym.name)
                 // CRT save/restore stubs use fall-through execution — each entry
                 // saves/restores one register and falls into the next. Extracting
                 // them as COMDAT sections breaks this fall-through chain.
