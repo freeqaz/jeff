@@ -793,8 +793,9 @@ impl Vm2 {
                 self.bump_reg_revision(dst);
                 true
             }
-            // Non-link branches do not update architectural value state tracked by VM2.
-            Opcode::B | Opcode::Bc | Opcode::Bcctr | Opcode::Bclr if !ins.field_lk() => true,
+            // Runtime shadow linear stepping does not consume branch-taken semantics, so both
+            // link and non-link branch forms can be treated as no-op state transitions here.
+            Opcode::B | Opcode::Bc | Opcode::Bcctr | Opcode::Bclr => true,
             // Illegal decode terminates execution in both VMs without mutating tracked facts.
             Opcode::Illegal => true,
             _ => false,
@@ -1336,6 +1337,36 @@ mod tests {
         assert_eq!(report.bridged_opcode_counts.get("Lwzu"), Some(&1));
         assert!(function_report.native_opcode_counts.get("Ori").is_some());
         assert!(report.native_opcode_counts.get("Ori").is_some());
+        assert_eq!(report.total_diffs(), 0);
+    }
+
+    #[test]
+    fn runtime_vm_shadow_report_native_mode_handles_link_branch_b() {
+        // bl +8 -> nop -> blr
+        let obj = make_obj_with_words(0x1000, &[0x4800_0009, 0x6000_0000, 0x4E80_0020]);
+        let starts = [SectionAddress::new(0, 0x1000)];
+        let report = runtime_vm_shadow_report_with_mode(
+            &obj,
+            &starts,
+            VmRuntimeShadowConfig { max_functions: 1, max_steps_per_function: 16 },
+            true,
+        );
+        assert_eq!(report.functions_requested, 1);
+        assert_eq!(report.functions_sampled, 1);
+        assert_eq!(report.function_reports.len(), 1);
+        let function_report = &report.function_reports[0];
+        assert!(
+            function_report.native_steps >= 1,
+            "link-branch opcode should be handled natively"
+        );
+        assert_eq!(
+            function_report.bridged_opcode_counts.get("B"),
+            None,
+            "link-branch opcode should no longer bridge"
+        );
+        assert_eq!(report.bridged_opcode_counts.get("B"), None);
+        assert!(function_report.native_opcode_counts.get("B").is_some());
+        assert!(report.native_opcode_counts.get("B").is_some());
         assert_eq!(report.total_diffs(), 0);
     }
 
