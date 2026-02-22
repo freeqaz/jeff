@@ -3,9 +3,11 @@ use std::fs::File;
 use anyhow::Result;
 use serde::{de::Error, Deserialize, Deserializer};
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::{
-    analysis::cfa::AnalyzerState,
+    analysis::cfa::{CfaConfig, FunctionInfo, SectionAddress, process_function_at},
     obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind},
 };
 
@@ -105,14 +107,16 @@ fn test_super_basic_cfa() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         None,
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     let start_addr = SectionAddress::new(0, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
@@ -227,24 +231,26 @@ fn test_jump_table_absolute_1() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         None,
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     let start_addr = SectionAddress::new(0, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     // 16 bytes (4 entries)
-    let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x820869fc));
+    let jump_table_entry = jump_tables.get(&SectionAddress::new(0, 0x820869fc));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
     assert!(func.slices.is_some());
@@ -263,24 +269,26 @@ fn test_jump_table_absolute_2() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         None,
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     let start_addr = SectionAddress::new(0, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     // 16 bytes (4 entries)
-    let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x827f9434));
+    let jump_table_entry = jump_tables.get(&SectionAddress::new(0, 0x827f9434));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
     assert!(func.slices.is_some());
@@ -300,24 +308,26 @@ fn test_jump_table_absolute_3() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         None,
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     let start_addr = SectionAddress::new(0, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     // 16 bytes (4 entries)
-    let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x82fbb464));
+    let jump_table_entry = jump_tables.get(&SectionAddress::new(0, 0x82fbb464));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
     assert!(func.slices.is_some());
@@ -336,25 +346,27 @@ fn test_jump_table_relative_bytes_1() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 105);
     assert!(func.slices.is_some());
@@ -373,25 +385,27 @@ fn test_jump_table_relative_bytes_2() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x1c);
     assert!(func.slices.is_some());
@@ -410,25 +424,27 @@ fn test_jump_table_relative_bytes_3() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 11);
     assert!(func.slices.is_some());
@@ -447,25 +463,27 @@ fn test_jump_table_relative_bytes_4() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 12);
     assert!(func.slices.is_some());
@@ -484,25 +502,27 @@ fn test_jump_table_relative_bytes_5() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 12);
     assert!(func.slices.is_some());
@@ -521,25 +541,27 @@ fn test_jump_table_relative_bytes_6() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 10);
     assert!(func.slices.is_some());
@@ -558,25 +580,27 @@ fn test_jump_table_relative_bytes_7() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x15);
     assert!(func.slices.is_some());
@@ -600,25 +624,27 @@ fn test_jump_table_relative_shorts_1() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 28);
     assert!(func.slices.is_some());
@@ -637,25 +663,27 @@ fn test_jump_table_relative_shorts_2() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     // 94 bytes = 47 entries (cmplwi r28, 46 → 0..46 inclusive)
     assert_eq!(*jump_table_entry.unwrap(), 94);
@@ -675,25 +703,27 @@ fn test_jump_table_relative_shorts_3() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 128);
     assert!(func.slices.is_some());
@@ -712,25 +742,27 @@ fn test_jump_table_relative_shorts_4() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 16);
     assert!(func.slices.is_some());
@@ -749,25 +781,27 @@ fn test_jump_table_relative_shorts_5() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 20);
     assert!(func.slices.is_some());
@@ -786,25 +820,27 @@ fn test_jump_table_relative_shorts_6() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x38);
     assert!(func.slices.is_some());
@@ -823,25 +859,27 @@ fn test_jump_table_relative_shorts_7() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 60);
     assert!(func.slices.is_some());
@@ -860,25 +898,27 @@ fn test_jump_table_relative_shorts_8() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         Some(make_data_section(cur_test.jump_table_start, &cur_test.jump_table_bytes)),
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     // section 1 is .text now that we have a relative jump table in .rdata
     let start_addr = SectionAddress::new(1, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     let jump_table_entry =
-        state.jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
+        jump_tables.get(&SectionAddress::new(0, cur_test.jump_table_start));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 20);
     assert!(func.slices.is_some());
@@ -900,24 +940,26 @@ fn test_jump_table_absolute_stack_meme() -> Result<()> {
         make_code_section(cur_test.function_start, &cur_test.function_bytes),
         None,
     );
-    let mut state = AnalyzerState::default();
+    let config = CfaConfig::default();
+    let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+    let mut jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
     let start_addr = SectionAddress::new(0, cur_test.function_start);
     // CFA completed with no errors
-    let res = state.process_function_at(&obj, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
+    let res = process_function_at(&obj, &config, &mut functions, &mut jump_tables, start_addr).unwrap_or_else(|e| panic!("{:?}", e));
     // we have one more function
     assert!(res);
-    assert_eq!(state.functions.len(), 1);
-    let func = state.functions.get(&start_addr);
+    assert_eq!(functions.len(), 1);
+    let func = functions.get(&start_addr);
     assert!(func.is_some());
     let func = func.unwrap();
     assert!(func.is_function());
     // does the detected function end match our expected end?
     assert_eq!(func.end, Some(start_addr + cur_test.function_bytes.len() as u32));
     // for this func, we should have 1 jump table
-    assert_eq!(state.jump_tables.is_empty(), false);
-    assert_eq!(state.jump_tables.len(), 1);
+    assert_eq!(jump_tables.is_empty(), false);
+    assert_eq!(jump_tables.len(), 1);
     // 0x5A4 bytes = 0x169 entries × 4 bytes/entry (Absolute)
-    let jump_table_entry = state.jump_tables.get(&SectionAddress::new(0, 0x82185be8));
+    let jump_table_entry = jump_tables.get(&SectionAddress::new(0, 0x82185be8));
     assert!(jump_table_entry.is_some());
     assert_eq!(*jump_table_entry.unwrap(), 0x5A4);
     assert!(func.slices.is_some());

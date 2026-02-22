@@ -3,7 +3,7 @@ use itertools::Itertools;
 
 use crate::{
     analysis::{
-        cfa::{AnalyzerState, SectionAddress},
+        cfa::{CfaConfig, FunctionInfo, SectionAddress, process_function_at},
         read_address,
     },
     obj::{
@@ -375,9 +375,11 @@ fn apply_init_user_signatures(obj: &mut ObjInfo) -> Result<()> {
         return Ok(());
     };
     // __init_user can be overridden, but we can still look for __init_cpp from it
-    let mut analyzer = AnalyzerState::default();
-    analyzer.process_function_at(obj, SectionAddress::new(section_index, symbol.address as u32))?;
-    for (addr, _) in analyzer.functions {
+    let config = CfaConfig::default();
+    let mut functions = std::collections::BTreeMap::<SectionAddress, FunctionInfo>::new();
+    let mut jump_tables = std::collections::BTreeMap::<SectionAddress, u32>::new();
+    process_function_at(obj, &config, &mut functions, &mut jump_tables, SectionAddress::new(section_index, symbol.address as u32))?;
+    for (addr, _) in functions {
         let section = &obj.sections[addr.section];
         if let Some(signature) = check_signatures_str(
             section,

@@ -1334,7 +1334,13 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
         }
         let section_idx = sym.section.unwrap();
         let Some(sect) = obj.sections.get(section_idx) else { continue };
-        if sect.kind == ObjSectionKind::Bss {
+        // Only extract code sections to COMDAT. Data/rdata symbols stay in
+        // their parent sections to preserve relocations (e.g., vtable entries
+        // that reference COMDAT functions). Without this, vtable relocations
+        // get claimed by the COMDAT branch but dropped when the .rdata$dup
+        // extraction doesn't properly preserve them, resulting in null vtable
+        // entries at link time.
+        if sect.kind != ObjSectionKind::Code {
             continue;
         }
         let offset = sym.address - sect.address;
@@ -1562,6 +1568,8 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
             });
         if sect.kind != ObjSectionKind::Bss {
             cur_coff.append_section_data(sect_id, &data, sect.align);
+        } else {
+            cur_coff.append_section_bss(sect_id, sect.size, sect.align);
         }
         sect_map.insert(idx, sect_id);
     }

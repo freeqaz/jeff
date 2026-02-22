@@ -1,7 +1,6 @@
 use std::{
     cmp::min,
     collections::{BTreeMap, BTreeSet},
-    env,
     fmt::{Debug, Display, Formatter, UpperHex},
     ops::{Add, AddAssign, BitAnd, Sub},
 };
@@ -14,17 +13,8 @@ use crate::{
     analysis::{
         disassemble,
         executor::{ExecCbData, ExecCbResult, Executor},
-        pipeline::{
-            compare_phase_checkpoints, phase_checkpoint_diff_entries, CandidatePipelineConfig,
-            CandidatePipelineEngine, CfaPipelineEngine, LegacyPipelineEngine,
-            PhaseCheckpointDiffEntry, PhaseCheckpointDiffSummary, PipelineDiffEntry,
-            PipelineDiffSummary,
-        },
         slices::{FunctionSlices, TailCallResult},
-        vm::{BranchTarget, GprValue, StepResult, VM},
-        vm2::{
-            runtime_vm_shadow_report_with_mode, VmRuntimeShadowConfig, VmRuntimeShadowReport,
-        },
+        vm::{BranchTarget, Value, StepResult, VM},
         RelocationTarget,
     },
     obj::{
@@ -139,1299 +129,931 @@ impl FunctionInfo {
     }
 }
 
-pub(crate) const ENABLE_VM2_CANDIDATE_SHADOW: bool = false;
-pub(crate) const ENABLE_PIPELINE_CANDIDATE_SHADOW: bool = false;
-pub(crate) const MAX_ALLOWED_VM_SHADOW_DELTAS: usize = 0;
-pub(crate) const MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS: usize = 0;
-pub(crate) const ENV_PIPELINE_MODE: &str = "DTK_CFA_PIPELINE_MODE";
-pub(crate) const ENV_ENABLE_VM2_SHADOW: &str = "DTK_CFA_ENABLE_VM2_SHADOW";
-pub(crate) const ENV_ENABLE_PIPELINE_SHADOW: &str = "DTK_CFA_ENABLE_PIPELINE_SHADOW";
-pub(crate) const ENV_MAX_VM_SHADOW_DELTAS: &str = "DTK_CFA_MAX_VM_SHADOW_DELTAS";
-pub(crate) const ENV_MAX_PHASE_CHECKPOINT_DELTAS: &str = "DTK_CFA_MAX_PHASE_CHECKPOINT_DELTAS";
-pub(crate) const ENV_VM_SHADOW_MAX_FUNCTIONS: &str = "DTK_CFA_VM_SHADOW_MAX_FUNCTIONS";
-pub(crate) const ENV_VM_SHADOW_MAX_STEPS: &str = "DTK_CFA_VM_SHADOW_MAX_STEPS";
-pub(crate) const ENV_VM_SHADOW_NATIVE_VM2: &str = "DTK_CFA_VM_SHADOW_NATIVE_VM2";
-pub(crate) const ENV_CANDIDATE_STRICT_CODE_SEEDS: &str = "DTK_CFA_CANDIDATE_STRICT_CODE_SEEDS";
-pub(crate) const ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS: &str =
-    "DTK_CFA_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS";
-const MAX_LOGGED_SHADOW_DELTA_ENTRIES: usize = 8;
-const DEFAULT_PIPELINE_EXECUTION_MODE: PipelineExecutionMode = PipelineExecutionMode::Candidate;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub(crate) enum PipelineExecutionMode {
-    #[default]
-    Legacy,
-    Shadow,
-    Candidate,
-}
-
-fn parse_shadow_bool(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn parse_pipeline_execution_mode(raw: &str) -> Option<PipelineExecutionMode> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "legacy" => Some(PipelineExecutionMode::Legacy),
-        "shadow" | "auto" => Some(PipelineExecutionMode::Shadow),
-        "candidate" => Some(PipelineExecutionMode::Candidate),
-        _ => None,
-    }
-}
-
-fn read_shadow_bool_env(name: &str, default: bool) -> bool {
-    match env::var(name) {
-        Ok(raw) => parse_shadow_bool(&raw).unwrap_or_else(|| {
-            log::warn!("Invalid {} value '{}', using default {}", name, raw, default);
-            default
-        }),
-        Err(_) => default,
-    }
-}
-
-fn read_shadow_usize_env(name: &str, default: usize) -> usize {
-    match env::var(name) {
-        Ok(raw) => raw.parse::<usize>().unwrap_or_else(|_| {
-            log::warn!("Invalid {} value '{}', using default {}", name, raw, default);
-            default
-        }),
-        Err(_) => default,
-    }
-}
-
-fn read_pipeline_execution_mode_env(default: PipelineExecutionMode) -> PipelineExecutionMode {
-    match env::var(ENV_PIPELINE_MODE) {
-        Ok(raw) => parse_pipeline_execution_mode(&raw).unwrap_or_else(|| {
-            log::warn!(
-                "Invalid {} value '{}', using default {:?}",
-                ENV_PIPELINE_MODE,
-                raw,
-                default
-            );
-            default
-        }),
-        Err(_) => default,
-    }
-}
-
-fn read_candidate_pipeline_config() -> CandidatePipelineConfig {
-    CandidatePipelineConfig {
-        strict_code_seeds: read_shadow_bool_env(ENV_CANDIDATE_STRICT_CODE_SEEDS, false),
-        strict_symbol_size_seeds: read_shadow_bool_env(
-            ENV_CANDIDATE_STRICT_SYMBOL_SIZE_SEEDS,
-            false,
-        ),
-    }
-}
-
-fn log_phase_checkpoint_delta_entries(entries: &[PhaseCheckpointDiffEntry]) {
-    if entries.is_empty() {
-        return;
-    }
-    let shown = entries.len().min(MAX_LOGGED_SHADOW_DELTA_ENTRIES);
-    log::warn!(
-        "Phase checkpoint deltas (showing {} of {}):",
-        shown,
-        entries.len()
-    );
-    for entry in entries.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
-        log::warn!("  {:?}: legacy={} candidate={}", entry.kind, entry.left, entry.right);
-    }
-}
-
-fn log_phase_checkpoint_delta_summary(summary: &PhaseCheckpointDiffSummary) {
-    if summary.total() == 0 {
-        return;
-    }
-    log::warn!(
-        "Phase checkpoint delta summary: seed_count={} processed_seed_count={} function_count={} jump_table_count={}",
-        summary.seed_count,
-        summary.processed_seed_count,
-        summary.function_count,
-        summary.jump_table_count
-    );
-}
-
-fn log_pipeline_digest_delta_entries(entries: &[PipelineDiffEntry]) {
-    if entries.is_empty() {
-        return;
-    }
-    let shown = entries.len().min(MAX_LOGGED_SHADOW_DELTA_ENTRIES);
-    log::warn!("Pipeline digest deltas (showing {} of {}):", shown, entries.len());
-    for entry in entries.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
-        log::warn!(
-            "  {:?} @ {}: legacy={} candidate={}",
-            entry.kind,
-            entry.address,
-            entry.left,
-            entry.right
-        );
-    }
-}
-
-fn log_pipeline_digest_delta_summary(summary: &PipelineDiffSummary) {
-    if summary.total() == 0 {
-        return;
-    }
-    log::warn!(
-        "Pipeline digest delta summary: function_presence={} function_end={} function_state={} jump_table_presence={} jump_table_size={}",
-        summary.function_presence,
-        summary.function_end,
-        summary.function_state,
-        summary.jump_table_presence,
-        summary.jump_table_size
-    );
-}
-
-fn format_top_opcode_counts(counts: &BTreeMap<String, usize>, max_entries: usize) -> String {
-    if counts.is_empty() {
-        return "none".into();
-    }
-    counts
-        .iter()
-        .sorted_by(|(left_op, left_count), (right_op, right_count)| {
-            right_count.cmp(left_count).then_with(|| left_op.cmp(right_op))
-        })
-        .take(max_entries)
-        .map(|(opcode, count)| format!("{opcode}:{count}"))
-        .join(", ")
-}
-
-fn log_vm_runtime_shadow_function_entries(report: &VmRuntimeShadowReport) {
-    let mismatched = report
-        .function_reports
-        .iter()
-        .filter(|function_report| function_report.total_diffs() != 0)
-        .collect_vec();
-    if mismatched.is_empty() {
-        return;
-    }
-    let shown = mismatched.len().min(MAX_LOGGED_SHADOW_DELTA_ENTRIES);
-    log::warn!("VM shadow function deltas (showing {} of {}):", shown, mismatched.len());
-    for function_report in mismatched.iter().take(MAX_LOGGED_SHADOW_DELTA_ENTRIES) {
-        log::warn!(
-            "  {}: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) sampled_steps={} native_steps={} bridged_steps={} top_bridged_opcodes=[{}] top_diff_opcodes=[{}]",
-            function_report.start,
-            function_report.total_diffs(),
-            function_report.summary.presence,
-            function_report.summary.value,
-            function_report.summary.provenance,
-            function_report.summary.confidence,
-            function_report.steps_sampled,
-            function_report.native_steps,
-            function_report.bridged_steps,
-            format_top_opcode_counts(&function_report.bridged_opcode_counts, 3),
-            format_top_opcode_counts(&function_report.diff_opcode_counts, 3)
-        );
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct CandidateShadowGateConfig {
-    pub enable_vm2_shadow: bool,
-    pub enable_pipeline_shadow: bool,
-    pub max_vm_shadow_deltas: usize,
-    pub max_phase_checkpoint_deltas: usize,
-}
-
-impl CandidateShadowGateConfig {
-    pub(crate) fn defaults() -> Self {
-        Self {
-            enable_vm2_shadow: read_shadow_bool_env(
-                ENV_ENABLE_VM2_SHADOW,
-                ENABLE_VM2_CANDIDATE_SHADOW,
-            ),
-            enable_pipeline_shadow: read_shadow_bool_env(
-                ENV_ENABLE_PIPELINE_SHADOW,
-                ENABLE_PIPELINE_CANDIDATE_SHADOW,
-            ),
-            max_vm_shadow_deltas: read_shadow_usize_env(
-                ENV_MAX_VM_SHADOW_DELTAS,
-                MAX_ALLOWED_VM_SHADOW_DELTAS,
-            ),
-            max_phase_checkpoint_deltas: read_shadow_usize_env(
-                ENV_MAX_PHASE_CHECKPOINT_DELTAS,
-                MAX_ALLOWED_PHASE_CHECKPOINT_DELTAS,
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum CandidateFallbackReason {
-    VmShadowDeltasExceeded,
-    PhaseCheckpointDeltasExceeded,
-    PipelineDigestMismatch,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Default)]
-pub(crate) struct CandidateShadowDecision {
-    pub vm_shadow_deltas: usize,
-    pub phase_checkpoint_deltas: usize,
-    pub reasons: Vec<CandidateFallbackReason>,
-}
-
-impl CandidateShadowDecision {
-    pub fn should_fallback(&self) -> bool {
-        !self.reasons.is_empty()
-    }
-}
-
-pub(crate) fn evaluate_candidate_shadow_decision(
-    vm_shadow_deltas: usize,
-    phase_checkpoint_deltas: usize,
-    gate_config: CandidateShadowGateConfig,
-) -> CandidateShadowDecision {
-    let mut reasons = Vec::new();
-    if gate_config.enable_vm2_shadow && vm_shadow_deltas > gate_config.max_vm_shadow_deltas {
-        reasons.push(CandidateFallbackReason::VmShadowDeltasExceeded);
-    }
-    if gate_config.enable_pipeline_shadow
-        && phase_checkpoint_deltas > gate_config.max_phase_checkpoint_deltas
-    {
-        reasons.push(CandidateFallbackReason::PhaseCheckpointDeltasExceeded);
-    }
-    CandidateShadowDecision { vm_shadow_deltas, phase_checkpoint_deltas, reasons }
-}
-
-pub(crate) fn select_candidate_or_legacy<T: Clone>(
-    legacy_result: &T,
-    candidate_result: &T,
-    decision: &CandidateShadowDecision,
-) -> T {
-    if decision.should_fallback() {
-        legacy_result.clone()
-    } else {
-        candidate_result.clone()
-    }
-}
-
+/// Immutable configuration inputs for CFA.
+/// Configured before analysis starts (e.g. by AnalysisPass implementations).
 #[derive(Debug, Default)]
-pub struct AnalyzerState {
+pub struct CfaConfig {
     pub sda_bases: Option<(u32, u32)>,
-    pub functions: BTreeMap<SectionAddress, FunctionInfo>,
-    pub jump_tables: BTreeMap<SectionAddress, u32>,
     pub known_symbols: BTreeMap<SectionAddress, Vec<ObjSymbol>>,
     pub known_sections: BTreeMap<SectionIndex, String>,
     pub skip_ranges: BTreeMap<SectionAddress, SectionAddress>,
+    /// Pre-seeded functions from analysis passes (e.g. save/restore sleds).
+    pub seed_functions: BTreeMap<SectionAddress, FunctionInfo>,
+}
+
+/// Final output of CFA — consumed by Tracker, apply_cfa, etc.
+#[derive(Debug, Default)]
+pub struct CfaResult {
+    pub functions: BTreeMap<SectionAddress, FunctionInfo>,
+    pub jump_tables: BTreeMap<SectionAddress, u32>,
     /// Functions that were merged as tail blocks into their predecessors.
-    /// These need to be removed from obj.symbols during apply().
+    /// These need to be removed from obj.symbols during apply_cfa().
     pub merged_tail_blocks: Vec<SectionAddress>,
     /// Functions whose ends were extended by absorbing tail blocks.
-    /// These need replace=true in apply() to update the symbol size.
+    /// These need replace=true in apply_cfa() to update the symbol size.
     pub extended_functions: Vec<SectionAddress>,
 }
 
-impl AnalyzerState {
-    pub fn new(skip_ranges: BTreeMap<SectionAddress, SectionAddress>) -> Self {
-        Self {
-            sda_bases: None,
-            functions: BTreeMap::new(),
-            jump_tables: BTreeMap::new(),
-            known_symbols: BTreeMap::new(),
-            known_sections: BTreeMap::new(),
-            skip_ranges,
-            merged_tail_blocks: Vec::new(),
-            extended_functions: Vec::new(),
-        }
-    }
+// =============================================================================
+// Public API
+// =============================================================================
 
-    pub fn apply(&self, obj: &mut ObjInfo) -> Result<()> {
-        for (&section_index, section_name) in &self.known_sections {
-            obj.sections[section_index].rename(section_name.clone())?;
-        }
-        // Remove symbols for functions that were merged as tail blocks
-        for addr in &self.merged_tail_blocks {
-            if let Ok(Some((index, _))) = obj.symbols.kind_at_section_address(
-                addr.section,
-                addr.address,
-                ObjSymbolKind::Function,
-            ) {
-                let existing = &obj.symbols[index];
-                let symbol = ObjSymbol {
-                    name: format!("__DELETED_{}", existing.name),
-                    kind: ObjSymbolKind::Unknown,
-                    size: 0,
-                    flags: ObjSymbolFlagSet(
-                        ObjSymbolFlags::RelocationIgnore
-                            | ObjSymbolFlags::NoWrite
-                            | ObjSymbolFlags::NoExport
-                            | ObjSymbolFlags::Stripped,
-                    ),
-                    ..existing.clone()
-                };
-                obj.symbols.replace(index, symbol)?;
-            }
-        }
-        // Update sizes for functions that absorbed tail blocks
-        for addr in &self.extended_functions {
-            if let Some(info) = self.functions.get(addr) {
-                if let Some(end) = info.end {
-                    let new_size = (end.address - addr.address) as u64;
-                    if let Ok(Some((index, _))) = obj.symbols.kind_at_section_address(
-                        addr.section,
-                        addr.address,
-                        ObjSymbolKind::Function,
-                    ) {
-                        let existing = &obj.symbols[index];
-                        if existing.size != new_size {
-                            let symbol =
-                                ObjSymbol { size: new_size, size_known: true, ..existing.clone() };
-                            obj.symbols.replace(index, symbol)?;
-                        }
+/// Run the full CFA pipeline: seed discovery → fixed-point analysis → finalization.
+pub fn run_cfa(obj: &ObjInfo, config: &CfaConfig) -> Result<CfaResult> {
+    // Phase 1: Discover seed functions from pdata, symbols, analysis passes
+    let mut functions = discover_seeds(obj, config);
+    let seed_addrs: Vec<SectionAddress> = functions.keys().copied().collect();
+    let mut jump_tables = BTreeMap::new();
+
+    // Phase 2: Process seeded functions
+    for &addr in &seed_addrs {
+        process_function_at(obj, config, &mut functions, &mut jump_tables, addr)?;
+
+        // Assertions for known function boundaries (from pdata/import data)
+        if let Some(value) = obj.known_functions.get(&addr) {
+            if let Some(func) = functions.get(&addr) {
+                if let Some(known_size) = value {
+                    let known_end = addr + *known_size;
+                    assert_eq!(func.end.is_some(), true, "Function at {} has no detected end rather than known end {}. There must be an error in processing!", addr, known_end);
+                    let func_end = func.end.unwrap();
+                    // pdata sizes are conservative and may not include
+                    // out-of-line tail blocks, so allow func_end >= known_end
+                    if func_end < known_end {
+                        panic!(
+                            "Function at {} has known end addr {}, but during processing, \
+                             ending was found to be {} (smaller than expected)!",
+                            addr, known_end, func_end
+                        );
+                    } else if func_end != known_end {
+                        log::info!(
+                            "Function at {} extends beyond pdata end {} to {} \
+                             (likely tail block inclusion)",
+                            addr,
+                            known_end,
+                            func_end
+                        );
                     }
                 }
-            }
-        }
-        for (&start, FunctionInfo { end, .. }) in self.functions.iter() {
-            let Some(end) = end else { continue };
-            let section = &obj.sections[start.section];
-            ensure!(
-                section.contains_range(start.address..end.address),
-                "Function {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
-                start.address,
-                end,
-                section.name,
-                section.address,
-                section.address + section.size
-            );
-            let name = create_auto_symbol_name("fn", obj.module_id, start.address);
-            obj.add_symbol(
-                ObjSymbol {
-                    name,
-                    address: start.address as u64,
-                    section: Some(start.section),
-                    size: (end.address - start.address) as u64,
-                    size_known: true,
-                    kind: ObjSymbolKind::Function,
-                    ..Default::default()
-                },
-                false,
-            )?;
-        }
-        let mut iter = self.jump_tables.iter().peekable();
-        while let Some((&addr, &(mut size))) = iter.next() {
-            // Truncate overlapping jump tables
-            if let Some((&next_addr, _)) = iter.peek() {
-                if next_addr.section == addr.section {
-                    size = min(size, next_addr.address - addr.address);
-                }
-            }
-            let section = &obj.sections[addr.section];
-            ensure!(
-                section.contains_range(addr.address..addr.address + size),
-                "Jump table {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
-                addr.address,
-                addr.address + size,
-                section.name,
-                section.address,
-                section.address + section.size
-            );
-            let address_str = if obj.module_id == 0 {
-                format!("{:08X}", addr.address)
             } else {
-                format!(
-                    "{}_{}_{:X}",
-                    obj.module_id,
-                    section.name.trim_start_matches('.'),
-                    addr.address
-                )
-            };
-            obj.add_symbol(
-                ObjSymbol {
-                    name: format!("jumptable_{address_str}"),
-                    address: addr.address as u64,
-                    section: Some(addr.section),
-                    size: size as u64,
-                    size_known: true,
-                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
-                    kind: ObjSymbolKind::Object,
-                    ..Default::default()
-                },
-                true,
-            )?;
+                unreachable!();
+            }
         }
-        for (&_addr, symbols) in &self.known_symbols {
-            for symbol in symbols {
-                // Remove overlapping symbols
-                if symbol.size > 0 {
-                    let end = symbol.address + symbol.size;
-                    let overlapping = obj
-                        .symbols
-                        .for_section_range(
-                            symbol.section.unwrap(),
-                            symbol.address as u32 + 1..end as u32,
-                        )
-                        .filter(|(_, s)| s.kind == symbol.kind)
-                        .map(|(a, _)| a)
-                        .collect_vec();
-                    for index in overlapping {
-                        let existing = &obj.symbols[index];
-                        let symbol = ObjSymbol {
-                            name: format!("__DELETED_{}", existing.name),
-                            kind: ObjSymbolKind::Unknown,
-                            size: 0,
-                            flags: ObjSymbolFlagSet(
-                                ObjSymbolFlags::RelocationIgnore
-                                    | ObjSymbolFlags::NoWrite
-                                    | ObjSymbolFlags::NoExport
-                                    | ObjSymbolFlags::Stripped,
-                            ),
-                            ..existing.clone()
-                        };
+    }
+    println!("Known functions complete.");
+
+    // Phase 3: Discover and analyze remaining functions (fixed-point)
+    if let Some(entry) = obj.entry.map(|n| n as u32) {
+        let (section_index, _) = obj
+            .sections
+            .at_address(entry)
+            .context(format!("Entry point {entry:#010X} outside of any section"))?;
+        process_function_at(
+            obj,
+            config,
+            &mut functions,
+            &mut jump_tables,
+            SectionAddress::new(section_index, entry),
+        )?;
+    }
+    process_functions(obj, config, &mut functions, &mut jump_tables)?;
+    while finalize_functions(obj, config, &mut functions, &mut jump_tables, true)? {
+        process_functions(obj, config, &mut functions, &mut jump_tables)?;
+    }
+    if functions.iter().any(|(_, i)| i.is_unfinalized()) {
+        log::error!("Failed to finalize functions:");
+        for (addr, info) in functions.iter().filter(|(_, i)| i.is_unfinalized()) {
+            log::error!(
+                "  {:#010X}: blocks [{:?}]",
+                addr,
+                info.slices.as_ref().unwrap().possible_blocks.keys()
+            );
+        }
+        bail!("Failed to finalize functions");
+    }
+
+    // Phase 4: Post-processing (merge tail blocks, validate invariants)
+    let (merged_tail_blocks, extended_functions) =
+        merge_tail_blocks(obj, config, &mut functions, &mut jump_tables)?;
+    validate_invariants(obj, &functions, &jump_tables)
+        .context("CFA invariant validation failed after detect_functions")?;
+
+    Ok(CfaResult { functions, jump_tables, merged_tail_blocks, extended_functions })
+}
+
+/// Apply CFA results to ObjInfo (create symbols, update sizes, etc.).
+pub fn apply_cfa(obj: &mut ObjInfo, result: &CfaResult, config: &CfaConfig) -> Result<()> {
+    for (&section_index, section_name) in &config.known_sections {
+        obj.sections[section_index].rename(section_name.clone())?;
+    }
+    // Remove symbols for functions that were merged as tail blocks
+    for addr in &result.merged_tail_blocks {
+        if let Ok(Some((index, _))) = obj.symbols.kind_at_section_address(
+            addr.section,
+            addr.address,
+            ObjSymbolKind::Function,
+        ) {
+            let existing = &obj.symbols[index];
+            let symbol = ObjSymbol {
+                name: format!("__DELETED_{}", existing.name),
+                kind: ObjSymbolKind::Unknown,
+                size: 0,
+                flags: ObjSymbolFlagSet(
+                    ObjSymbolFlags::RelocationIgnore
+                        | ObjSymbolFlags::NoWrite
+                        | ObjSymbolFlags::NoExport
+                        | ObjSymbolFlags::Stripped,
+                ),
+                ..existing.clone()
+            };
+            obj.symbols.replace(index, symbol)?;
+        }
+    }
+    // Update sizes for functions that absorbed tail blocks
+    for addr in &result.extended_functions {
+        if let Some(info) = result.functions.get(addr) {
+            if let Some(end) = info.end {
+                let new_size = (end.address - addr.address) as u64;
+                if let Ok(Some((index, _))) = obj.symbols.kind_at_section_address(
+                    addr.section,
+                    addr.address,
+                    ObjSymbolKind::Function,
+                ) {
+                    let existing = &obj.symbols[index];
+                    if existing.size != new_size {
+                        let symbol =
+                            ObjSymbol { size: new_size, size_known: true, ..existing.clone() };
                         obj.symbols.replace(index, symbol)?;
                     }
                 }
-                obj.add_symbol(symbol.clone(), true)?;
             }
         }
-        Ok(())
     }
-
-    pub(crate) fn phase_seed_discovery(&mut self, obj: &ObjInfo) -> Result<Vec<SectionAddress>> {
-        // Apply known functions from pdata/import data
-        for (&addr, &size) in &obj.known_functions {
-            self.functions.insert(
-                addr,
-                FunctionInfo { analyzed: false, end: size.map(|size| addr + size), slices: None },
-            );
-        }
-
-        // Apply known functions from symbols
-        for (_, symbol) in obj.symbols.by_kind(ObjSymbolKind::Function) {
-            let Some(section_index) = symbol.section else { continue };
-            let addr_ref = SectionAddress::new(section_index, symbol.address as u32);
-            self.functions.insert(
-                addr_ref,
-                FunctionInfo {
-                    analyzed: false,
-                    end: if symbol.size_known { Some(addr_ref + symbol.size as u32) } else { None },
-                    slices: None,
-                },
-            );
-        }
-
-        // Also check the beginning of every code section
-        for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
-            let this_sec_start = SectionAddress::new(section_index, section.address as u32);
-            if obj
-                .symbols
-                .by_name(&format!("except_data_{:08X}", this_sec_start.address + 8))?
-                .is_some()
-            {
-                continue;
+    for (&start, FunctionInfo { end, .. }) in result.functions.iter() {
+        let Some(end) = end else { continue };
+        let section = &obj.sections[start.section];
+        ensure!(
+            section.contains_range(start.address..end.address),
+            "Function {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
+            start.address,
+            end,
+            section.name,
+            section.address,
+            section.address + section.size
+        );
+        let name = create_auto_symbol_name("fn", obj.module_id, start.address);
+        obj.add_symbol(
+            ObjSymbol {
+                name,
+                address: start.address as u64,
+                section: Some(start.section),
+                size: (end.address - start.address) as u64,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )?;
+    }
+    let mut iter = result.jump_tables.iter().peekable();
+    while let Some((&addr, &(mut size))) = iter.next() {
+        // Truncate overlapping jump tables
+        if let Some((&next_addr, _)) = iter.peek() {
+            if next_addr.section == addr.section {
+                size = min(size, next_addr.address - addr.address);
             }
-            self.functions.entry(this_sec_start).or_default();
         }
-
-        Ok(self.functions.keys().copied().collect_vec())
+        let section = &obj.sections[addr.section];
+        ensure!(
+            section.contains_range(addr.address..addr.address + size),
+            "Jump table {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
+            addr.address,
+            addr.address + size,
+            section.name,
+            section.address,
+            section.address + section.size
+        );
+        let address_str = if obj.module_id == 0 {
+            format!("{:08X}", addr.address)
+        } else {
+            format!(
+                "{}_{}_{:X}",
+                obj.module_id,
+                section.name.trim_start_matches('.'),
+                addr.address
+            )
+        };
+        obj.add_symbol(
+            ObjSymbol {
+                name: format!("jumptable_{address_str}"),
+                address: addr.address as u64,
+                section: Some(addr.section),
+                size: size as u64,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            },
+            true,
+        )?;
     }
-
-    pub(crate) fn phase_slice_seeded_functions(
-        &mut self,
-        obj: &ObjInfo,
-        seed_addrs: &[SectionAddress],
-    ) -> Result<()> {
-        // Process known functions first
-        for &addr in seed_addrs {
-            self.process_function_at(obj, addr)?;
-
-            // some assertions, since we're working with known function boundaries
-            // if we got this from pdata or import data, there should be a known end
-            if let Some(value) = obj.known_functions.get(&addr) {
-                if let Some(func) = self.functions.get(&addr) {
-                    if let Some(known_size) = value {
-                        let known_end = addr + *known_size;
-                        assert_eq!(func.end.is_some(), true, "Function at {} has no detected end rather than known end {}. There must be an error in processing!", addr, known_end);
-                        let func_end = func.end.unwrap();
-                        // pdata sizes are conservative and may not include
-                        // out-of-line tail blocks, so allow func_end >= known_end
-                        if func_end < known_end {
-                            panic!(
-                                "Function at {} has known end addr {}, but during processing, \
-                                 ending was found to be {} (smaller than expected)!",
-                                addr, known_end, func_end
-                            );
-                        } else if func_end != known_end {
-                            log::info!(
-                                "Function at {} extends beyond pdata end {} to {} \
-                                 (likely tail block inclusion)",
-                                addr,
-                                known_end,
-                                func_end
-                            );
-                        }
-                    }
-                } else {
-                    unreachable!();
+    for (&_addr, symbols) in &config.known_symbols {
+        for symbol in symbols {
+            // Remove overlapping symbols
+            if symbol.size > 0 {
+                let end = symbol.address + symbol.size;
+                let overlapping = obj
+                    .symbols
+                    .for_section_range(
+                        symbol.section.unwrap(),
+                        symbol.address as u32 + 1..end as u32,
+                    )
+                    .filter(|(_, s)| s.kind == symbol.kind)
+                    .map(|(a, _)| a)
+                    .collect_vec();
+                for index in overlapping {
+                    let existing = &obj.symbols[index];
+                    let symbol = ObjSymbol {
+                        name: format!("__DELETED_{}", existing.name),
+                        kind: ObjSymbolKind::Unknown,
+                        size: 0,
+                        flags: ObjSymbolFlagSet(
+                            ObjSymbolFlags::RelocationIgnore
+                                | ObjSymbolFlags::NoWrite
+                                | ObjSymbolFlags::NoExport
+                                | ObjSymbolFlags::Stripped,
+                        ),
+                        ..existing.clone()
+                    };
+                    obj.symbols.replace(index, symbol)?;
                 }
             }
-            // assert something with slices?
+            obj.add_symbol(symbol.clone(), true)?;
         }
+    }
+    Ok(())
+}
 
-        // the rest...
-        println!("Known functions complete.");
-        Ok(())
+// =============================================================================
+// Phase functions
+// =============================================================================
+
+/// Phase 1: Discover seed functions from pdata, symbols, section starts, and analysis passes.
+fn discover_seeds(
+    obj: &ObjInfo,
+    config: &CfaConfig,
+) -> BTreeMap<SectionAddress, FunctionInfo> {
+    let mut functions = config.seed_functions.clone();
+
+    // Apply known functions from pdata/import data
+    for (&addr, &size) in &obj.known_functions {
+        functions.insert(
+            addr,
+            FunctionInfo { analyzed: false, end: size.map(|size| addr + size), slices: None },
+        );
     }
 
-    pub(crate) fn phase_discover_remaining_functions(&mut self, obj: &ObjInfo) -> Result<()> {
-        if let Some(entry) = obj.entry.map(|n| n as u32) {
-            // Locate entry function bounds
-            let (section_index, _) = obj
-                .sections
-                .at_address(entry)
-                .context(format!("Entry point {entry:#010X} outside of any section"))?;
-            self.process_function_at(obj, SectionAddress::new(section_index, entry))?;
+    // Apply known functions from symbols
+    for (_, symbol) in obj.symbols.by_kind(ObjSymbolKind::Function) {
+        let Some(section_index) = symbol.section else { continue };
+        let addr_ref = SectionAddress::new(section_index, symbol.address as u32);
+        functions.insert(
+            addr_ref,
+            FunctionInfo {
+                analyzed: false,
+                end: if symbol.size_known { Some(addr_ref + symbol.size as u32) } else { None },
+                slices: None,
+            },
+        );
+    }
+
+    // Also check the beginning of every code section
+    for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
+        let this_sec_start = SectionAddress::new(section_index, section.address as u32);
+        if obj
+            .symbols
+            .by_name(&format!("except_data_{:08X}", this_sec_start.address + 8))
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            continue;
         }
-        // Locate bounds for referenced functions until none are left
-        self.process_functions(obj)?;
-        // Final pass(es)
-        while self.finalize_functions(obj, true)? {
-            self.process_functions(obj)?;
-        }
-        if self.functions.iter().any(|(_, i)| i.is_unfinalized()) {
-            log::error!("Failed to finalize functions:");
-            for (addr, info) in self.functions.iter().filter(|(_, i)| i.is_unfinalized()) {
-                log::error!(
-                    "  {:#010X}: blocks [{:?}]",
-                    addr,
-                    info.slices.as_ref().unwrap().possible_blocks.keys()
+        functions.entry(this_sec_start).or_default();
+    }
+
+    functions
+}
+
+/// Validate core post-analysis invariants.
+pub fn validate_invariants(
+    obj: &ObjInfo,
+    functions: &BTreeMap<SectionAddress, FunctionInfo>,
+    jump_tables: &BTreeMap<SectionAddress, u32>,
+) -> Result<()> {
+    let mut prev: Option<(SectionAddress, SectionAddress)> = None;
+    for (&start, info) in functions {
+        let Some(end) = info.end else { continue };
+        ensure!(
+            matches!(obj.sections.get(start.section), Some(s) if s.kind == ObjSectionKind::Code),
+            "Function start {} is not in a code section",
+            start
+        );
+        ensure!(
+            start.section == end.section,
+            "Function {} crosses sections (end {})",
+            start,
+            end
+        );
+        ensure!(end.address > start.address, "Function {} has non-positive size", start);
+        let section = &obj.sections[start.section];
+        ensure!(
+            section.contains_range(start.address..end.address),
+            "Function {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
+            start.address,
+            end.address,
+            section.name,
+            section.address,
+            section.address + section.size
+        );
+        if let Some((prev_start, prev_end)) = prev {
+            if prev_start.section == start.section {
+                ensure!(
+                    start.address >= prev_end.address,
+                    "Overlapping functions in section {}: {}..{} and {}..{}",
+                    start.section,
+                    prev_start,
+                    prev_end,
+                    start,
+                    end
                 );
             }
-            bail!("Failed to finalize functions");
         }
-        Ok(())
+        prev = Some((start, end));
     }
 
-    pub(crate) fn phase_finalize_and_validate(&mut self, obj: &ObjInfo) -> Result<()> {
-        // Merge tail blocks: small functions that are actually out-of-line code
-        // from the preceding function (e.g., loop exit paths placed after .pdata end)
-        self.merge_tail_blocks(obj)?;
-        self.validate_invariants(obj)
-            .context("CFA invariant validation failed after detect_functions")?;
-        Ok(())
+    for (&addr, &size) in jump_tables {
+        ensure!(size > 0, "Jump table at {} has zero size", addr);
+        let end = addr
+            .address
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("Jump table size overflow at {}", addr))?;
+        let section = &obj.sections[addr.section];
+        ensure!(
+            section.contains_range(addr.address..end),
+            "Jump table {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
+            addr.address,
+            end,
+            section.name,
+            section.address,
+            section.address + section.size
+        );
+        ensure!(section.kind != ObjSectionKind::Bss, "Jump table at {} cannot be in BSS", addr);
     }
+    Ok(())
+}
 
-    fn detect_functions_legacy(&mut self, obj: &ObjInfo) -> Result<()> {
-        let seed_addrs = self.phase_seed_discovery(obj)?;
-        self.phase_slice_seeded_functions(obj, &seed_addrs)?;
-        self.phase_discover_remaining_functions(obj)?;
-        self.phase_finalize_and_validate(obj)?;
-        Ok(())
-    }
+// =============================================================================
+// Internal helpers
+// =============================================================================
 
-    fn detect_functions_candidate(&mut self, obj: &ObjInfo) -> Result<()> {
-        let skip_ranges = self.skip_ranges.clone();
-        let candidate_config = read_candidate_pipeline_config();
-        let mut candidate_pipeline =
-            CandidatePipelineEngine::new_with_config(skip_ranges, candidate_config);
-        candidate_pipeline.run_with_report(obj)?;
-        *self = candidate_pipeline.state;
-        Ok(())
-    }
-
-    fn detect_functions_with_shadow_config(
-        &mut self,
-        obj: &ObjInfo,
-        gate_config: CandidateShadowGateConfig,
-    ) -> Result<CandidateShadowDecision> {
-        let shadow_enabled = gate_config.enable_vm2_shadow || gate_config.enable_pipeline_shadow;
-        if !shadow_enabled {
-            let decision = evaluate_candidate_shadow_decision(0, 0, gate_config);
-            self.detect_functions_legacy(obj)?;
-            return Ok(decision);
-        }
-
-        let skip_ranges = self.skip_ranges.clone();
-        let mut legacy_pipeline = LegacyPipelineEngine::new(skip_ranges.clone());
-        let legacy_report = legacy_pipeline.run_with_report(obj)?;
-        let legacy_digest = legacy_report.digest.clone();
-        let legacy_seed_addresses =
-            legacy_report.seed_discovery.seeds.iter().map(|seed| seed.address).collect_vec();
-
-        // Candidate path is isolated behind its own engine type for staged phase rollout.
-        let candidate_config = read_candidate_pipeline_config();
-        let mut candidate_pipeline =
-            CandidatePipelineEngine::new_with_config(skip_ranges, candidate_config);
-        let candidate_report = candidate_pipeline.run_with_report(obj)?;
-        let candidate_digest = candidate_report.digest.clone();
-
-        let vm_shadow_report = if gate_config.enable_vm2_shadow {
-            let default_config = VmRuntimeShadowConfig::default();
-            let vm_shadow_config = VmRuntimeShadowConfig {
-                max_functions: read_shadow_usize_env(
-                    ENV_VM_SHADOW_MAX_FUNCTIONS,
-                    default_config.max_functions,
-                ),
-                max_steps_per_function: read_shadow_usize_env(
-                    ENV_VM_SHADOW_MAX_STEPS,
-                    default_config.max_steps_per_function,
-                ),
-            };
-            let vm_shadow_native_vm2 = read_shadow_bool_env(ENV_VM_SHADOW_NATIVE_VM2, false);
-            let vm_shadow_report = runtime_vm_shadow_report_with_mode(
-                obj,
-                &legacy_seed_addresses,
-                vm_shadow_config,
-                vm_shadow_native_vm2,
-            );
-            log::debug!(
-                "VM shadow report: total_diffs={} (presence={}, value={}, provenance={}, confidence={}) requested_functions={} sampled_functions={} sampled_steps={} native_steps={} bridged_steps={} native_opcode_kinds={} bridged_opcode_kinds={} diff_opcode_kinds={} top_bridged_opcodes=[{}] top_diff_opcodes=[{}] mismatched_functions={} native_vm2={} max_functions={} max_steps={}",
-                vm_shadow_report.total_diffs(),
-                vm_shadow_report.summary.presence,
-                vm_shadow_report.summary.value,
-                vm_shadow_report.summary.provenance,
-                vm_shadow_report.summary.confidence,
-                vm_shadow_report.functions_requested,
-                vm_shadow_report.functions_sampled,
-                vm_shadow_report.steps_sampled,
-                vm_shadow_report.native_steps,
-                vm_shadow_report.bridged_steps,
-                vm_shadow_report.native_opcode_counts.len(),
-                vm_shadow_report.bridged_opcode_counts.len(),
-                vm_shadow_report.diff_opcode_counts.len(),
-                format_top_opcode_counts(&vm_shadow_report.bridged_opcode_counts, 5),
-                format_top_opcode_counts(&vm_shadow_report.diff_opcode_counts, 5),
-                vm_shadow_report.functions_with_diffs(),
-                vm_shadow_native_vm2,
-                vm_shadow_config.max_functions,
-                vm_shadow_config.max_steps_per_function
-            );
-            Some(vm_shadow_report)
-        } else {
-            None
+fn finalize_functions(
+    obj: &ObjInfo,
+    config: &CfaConfig,
+    functions: &mut BTreeMap<SectionAddress, FunctionInfo>,
+    jump_tables: &mut BTreeMap<SectionAddress, u32>,
+    finalize: bool,
+) -> Result<bool> {
+    let mut finalized_any = false;
+    let unfinalized = functions
+        .iter()
+        .filter_map(|(&addr, info)| {
+            if info.is_unfinalized() {
+                info.slices.clone().map(|s| (addr, s))
+            } else {
+                None
+            }
+        })
+        .collect_vec();
+    for (addr, mut slices) in unfinalized {
+        let Some(function_start) = slices.start() else {
+            bail!("Function slice without start @ {:#010X}", addr);
         };
-        let vm_shadow_deltas = vm_shadow_report.as_ref().map_or(0, VmRuntimeShadowReport::total_diffs);
-
-        let phase_checkpoint_summary = compare_phase_checkpoints(&legacy_report, &candidate_report);
-        let phase_checkpoint_entries = phase_checkpoint_diff_entries(&legacy_report, &candidate_report);
-        let phase_checkpoint_deltas = phase_checkpoint_summary.total();
-        let digest_entries = legacy_digest.diff_entries(&candidate_digest);
-        let digest_summary = legacy_digest.diff_summary(&candidate_digest);
-        let digest_deltas = digest_entries.len();
-
-        let mut decision = evaluate_candidate_shadow_decision(
-            vm_shadow_deltas,
-            phase_checkpoint_deltas,
-            gate_config,
-        );
-        if digest_deltas > 0 {
-            decision.reasons.push(CandidateFallbackReason::PipelineDigestMismatch);
-        }
-
-        let selected_digest =
-            select_candidate_or_legacy(&legacy_digest, &candidate_digest, &decision);
-        if decision.should_fallback() {
-            log::warn!(
-                "Candidate shadow mismatch exceeded threshold (vm_deltas={}, phase_deltas={}, digest_deltas={}, reasons={:?}); using legacy analyzer",
-                vm_shadow_deltas,
-                phase_checkpoint_deltas,
-                digest_deltas,
-                decision.reasons
-            );
-            if let Some(vm_shadow_report) = vm_shadow_report.as_ref() {
-                log_vm_runtime_shadow_function_entries(vm_shadow_report);
-            }
-            log_phase_checkpoint_delta_summary(&phase_checkpoint_summary);
-            log_pipeline_digest_delta_summary(&digest_summary);
-            log_phase_checkpoint_delta_entries(&phase_checkpoint_entries);
-            log_pipeline_digest_delta_entries(&digest_entries);
-            *self = legacy_pipeline.state;
-        } else {
-            log::debug!(
-                "Candidate shadow parity clean (vm_deltas={}, phase_deltas={}, digest_deltas={}); using candidate pipeline state",
-                vm_shadow_deltas,
-                phase_checkpoint_deltas,
-                digest_deltas
-            );
-            *self = candidate_pipeline.state;
-        }
-
-        let selected_state_digest =
-            crate::analysis::pipeline::PipelineDigest::from_state(self);
-        debug_assert_eq!(
-            selected_state_digest, selected_digest,
-            "selected state digest must match selected pipeline digest",
-        );
-        Ok(decision)
-    }
-
-    pub fn detect_functions(&mut self, obj: &ObjInfo) -> Result<()> {
-        let execution_mode = read_pipeline_execution_mode_env(DEFAULT_PIPELINE_EXECUTION_MODE);
-        log::debug!("CFA pipeline execution mode: {:?}", execution_mode);
-        match execution_mode {
-            PipelineExecutionMode::Legacy => self.detect_functions_legacy(obj)?,
-            PipelineExecutionMode::Shadow => {
-                let mut gate_config = CandidateShadowGateConfig::defaults();
-                gate_config.enable_pipeline_shadow = true;
-                let _decision = self.detect_functions_with_shadow_config(obj, gate_config)?;
-            }
-            PipelineExecutionMode::Candidate => self.detect_functions_candidate(obj)?,
-        }
-        Ok(())
-    }
-
-    /// Validate core post-analysis invariants used by rewrite shadow/parity checks.
-    pub fn validate_invariants(&self, obj: &ObjInfo) -> Result<()> {
-        let mut prev: Option<(SectionAddress, SectionAddress)> = None;
-        for (&start, info) in &self.functions {
-            let Some(end) = info.end else { continue };
-            ensure!(
-                matches!(obj.sections.get(start.section), Some(s) if s.kind == ObjSectionKind::Code),
-                "Function start {} is not in a code section",
-                start
-            );
-            ensure!(
-                start.section == end.section,
-                "Function {} crosses sections (end {})",
-                start,
-                end
-            );
-            ensure!(end.address > start.address, "Function {} has non-positive size", start);
-            let section = &obj.sections[start.section];
-            ensure!(
-                section.contains_range(start.address..end.address),
-                "Function {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
-                start.address,
-                end.address,
-                section.name,
-                section.address,
-                section.address + section.size
-            );
-            if let Some((prev_start, prev_end)) = prev {
-                if prev_start.section == start.section {
-                    ensure!(
-                        start.address >= prev_end.address,
-                        "Overlapping functions in section {}: {}..{} and {}..{}",
-                        start.section,
-                        prev_start,
-                        prev_end,
-                        start,
-                        end
-                    );
+        let function_end = slices.end();
+        let mut current = SectionAddress::new(addr.section, 0);
+        while let Some((&block, vm)) = slices.possible_blocks.range(current..).next() {
+            current = block + 4;
+            let vm = vm.clone();
+            match slices.check_tail_call(
+                obj,
+                block,
+                function_start,
+                function_end,
+                functions,
+                Some(vm.clone()),
+            ) {
+                TailCallResult::Not => {
+                    log::trace!("Finalized block @ {:#010X}", block);
+                    slices.possible_blocks.remove(&block);
+                    slices.analyze(
+                        obj,
+                        block,
+                        function_start,
+                        function_end,
+                        functions,
+                        Some(vm),
+                    )?;
+                    // Start at the beginning of the function again
+                    current = SectionAddress::new(addr.section, 0);
                 }
-            }
-            prev = Some((start, end));
-        }
-
-        for (&addr, &size) in &self.jump_tables {
-            ensure!(size > 0, "Jump table at {} has zero size", addr);
-            let end = addr
-                .address
-                .checked_add(size)
-                .ok_or_else(|| anyhow!("Jump table size overflow at {}", addr))?;
-            let section = &obj.sections[addr.section];
-            ensure!(
-                section.contains_range(addr.address..end),
-                "Jump table {:#010X}..{:#010X} out of bounds of section {} {:#010X}..{:#010X}",
-                addr.address,
-                end,
-                section.name,
-                section.address,
-                section.address + section.size
-            );
-            ensure!(section.kind != ObjSectionKind::Bss, "Jump table at {} cannot be in BSS", addr);
-        }
-        Ok(())
-    }
-
-    fn finalize_functions(&mut self, obj: &ObjInfo, finalize: bool) -> Result<bool> {
-        let mut finalized_any = false;
-        let unfinalized = self
-            .functions
-            .iter()
-            .filter_map(|(&addr, info)| {
-                if info.is_unfinalized() {
-                    info.slices.clone().map(|s| (addr, s))
-                } else {
-                    None
+                TailCallResult::Is => {
+                    log::trace!("Finalized tail call @ {:#010X}", block);
+                    slices.possible_blocks.remove(&block);
+                    slices.function_references.insert(block);
+                    // Start at the beginning of the function again
+                    current = SectionAddress::new(addr.section, 0);
                 }
-            })
-            .collect_vec();
-        for (addr, mut slices) in unfinalized {
-            // log::info!("Trying to finalize {:#010X}", addr);
-            let Some(function_start) = slices.start() else {
-                bail!("Function slice without start @ {:#010X}", addr);
-            };
-            let function_end = slices.end();
-            let mut current = SectionAddress::new(addr.section, 0);
-            while let Some((&block, vm)) = slices.possible_blocks.range(current..).next() {
-                current = block + 4;
-                let vm = vm.clone();
-                match slices.check_tail_call(
-                    obj,
-                    block,
-                    function_start,
-                    function_end,
-                    &self.functions,
-                    Some(vm.clone()),
-                ) {
-                    TailCallResult::Not => {
-                        log::trace!("Finalized block @ {:#010X}", block);
+                TailCallResult::Possible => {
+                    if finalize {
+                        log::trace!(
+                            "Still couldn't determine {:#010X}, assuming non-tail-call",
+                            block
+                        );
                         slices.possible_blocks.remove(&block);
                         slices.analyze(
                             obj,
                             block,
                             function_start,
                             function_end,
-                            &self.functions,
+                            functions,
                             Some(vm),
                         )?;
-                        // Start at the beginning of the function again
-                        current = SectionAddress::new(addr.section, 0);
                     }
-                    TailCallResult::Is => {
-                        log::trace!("Finalized tail call @ {:#010X}", block);
-                        slices.possible_blocks.remove(&block);
-                        slices.function_references.insert(block);
-                        // Start at the beginning of the function again
-                        current = SectionAddress::new(addr.section, 0);
-                    }
-                    TailCallResult::Possible => {
-                        if finalize {
-                            log::trace!(
-                                "Still couldn't determine {:#010X}, assuming non-tail-call",
-                                block
-                            );
-                            slices.possible_blocks.remove(&block);
-                            slices.analyze(
-                                obj,
-                                block,
-                                function_start,
-                                function_end,
-                                &self.functions,
-                                Some(vm),
-                            )?;
-                        }
-                    }
-                    TailCallResult::Error(e) => return Err(e),
                 }
-            }
-            if slices.can_finalize() {
-                log::trace!("Finalizing {:#010X}", addr);
-                slices.finalize(obj, &self.functions)?;
-                for address in slices.function_references.iter().cloned() {
-                    self.try_add_function(obj, address);
-                }
-                self.jump_tables.append(&mut slices.jump_table_references.clone());
-                let end = slices.end();
-                let info = self.functions.get_mut(&addr).unwrap();
-                info.analyzed = true;
-                info.end = end;
-                info.slices = Some(slices.clone());
-                finalized_any = true;
+                TailCallResult::Error(e) => return Err(e),
             }
         }
-        Ok(finalized_any)
-    }
-
-    fn try_add_function(&mut self, obj: &ObjInfo, address: SectionAddress) {
-        // Only create functions for code sections
-        // Some games use branches to data sections to prevent dead stripping (Mario Party)
-        if !matches!(obj.sections.get(address.section), Some(section) if section.kind == ObjSectionKind::Code)
-            // Avoid creating functions in skipped ranges
-            || self.in_skipped_range(address)
-        {
-            return;
-        }
-        self.functions.entry(address).or_default();
-    }
-
-    fn in_skipped_range(&self, address: SectionAddress) -> bool {
-        match self.skip_ranges.range(..=address).next_back() {
-            Some((&start, &end)) => address >= start && address < end,
-            None => false,
-        }
-    }
-
-    fn first_unbounded_function(&self) -> Option<SectionAddress> {
-        self.functions.iter().find(|(_, info)| !info.is_analyzed()).map(|(&addr, _)| addr)
-    }
-
-    fn process_functions(&mut self, obj: &ObjInfo) -> Result<()> {
-        loop {
-            match self.first_unbounded_function() {
-                Some(addr) => {
-                    log::trace!("Processing {:#010X}", addr);
-                    self.process_function_at(obj, addr)?;
-                }
-                None => {
-                    if !self.finalize_functions(obj, false)? && !self.detect_new_functions(obj)? {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn process_function_at(&mut self, obj: &ObjInfo, addr: SectionAddress) -> Result<bool> {
-        Ok(if let Some(mut slices) = self.process_function(obj, addr)? {
+        if slices.can_finalize() {
+            log::trace!("Finalizing {:#010X}", addr);
+            slices.finalize(obj, functions)?;
             for address in slices.function_references.iter().cloned() {
-                self.try_add_function(obj, address);
+                try_add_function(obj, config, functions, address);
             }
-            self.jump_tables.append(&mut slices.jump_table_references.clone());
-            if slices.can_finalize() {
-                slices.finalize(obj, &self.functions)?;
-                let info = self.functions.entry(addr).or_default();
-                info.analyzed = true;
-                info.end = slices.end();
-                info.slices = Some(slices);
-            } else {
-                let info = self.functions.entry(addr).or_default();
-                info.analyzed = true;
-                // Don't overwrite info.end - preserve known end from pdata/symbols
-                info.slices = Some(slices);
-            }
-            true
-        } else {
-            log::info!("Not a function @ {:#010X}", addr);
-            let info = self.functions.entry(addr).or_default();
+            jump_tables.append(&mut slices.jump_table_references.clone());
+            let end = slices.end();
+            let info = functions.get_mut(&addr).unwrap();
             info.analyzed = true;
-            info.end = None;
-            false
-        })
+            info.end = end;
+            info.slices = Some(slices.clone());
+            finalized_any = true;
+        }
     }
+    Ok(finalized_any)
+}
 
-    fn process_function(
-        &mut self,
-        obj: &ObjInfo,
-        start: SectionAddress,
-    ) -> Result<Option<FunctionSlices>> {
-        let mut slices = FunctionSlices::default();
-        let function_end = self.functions.get(&start).and_then(|info| info.end);
-        Ok(match slices.analyze(obj, start, start, function_end, &self.functions, None)? {
-            true => Some(slices),
-            false => None,
-        })
+fn try_add_function(
+    obj: &ObjInfo,
+    config: &CfaConfig,
+    functions: &mut BTreeMap<SectionAddress, FunctionInfo>,
+    address: SectionAddress,
+) {
+    // Only create functions for code sections
+    // Some games use branches to data sections to prevent dead stripping (Mario Party)
+    if !matches!(obj.sections.get(address.section), Some(section) if section.kind == ObjSectionKind::Code)
+        // Avoid creating functions in skipped ranges
+        || in_skipped_range(&config.skip_ranges, address)
+    {
+        return;
     }
+    functions.entry(address).or_default();
+}
 
-    /// Post-pass to merge small functions that are actually tail blocks of their predecessor.
-    ///
-    /// After all functions are detected (from pdata, symbols, and gap-filling), this scans for
-    /// adjacent function pairs where the second function is a tail block of the first. This
-    /// handles cases where symbols.txt already has the fake function defined from a previous run.
-    fn merge_tail_blocks(&mut self, obj: &ObjInfo) -> Result<()> {
-        let mut merges: Vec<(SectionAddress, SectionAddress)> = vec![];
+fn in_skipped_range(
+    skip_ranges: &BTreeMap<SectionAddress, SectionAddress>,
+    address: SectionAddress,
+) -> bool {
+    match skip_ranges.range(..=address).next_back() {
+        Some((&start, &end)) => address >= start && address < end,
+        None => false,
+    }
+}
 
-        for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
-            let section_start = SectionAddress::new(section_index, section.address as u32);
-            let section_end = section_start + section.size as u32;
-            let funcs_in_section: Vec<(SectionAddress, FunctionInfo)> = self
-                .functions
-                .range(section_start..section_end)
-                .map(|(&a, i)| (a, i.clone()))
-                .collect();
+fn first_unbounded_function(
+    functions: &BTreeMap<SectionAddress, FunctionInfo>,
+) -> Option<SectionAddress> {
+    functions.iter().find(|(_, info)| !info.is_analyzed()).map(|(&addr, _)| addr)
+}
 
-            for window in funcs_in_section.windows(2) {
-                let (prev_addr, prev_info) = &window[0];
-                let (func_addr, func_info) = &window[1];
+fn process_functions(
+    obj: &ObjInfo,
+    config: &CfaConfig,
+    functions: &mut BTreeMap<SectionAddress, FunctionInfo>,
+    jump_tables: &mut BTreeMap<SectionAddress, u32>,
+) -> Result<()> {
+    loop {
+        match first_unbounded_function(functions) {
+            Some(addr) => {
+                log::trace!("Processing {:#010X}", addr);
+                process_function_at(obj, config, functions, jump_tables, addr)?;
+            }
+            None => {
+                if !finalize_functions(obj, config, functions, jump_tables, false)?
+                    && !detect_new_functions(obj, config, functions)?
+                {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
-                let Some(prev_end) = prev_info.end else { continue };
-                let Some(func_end) = func_info.end else { continue };
+/// Process a single function at the given address.
+/// Public for use in tests.
+pub fn process_function_at(
+    obj: &ObjInfo,
+    config: &CfaConfig,
+    functions: &mut BTreeMap<SectionAddress, FunctionInfo>,
+    jump_tables: &mut BTreeMap<SectionAddress, u32>,
+    addr: SectionAddress,
+) -> Result<bool> {
+    Ok(if let Some(mut slices) = process_function(obj, functions, addr)? {
+        for address in slices.function_references.iter().cloned() {
+            try_add_function(obj, config, functions, address);
+        }
+        jump_tables.append(&mut slices.jump_table_references.clone());
+        if slices.can_finalize() {
+            slices.finalize(obj, functions)?;
+            let info = functions.entry(addr).or_default();
+            info.analyzed = true;
+            info.end = slices.end();
+            info.slices = Some(slices);
+        } else {
+            let info = functions.entry(addr).or_default();
+            info.analyzed = true;
+            // Don't overwrite info.end - preserve known end from pdata/symbols
+            info.slices = Some(slices);
+        }
+        true
+    } else {
+        log::info!("Not a function @ {:#010X}", addr);
+        let info = functions.entry(addr).or_default();
+        info.analyzed = true;
+        info.end = None;
+        false
+    })
+}
 
-                // Only consider the case where the candidate function starts right
-                // at the predecessor's end (no gap/alignment between them)
-                if *func_addr != prev_end {
+fn process_function(
+    obj: &ObjInfo,
+    functions: &BTreeMap<SectionAddress, FunctionInfo>,
+    start: SectionAddress,
+) -> Result<Option<FunctionSlices>> {
+    let mut slices = FunctionSlices::default();
+    let function_end = functions.get(&start).and_then(|info| info.end);
+    Ok(match slices.analyze(obj, start, start, function_end, functions, None)? {
+        true => Some(slices),
+        false => None,
+    })
+}
+
+/// Post-pass to merge small functions that are actually tail blocks of their predecessors.
+///
+/// After all functions are detected (from pdata, symbols, and gap-filling), this scans for
+/// adjacent function pairs where the second function is a tail block of the first. This
+/// handles cases where symbols.txt already has the fake function defined from a previous run.
+///
+/// Returns (merged_tail_blocks, extended_functions).
+fn merge_tail_blocks(
+    obj: &ObjInfo,
+    config: &CfaConfig,
+    functions: &mut BTreeMap<SectionAddress, FunctionInfo>,
+    jump_tables: &mut BTreeMap<SectionAddress, u32>,
+) -> Result<(Vec<SectionAddress>, Vec<SectionAddress>)> {
+    let mut merged_tail_blocks = Vec::new();
+    let mut extended_functions = Vec::new();
+    let mut merges: Vec<(SectionAddress, SectionAddress)> = vec![];
+
+    for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
+        let section_start = SectionAddress::new(section_index, section.address as u32);
+        let section_end = section_start + section.size as u32;
+        let funcs_in_section: Vec<(SectionAddress, FunctionInfo)> = functions
+            .range(section_start..section_end)
+            .map(|(&a, i)| (a, i.clone()))
+            .collect();
+
+        for window in funcs_in_section.windows(2) {
+            let (prev_addr, prev_info) = &window[0];
+            let (func_addr, func_info) = &window[1];
+
+            let Some(prev_end) = prev_info.end else { continue };
+            let Some(func_end) = func_info.end else { continue };
+
+            // Only consider the case where the candidate function starts right
+            // at the predecessor's end (no gap/alignment between them)
+            if *func_addr != prev_end {
+                continue;
+            }
+
+            // Skip merging if the candidate has a global-scope symbol
+            // (user, PDB, or map file explicitly defined it as a real function)
+            if let Ok(Some((_, sym))) = obj.symbols.kind_at_section_address(
+                func_addr.section,
+                func_addr.address,
+                ObjSymbolKind::Function,
+            ) {
+                if sym.flags.scope() == ObjSymbolScope::Global {
+                    log::info!(
+                        "Skipping tail block merge of {:#010X} (global-scope symbol '{}')",
+                        func_addr,
+                        sym.name,
+                    );
                     continue;
                 }
-
-                // Skip merging if the candidate has a global-scope symbol
-                // (user, PDB, or map file explicitly defined it as a real function)
-                if let Ok(Some((_, sym))) = obj.symbols.kind_at_section_address(
-                    func_addr.section,
-                    func_addr.address,
-                    ObjSymbolKind::Function,
-                ) {
-                    if sym.flags.scope() == ObjSymbolScope::Global {
-                        log::info!(
-                            "Skipping tail block merge of {:#010X} (global-scope symbol '{}')",
-                            func_addr,
-                            sym.name,
-                        );
-                        continue;
-                    }
-                }
-
-                // Check if this function is a tail block
-                if let Some(_tail_end) =
-                    Self::check_tail_block(section, *func_addr, func_end, *prev_addr, prev_end)
-                {
-                    log::info!(
-                        "Merging tail block function {:#010X}-{:#010X} into {:#010X} (extending from {:#010X})",
-                        func_addr, func_end, prev_addr, prev_end,
-                    );
-                    merges.push((*prev_addr, *func_addr));
-                }
-            }
-        }
-
-        for (prev_addr, tail_addr) in &merges {
-            // Get the tail function's end before removing it
-            let tail_end = self.functions.get(tail_addr).and_then(|i| i.end).unwrap();
-            // Remove the fake function
-            self.functions.remove(tail_addr);
-            // Track for symbol removal in apply()
-            self.merged_tail_blocks.push(*tail_addr);
-            // Extend the predecessor's end and track for size update in apply()
-            self.extended_functions.push(*prev_addr);
-            if let Some(info) = self.functions.get_mut(prev_addr) {
-                info.end = Some(tail_end);
-                // Mark for re-analysis with the new bounds
-                info.analyzed = false;
-                info.slices = None;
-            }
-        }
-
-        if !merges.is_empty() {
-            log::info!("Merged {} tail block(s), re-analyzing affected functions", merges.len());
-            // Re-analyze the extended functions
-            for (prev_addr, _) in &merges {
-                self.process_function_at(obj, *prev_addr)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Check if code at `gap_start` (up to `gap_end`) is a tail block of the preceding function.
-    ///
-    /// A tail block is an out-of-line code fragment (typically a loop exit path) that the
-    /// compiler placed after the .pdata-reported function end. It's characterized by:
-    /// - Starting with an unconditional branch (`b`, not `bl`) back into the preceding function
-    /// - Or containing only a few instructions that all branch back into the preceding function
-    ///   before ending with `blr`
-    ///
-    /// Returns `Some(block_end)` if this is a tail block, where `block_end` is the address
-    /// just past the last instruction in the tail block.
-    fn check_tail_block(
-        section: &crate::obj::ObjSection,
-        gap_start: SectionAddress,
-        gap_end: SectionAddress,
-        preceding_func_start: SectionAddress,
-        preceding_func_end: SectionAddress,
-    ) -> Option<SectionAddress> {
-        // Only consider small gaps (up to 64 bytes / 16 instructions)
-        let gap_size = gap_end.address - gap_start.address;
-        if gap_size > 64 {
-            return None;
-        }
-
-        // Check the first instruction
-        let first_ins = disassemble(section, gap_start.address)?;
-
-        // Case 1: First instruction is an unconditional branch (b, not bl) back into
-        // the preceding function. This is the classic out-of-line loop exit.
-        if first_ins.op == Opcode::B && !first_ins.field_lk() && !first_ins.field_aa() {
-            let target = first_ins.branch_dest(gap_start.address)?;
-            if target >= preceding_func_start.address && target < preceding_func_end.address {
-                // Scan forward to find the end of this tail block (up to blr or gap_end)
-                let mut addr = gap_start;
-                loop {
-                    let Some(ins) = disassemble(section, addr.address) else { break };
-                    addr += 4;
-                    // blr (unconditional return) or end of gap
-                    if ins.op == Opcode::Bclr
-                        && !ins.field_lk()
-                        && (ins.field_bo() & 0b10100 == 0b10100)
-                    {
-                        return Some(addr);
-                    }
-                    if addr >= gap_end {
-                        return Some(gap_end);
-                    }
-                }
-            }
-        }
-
-        // Case 2: Scan the entire gap block — if every branch instruction targets back
-        // into the preceding function (no outward calls or forward jumps to other functions),
-        // and the block ends with blr, treat it as a tail block.
-        let mut addr = gap_start;
-        let mut has_backward_branch = false;
-        let mut ends_with_blr = false;
-        while addr < gap_end {
-            let Some(ins) = disassemble(section, addr.address) else { return None };
-
-            match ins.op {
-                // Unconditional or conditional branch (not link)
-                Opcode::B | Opcode::Bc if !ins.field_lk() && !ins.field_aa() => {
-                    if let Some(target) = ins.branch_dest(addr.address) {
-                        if target >= preceding_func_start.address
-                            && target < preceding_func_end.address
-                        {
-                            has_backward_branch = true;
-                        } else if target < gap_start.address || target >= gap_end.address {
-                            // Branch to somewhere outside both the preceding function and
-                            // this gap — not a simple tail block
-                            return None;
-                        }
-                    }
-                }
-                // bl (function call) — tail blocks don't call other functions
-                Opcode::B | Opcode::Bc if ins.field_lk() => return None,
-                // blr — return instruction
-                Opcode::Bclr if !ins.field_lk() && (ins.field_bo() & 0b10100 == 0b10100) => {
-                    ends_with_blr = true;
-                }
-                // bctr — indirect branch, not typical for a tail block
-                Opcode::Bcctr if !ins.field_lk() => return None,
-                _ => {}
             }
 
-            addr += 4;
-        }
-
-        if has_backward_branch && ends_with_blr {
-            Some(gap_end)
-        } else {
-            None
+            // Check if this function is a tail block
+            if let Some(_tail_end) =
+                check_tail_block(section, *func_addr, func_end, *prev_addr, prev_end)
+            {
+                log::info!(
+                    "Merging tail block function {:#010X}-{:#010X} into {:#010X} (extending from {:#010X})",
+                    func_addr, func_end, prev_addr, prev_end,
+                );
+                merges.push((*prev_addr, *func_addr));
+            }
         }
     }
 
-    fn detect_new_functions(&mut self, obj: &ObjInfo) -> Result<bool> {
-        let mut new_functions = vec![];
-        let mut extended_functions: Vec<(SectionAddress, SectionAddress)> = vec![];
-        for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
-            if section.name == ".xidata" {
-                continue;
-            } // because we already did our xidata processing at this point
-            let section_start = SectionAddress::new(section_index, section.address as u32);
-            let section_end = section_start + section.size as u32;
-            let mut iter = self.functions.range(section_start..section_end).peekable();
+    for (prev_addr, tail_addr) in &merges {
+        // Get the tail function's end before removing it
+        let tail_end = functions.get(tail_addr).and_then(|i| i.end).unwrap();
+        // Remove the fake function
+        functions.remove(tail_addr);
+        // Track for symbol removal in apply_cfa()
+        merged_tail_blocks.push(*tail_addr);
+        // Extend the predecessor's end and track for size update in apply_cfa()
+        extended_functions.push(*prev_addr);
+        if let Some(info) = functions.get_mut(prev_addr) {
+            info.end = Some(tail_end);
+            // Mark for re-analysis with the new bounds
+            info.analyzed = false;
+            info.slices = None;
+        }
+    }
+
+    if !merges.is_empty() {
+        log::info!("Merged {} tail block(s), re-analyzing affected functions", merges.len());
+        // Re-analyze the extended functions
+        for (prev_addr, _) in &merges {
+            process_function_at(obj, config, functions, jump_tables, *prev_addr)?;
+        }
+    }
+
+    Ok((merged_tail_blocks, extended_functions))
+}
+
+/// Check if code at `gap_start` (up to `gap_end`) is a tail block of the preceding function.
+///
+/// A tail block is an out-of-line code fragment (typically a loop exit path) that the
+/// compiler placed after the .pdata-reported function end. It's characterized by:
+/// - Starting with an unconditional branch (`b`, not `bl`) back into the preceding function
+/// - Or containing only a few instructions that all branch back into the preceding function
+///   before ending with `blr`
+///
+/// Returns `Some(block_end)` if this is a tail block, where `block_end` is the address
+/// just past the last instruction in the tail block.
+fn check_tail_block(
+    section: &ObjSection,
+    gap_start: SectionAddress,
+    gap_end: SectionAddress,
+    preceding_func_start: SectionAddress,
+    preceding_func_end: SectionAddress,
+) -> Option<SectionAddress> {
+    // Only consider small gaps (up to 64 bytes / 16 instructions)
+    let gap_size = gap_end.address - gap_start.address;
+    if gap_size > 64 {
+        return None;
+    }
+
+    // Check the first instruction
+    let first_ins = disassemble(section, gap_start.address)?;
+
+    // Case 1: First instruction is an unconditional branch (b, not bl) back into
+    // the preceding function. This is the classic out-of-line loop exit.
+    if first_ins.op == Opcode::B && !first_ins.field_lk() && !first_ins.field_aa() {
+        let target = first_ins.branch_dest(gap_start.address)?;
+        if target >= preceding_func_start.address && target < preceding_func_end.address {
+            // Scan forward to find the end of this tail block (up to blr or gap_end)
+            let mut addr = gap_start;
             loop {
-                match (iter.next(), iter.peek()) {
-                    (Some((&first, first_info)), Some(&(&second, second_info))) => {
-                        let Some(first_end) = first_info.end else { continue };
-                        if first_end > second {
-                            bail!("Overlapping functions {}-{} -> {}", first, first_end, second);
+                let Some(ins) = disassemble(section, addr.address) else { break };
+                addr += 4;
+                // blr (unconditional return) or end of gap
+                if ins.op == Opcode::Bclr
+                    && !ins.field_lk()
+                    && (ins.field_bo() & 0b10100 == 0b10100)
+                {
+                    return Some(addr);
+                }
+                if addr >= gap_end {
+                    return Some(gap_end);
+                }
+            }
+        }
+    }
+
+    // Case 2: Scan the entire gap block — if every branch instruction targets back
+    // into the preceding function (no outward calls or forward jumps to other functions),
+    // and the block ends with blr, treat it as a tail block.
+    let mut addr = gap_start;
+    let mut has_backward_branch = false;
+    let mut ends_with_blr = false;
+    while addr < gap_end {
+        let Some(ins) = disassemble(section, addr.address) else { return None };
+
+        match ins.op {
+            // Unconditional or conditional branch (not link)
+            Opcode::B | Opcode::Bc if !ins.field_lk() && !ins.field_aa() => {
+                if let Some(target) = ins.branch_dest(addr.address) {
+                    if target >= preceding_func_start.address
+                        && target < preceding_func_end.address
+                    {
+                        has_backward_branch = true;
+                    } else if target < gap_start.address || target >= gap_end.address {
+                        // Branch to somewhere outside both the preceding function and
+                        // this gap — not a simple tail block
+                        return None;
+                    }
+                }
+            }
+            // bl (function call) — tail blocks don't call other functions
+            Opcode::B | Opcode::Bc if ins.field_lk() => return None,
+            // blr — return instruction
+            Opcode::Bclr if !ins.field_lk() && (ins.field_bo() & 0b10100 == 0b10100) => {
+                ends_with_blr = true;
+            }
+            // bctr — indirect branch, not typical for a tail block
+            Opcode::Bcctr if !ins.field_lk() => return None,
+            _ => {}
+        }
+
+        addr += 4;
+    }
+
+    if has_backward_branch && ends_with_blr {
+        Some(gap_end)
+    } else {
+        None
+    }
+}
+
+fn detect_new_functions(
+    obj: &ObjInfo,
+    config: &CfaConfig,
+    functions: &mut BTreeMap<SectionAddress, FunctionInfo>,
+) -> Result<bool> {
+    let mut new_functions = vec![];
+    let mut extended_functions: Vec<(SectionAddress, SectionAddress)> = vec![];
+    for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
+        if section.name == ".xidata" {
+            continue;
+        } // because we already did our xidata processing at this point
+        let section_start = SectionAddress::new(section_index, section.address as u32);
+        let section_end = section_start + section.size as u32;
+        let mut iter = functions.range(section_start..section_end).peekable();
+        loop {
+            match (iter.next(), iter.peek()) {
+                (Some((&first, first_info)), Some(&(&second, second_info))) => {
+                    let Some(first_end) = first_info.end else { continue };
+                    if first_end > second {
+                        bail!("Overlapping functions {}-{} -> {}", first, first_end, second);
+                    }
+                    let addr = match skip_alignment(config, section, first_end, second) {
+                        Some(addr) => addr,
+                        None => continue,
+                    };
+                    if second > addr {
+                        // don't try to add a function where there's an exception symbol
+                        if obj
+                            .symbols
+                            .by_name(&format!("except_data_{:08X}", addr.address + 8))?
+                            .is_some()
+                        {
+                            continue;
                         }
-                        let addr = match self.skip_alignment(section, first_end, second) {
+
+                        // Check if this gap is a tail block of the preceding function
+                        if let Some(tail_end) =
+                            check_tail_block(section, addr, second, first, first_end)
+                        {
+                            log::info!(
+                                "Detected tail block @ {:#010X}-{:#010X} of function {:#010X}, extending function end from {:#010X}",
+                                addr, tail_end, first, first_end,
+                            );
+                            extended_functions.push((first, tail_end));
+                            continue;
+                        }
+
+                        log::trace!(
+                            "Trying function @ {:#010X} (from {:#010X}-{:#010X} <-> {:#010X}-{:#010X?})",
+                            addr,
+                            first.address,
+                            first_end,
+                            second.address,
+                            second_info.end,
+                        );
+                        new_functions.push(addr);
+                    }
+                }
+                (Some((&last, last_info)), None) => {
+                    let Some(last_end) = last_info.end else { continue };
+                    if last_end < section_end {
+                        let addr = match skip_alignment(config, section, last_end, section_end) {
                             Some(addr) => addr,
                             None => continue,
                         };
-                        if second > addr {
-                            // don't try to add a function where there's an exception symbol
-                            if obj
-                                .symbols
-                                .by_name(&format!("except_data_{:08X}", addr.address + 8))?
-                                .is_some()
-                            {
-                                continue;
-                            }
-
-                            // Check if this gap is a tail block of the preceding function
-                            if let Some(tail_end) =
-                                Self::check_tail_block(section, addr, second, first, first_end)
-                            {
+                        if addr < section_end {
+                            // Check if this gap is a tail block of the last function
+                            if let Some(tail_end) = check_tail_block(
+                                section,
+                                addr,
+                                section_end,
+                                last,
+                                last_end,
+                            ) {
                                 log::info!(
                                     "Detected tail block @ {:#010X}-{:#010X} of function {:#010X}, extending function end from {:#010X}",
-                                    addr, tail_end, first, first_end,
+                                    addr, tail_end, last, last_end,
                                 );
-                                extended_functions.push((first, tail_end));
+                                extended_functions.push((last, tail_end));
                                 continue;
                             }
 
                             log::trace!(
-                                "Trying function @ {:#010X} (from {:#010X}-{:#010X} <-> {:#010X}-{:#010X?})",
+                                "Trying function @ {:#010X} (from {:#010X}-{:#010X} <-> {:#010X})",
                                 addr,
-                                first.address,
-                                first_end,
-                                second.address,
-                                second_info.end,
+                                last.address,
+                                last_end,
+                                section_end,
                             );
                             new_functions.push(addr);
                         }
                     }
-                    (Some((&last, last_info)), None) => {
-                        let Some(last_end) = last_info.end else { continue };
-                        if last_end < section_end {
-                            let addr = match self.skip_alignment(section, last_end, section_end) {
-                                Some(addr) => addr,
-                                None => continue,
-                            };
-                            if addr < section_end {
-                                // Check if this gap is a tail block of the last function
-                                if let Some(tail_end) = Self::check_tail_block(
-                                    section,
-                                    addr,
-                                    section_end,
-                                    last,
-                                    last_end,
-                                ) {
-                                    log::info!(
-                                        "Detected tail block @ {:#010X}-{:#010X} of function {:#010X}, extending function end from {:#010X}",
-                                        addr, tail_end, last, last_end,
-                                    );
-                                    extended_functions.push((last, tail_end));
-                                    continue;
-                                }
-
-                                log::trace!(
-                                    "Trying function @ {:#010X} (from {:#010X}-{:#010X} <-> {:#010X})",
-                                    addr,
-                                    last.address,
-                                    last_end,
-                                    section_end,
-                                );
-                                new_functions.push(addr);
-                            }
-                        }
-                    }
-                    _ => break,
                 }
+                _ => break,
             }
         }
-        // Apply function end extensions for tail blocks
-        for (func_addr, new_end) in &extended_functions {
-            if let Some(info) = self.functions.get_mut(func_addr) {
-                if let Some(ref mut end) = info.end {
-                    if *new_end > *end {
-                        *end = *new_end;
-                    }
-                }
-                // Mark as needing re-analysis since the function bounds changed
-                info.analyzed = false;
-            }
-        }
-        let found_new = !new_functions.is_empty() || !extended_functions.is_empty();
-        for addr in new_functions {
-            let opt = self.functions.insert(addr, FunctionInfo::default());
-            ensure!(opt.is_none(), "Attempted to detect duplicate function @ {:#010X}", addr);
-        }
-        Ok(found_new)
     }
-
-    fn skip_alignment(
-        &self,
-        section: &ObjSection,
-        mut addr: SectionAddress,
-        end: SectionAddress,
-    ) -> Option<SectionAddress> {
-        loop {
-            if let Some((&start, &end)) = self.skip_ranges.range(..=addr).next_back() {
-                if addr >= start && addr < end {
-                    addr = end;
+    // Apply function end extensions for tail blocks
+    for (func_addr, new_end) in &extended_functions {
+        if let Some(info) = functions.get_mut(func_addr) {
+            if let Some(ref mut end) = info.end {
+                if *new_end > *end {
+                    *end = *new_end;
                 }
-            };
-            if addr.address + 4 > end.address {
-                break None;
             }
-            let data = match section.data_range(addr.address, addr.address + 4) {
-                Ok(data) => data,
-                Err(_) => return None,
-            };
-            if data == [0u8; 4] {
-                addr += 4;
-            } else {
-                break Some(addr);
+            // Mark as needing re-analysis since the function bounds changed
+            info.analyzed = false;
+        }
+    }
+    let found_new = !new_functions.is_empty() || !extended_functions.is_empty();
+    for addr in new_functions {
+        let opt = functions.insert(addr, FunctionInfo::default());
+        ensure!(opt.is_none(), "Attempted to detect duplicate function @ {:#010X}", addr);
+    }
+    Ok(found_new)
+}
+
+fn skip_alignment(
+    config: &CfaConfig,
+    section: &ObjSection,
+    mut addr: SectionAddress,
+    end: SectionAddress,
+) -> Option<SectionAddress> {
+    loop {
+        if let Some((&start, &end)) = config.skip_ranges.range(..=addr).next_back() {
+            if addr >= start && addr < end {
+                addr = end;
             }
+        };
+        if addr.address + 4 > end.address {
+            break None;
+        }
+        let data = match section.data_range(addr.address, addr.address + 4) {
+            Ok(data) => data,
+            Err(_) => return None,
+        };
+        if data == [0u8; 4] {
+            addr += 4;
+        } else {
+            break Some(addr);
         }
     }
 }
+
+// =============================================================================
+// Standalone utility functions
+// =============================================================================
 
 /// Execute VM from entry point following branches and function calls
 /// until SDA bases are initialized (__init_registers)
@@ -1471,7 +1093,7 @@ pub fn locate_sda_bases(obj: &mut ObjInfo) -> Result<bool> {
                 }
             }
 
-            if let (GprValue::Constant(sda2_base), GprValue::Constant(sda_base)) =
+            if let (Value::Constant(sda2_base), Value::Constant(sda_base)) =
                 (vm.gpr_value(2), vm.gpr_value(13))
             {
                 return Ok(ExecCbResult::End((sda2_base, sda_base)));
@@ -1565,53 +1187,6 @@ mod tests {
     /// Encode `bctr` (branch to count register)
     const BCTR: u32 = 0x4E800420;
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct ShadowDigest {
-        functions: std::collections::BTreeMap<SectionAddress, Option<SectionAddress>>,
-        jump_tables: std::collections::BTreeMap<SectionAddress, u32>,
-    }
-
-    fn shadow_digest(state: &AnalyzerState) -> ShadowDigest {
-        ShadowDigest {
-            functions: state.functions.iter().map(|(&addr, info)| (addr, info.end)).collect(),
-            jump_tables: state.jump_tables.clone(),
-        }
-    }
-
-    fn diff_shadow_digests(expected: &ShadowDigest, actual: &ShadowDigest) -> Vec<String> {
-        let mut diffs = Vec::new();
-        let function_keys = expected
-            .functions
-            .keys()
-            .chain(actual.functions.keys())
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        for key in function_keys {
-            let e = expected.functions.get(&key);
-            let a = actual.functions.get(&key);
-            if e != a {
-                diffs.push(format!("function mismatch at {key}: expected {:?}, actual {:?}", e, a));
-            }
-        }
-        let jump_keys = expected
-            .jump_tables
-            .keys()
-            .chain(actual.jump_tables.keys())
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        for key in jump_keys {
-            let e = expected.jump_tables.get(&key);
-            let a = actual.jump_tables.get(&key);
-            if e != a {
-                diffs.push(format!(
-                    "jump-table mismatch at {key}: expected {:?}, actual {:?}",
-                    e, a
-                ));
-            }
-        }
-        diffs
-    }
-
     /// Test FunctionInfo state detection methods
     #[test]
     fn test_function_info_states() {
@@ -1659,46 +1234,33 @@ mod tests {
 
     /// Test that a function with a known end from pdata/symbols maintains that end
     /// when slices can't finalize. This tests the fix in process_function_at().
-    ///
-    /// Before fix: info.end would be set to None when can_finalize() returned false
-    /// After fix: info.end is preserved (not overwritten)
     #[test]
     fn test_known_end_preserved_state() {
-        // Simulate the state after process_function_at with the fix:
-        // - We had a known end from pdata (0x100)
-        // - Slices couldn't finalize (has possible_blocks)
-        // - The fix preserves info.end instead of setting it to None
         let known_end = SectionAddress::new(0, 0x100);
         let info = FunctionInfo {
             analyzed: true,
-            end: Some(known_end),                    // preserved from pdata
-            slices: Some(FunctionSlices::default()), // slices that couldn't finalize
+            end: Some(known_end),
+            slices: Some(FunctionSlices::default()),
         };
 
-        // With the fix, this state is valid: we have a known end even though
-        // slices couldn't finalize. This allows the function to proceed with
-        // the pdata-provided bounds.
         assert!(info.is_analyzed());
-        assert!(info.is_function()); // has both end and slices
+        assert!(info.is_function());
         assert_eq!(info.end, Some(known_end));
     }
 
-    /// Test that AnalyzerState correctly initializes functions from known_functions (pdata)
+    /// Test that functions map correctly tracks function entries
     #[test]
-    fn test_analyzer_state_known_function_init() {
-        let mut state = AnalyzerState::default();
+    fn test_functions_map_init() {
+        let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
 
-        // Simulate adding a known function from pdata with a known size
         let func_addr = SectionAddress::new(0, 0x1000);
         let func_size = 0x50u32;
         let func_end = func_addr + func_size;
 
-        state
-            .functions
+        functions
             .insert(func_addr, FunctionInfo { analyzed: false, end: Some(func_end), slices: None });
 
-        // Verify the function was added with the correct end
-        let info = state.functions.get(&func_addr).unwrap();
+        let info = functions.get(&func_addr).unwrap();
         assert!(!info.analyzed);
         assert_eq!(info.end, Some(func_end));
         assert!(info.slices.is_none());
@@ -1706,38 +1268,27 @@ mod tests {
 
     /// Test the scenario where process_function_at receives a function with
     /// a pre-set end (from pdata) and slices can't finalize.
-    ///
-    /// This simulates what happens after the fix: the end is preserved.
     #[test]
     fn test_end_preserved_when_cannot_finalize() {
-        let mut state = AnalyzerState::default();
+        let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
 
-        // Setup: function with known end from pdata
         let func_addr = SectionAddress::new(0, 0x1000);
         let known_end = SectionAddress::new(0, 0x1050);
 
-        state.functions.insert(
+        functions.insert(
             func_addr,
             FunctionInfo { analyzed: false, end: Some(known_end), slices: None },
         );
 
-        // Simulate what process_function_at does when slices can't finalize:
-        // With the fix, it should preserve the existing end
         let slices = FunctionSlices::default();
-        // Note: FunctionSlices::default() has possible_blocks empty, so can_finalize() = true
-        // But we're testing the code path conceptually
 
-        // Get existing info and simulate the "can't finalize" branch
-        let info = state.functions.get_mut(&func_addr).unwrap();
-        let original_end = info.end; // Should be Some(known_end)
+        let info = functions.get_mut(&func_addr).unwrap();
+        let original_end = info.end;
 
-        // Simulate the fixed code path (doesn't overwrite info.end):
         info.analyzed = true;
-        // info.end = None; // OLD BUG: this line was present
-        // NEW FIX: we don't touch info.end, preserving the known value
+        // Don't overwrite info.end, preserving the known value
         info.slices = Some(slices);
 
-        // Verify the end is preserved
         assert_eq!(info.end, original_end);
         assert_eq!(info.end, Some(known_end));
     }
@@ -1745,262 +1296,33 @@ mod tests {
     /// Test the scenario where slices CAN finalize - end should come from slices
     #[test]
     fn test_end_from_slices_when_can_finalize() {
-        let mut state = AnalyzerState::default();
+        let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
 
-        // Setup: function without known end
         let func_addr = SectionAddress::new(0, 0x1000);
 
-        state.functions.insert(func_addr, FunctionInfo::default());
+        functions.insert(func_addr, FunctionInfo::default());
 
-        // Create slices that represent a finalized function
         let mut slices = FunctionSlices::default();
-        // Add a block to give the slices an end
         slices.blocks.insert(func_addr, Some(SectionAddress::new(0, 0x1020)));
 
-        // Simulate what process_function_at does when slices CAN finalize:
-        let info = state.functions.get_mut(&func_addr).unwrap();
+        let info = functions.get_mut(&func_addr).unwrap();
         info.analyzed = true;
-        info.end = slices.end(); // Set from slices
+        info.end = slices.end();
         info.slices = Some(slices.clone());
 
-        // Verify the end comes from slices
         assert!(info.is_analyzed());
         assert_eq!(info.end, slices.end());
-    }
-
-    /// Shadow harness sanity: identical digests must produce no diffs.
-    #[test]
-    fn test_shadow_digest_diff_is_empty_for_identical_state() {
-        let mut state = AnalyzerState::default();
-        let func = SectionAddress::new(0, 0x1000);
-        state.functions.insert(
-            func,
-            FunctionInfo {
-                analyzed: true,
-                end: Some(func + 0x20),
-                slices: Some(FunctionSlices::default()),
-            },
-        );
-        state.jump_tables.insert(SectionAddress::new(0, 0x1040), 0x10);
-
-        let digest = shadow_digest(&state);
-        assert!(
-            diff_shadow_digests(&digest, &digest).is_empty(),
-            "identical shadow digests should not differ"
-        );
-    }
-
-    /// Shadow parity baseline: current analyzer should be deterministic on repeated runs.
-    #[test]
-    fn test_shadow_digest_is_deterministic_for_legacy_analyzer() {
-        let obj = make_obj(0x1000, &[NOP, BLR, NOP, NOP, NOP, NOP]);
-        let start = SectionAddress::new(0, 0x1000);
-
-        let mut state_a = AnalyzerState::new(std::collections::BTreeMap::new());
-        state_a.functions.insert(start, FunctionInfo::default());
-        state_a.process_function_at(&obj, start).expect("first process_function_at run failed");
-        state_a.validate_invariants(&obj).expect("first invariant validation failed");
-
-        let mut state_b = AnalyzerState::new(std::collections::BTreeMap::new());
-        state_b.functions.insert(start, FunctionInfo::default());
-        state_b.process_function_at(&obj, start).expect("second process_function_at run failed");
-        state_b.validate_invariants(&obj).expect("second invariant validation failed");
-
-        let digest_a = shadow_digest(&state_a);
-        let digest_b = shadow_digest(&state_b);
-        let diffs = diff_shadow_digests(&digest_a, &digest_b);
-        assert!(diffs.is_empty(), "legacy analyzer should be deterministic, diffs: {diffs:?}");
-    }
-
-    #[test]
-    fn test_candidate_shadow_decision_triggers_vm_threshold_fallback() {
-        let config = CandidateShadowGateConfig {
-            enable_vm2_shadow: true,
-            enable_pipeline_shadow: false,
-            max_vm_shadow_deltas: 0,
-            max_phase_checkpoint_deltas: 0,
-        };
-        let decision = evaluate_candidate_shadow_decision(1, 0, config);
-        assert!(decision.should_fallback());
-        assert_eq!(decision.reasons, vec![CandidateFallbackReason::VmShadowDeltasExceeded]);
-    }
-
-    #[test]
-    fn test_parse_shadow_bool_accepts_common_values() {
-        assert_eq!(parse_shadow_bool("1"), Some(true));
-        assert_eq!(parse_shadow_bool("true"), Some(true));
-        assert_eq!(parse_shadow_bool("YES"), Some(true));
-        assert_eq!(parse_shadow_bool("on"), Some(true));
-        assert_eq!(parse_shadow_bool("0"), Some(false));
-        assert_eq!(parse_shadow_bool("false"), Some(false));
-        assert_eq!(parse_shadow_bool("No"), Some(false));
-        assert_eq!(parse_shadow_bool("off"), Some(false));
-    }
-
-    #[test]
-    fn test_parse_shadow_bool_rejects_invalid_values() {
-        assert_eq!(parse_shadow_bool(""), None);
-        assert_eq!(parse_shadow_bool("2"), None);
-        assert_eq!(parse_shadow_bool("maybe"), None);
-    }
-
-    #[test]
-    fn test_parse_pipeline_execution_mode_accepts_common_values() {
-        assert_eq!(
-            parse_pipeline_execution_mode("legacy"),
-            Some(PipelineExecutionMode::Legacy)
-        );
-        assert_eq!(
-            parse_pipeline_execution_mode("shadow"),
-            Some(PipelineExecutionMode::Shadow)
-        );
-        assert_eq!(
-            parse_pipeline_execution_mode("AUTO"),
-            Some(PipelineExecutionMode::Shadow)
-        );
-        assert_eq!(
-            parse_pipeline_execution_mode("candidate"),
-            Some(PipelineExecutionMode::Candidate)
-        );
-    }
-
-    #[test]
-    fn test_parse_pipeline_execution_mode_rejects_invalid_values() {
-        assert_eq!(parse_pipeline_execution_mode(""), None);
-        assert_eq!(parse_pipeline_execution_mode("legacy-shadow"), None);
-        assert_eq!(parse_pipeline_execution_mode("1"), None);
-    }
-
-    #[test]
-    fn test_candidate_shadow_decision_triggers_phase_threshold_fallback() {
-        let config = CandidateShadowGateConfig {
-            enable_vm2_shadow: false,
-            enable_pipeline_shadow: true,
-            max_vm_shadow_deltas: 0,
-            max_phase_checkpoint_deltas: 0,
-        };
-        let decision = evaluate_candidate_shadow_decision(0, 1, config);
-        assert!(decision.should_fallback());
-        assert_eq!(decision.reasons, vec![CandidateFallbackReason::PhaseCheckpointDeltasExceeded]);
-    }
-
-    #[test]
-    fn test_candidate_shadow_decision_respects_gate_flags_and_thresholds() {
-        let disabled = CandidateShadowGateConfig {
-            enable_vm2_shadow: false,
-            enable_pipeline_shadow: false,
-            max_vm_shadow_deltas: 0,
-            max_phase_checkpoint_deltas: 0,
-        };
-        let decision_disabled = evaluate_candidate_shadow_decision(10, 10, disabled);
-        assert!(!decision_disabled.should_fallback());
-
-        let enabled = CandidateShadowGateConfig {
-            enable_vm2_shadow: true,
-            enable_pipeline_shadow: true,
-            max_vm_shadow_deltas: 2,
-            max_phase_checkpoint_deltas: 3,
-        };
-        let decision_enabled = evaluate_candidate_shadow_decision(2, 3, enabled);
-        assert!(!decision_enabled.should_fallback());
-    }
-
-    #[test]
-    fn test_candidate_shadow_fallback_preserves_legacy_output_digest() {
-        let mut legacy_state = AnalyzerState::default();
-        let func_start = SectionAddress::new(0, 0x1000);
-        legacy_state.functions.insert(
-            func_start,
-            FunctionInfo {
-                analyzed: true,
-                end: Some(func_start + 0x20),
-                slices: Some(FunctionSlices::default()),
-            },
-        );
-        legacy_state.jump_tables.insert(SectionAddress::new(0, 0x1040), 0x10);
-        let fallback_digest = shadow_digest(&legacy_state);
-
-        let candidate_digest = ShadowDigest {
-            functions: std::collections::BTreeMap::new(),
-            jump_tables: std::collections::BTreeMap::new(),
-        };
-        let decision = CandidateShadowDecision {
-            vm_shadow_deltas: 1,
-            phase_checkpoint_deltas: 0,
-            reasons: vec![CandidateFallbackReason::VmShadowDeltasExceeded],
-        };
-        assert!(decision.should_fallback());
-
-        let selected_digest =
-            select_candidate_or_legacy(&fallback_digest, &candidate_digest, &decision);
-        assert_eq!(
-            selected_digest, fallback_digest,
-            "fallback path should preserve legacy output digest exactly"
-        );
-    }
-
-    #[test]
-    fn test_detect_functions_with_shadow_config_pipeline_gate_uses_live_phase_deltas() {
-        let obj = make_obj(0x1000, &[NOP, BLR]);
-        let mut state = AnalyzerState::new(std::collections::BTreeMap::new());
-        let gate_config = CandidateShadowGateConfig {
-            enable_vm2_shadow: false,
-            enable_pipeline_shadow: true,
-            max_vm_shadow_deltas: 0,
-            max_phase_checkpoint_deltas: 0,
-        };
-        let decision = state
-            .detect_functions_with_shadow_config(&obj, gate_config)
-            .expect("shadow-gated detect_functions should succeed");
-        assert_eq!(decision.vm_shadow_deltas, 0);
-        assert_eq!(decision.phase_checkpoint_deltas, 0);
-        assert!(!decision.should_fallback());
-        assert!(
-            !state.functions.is_empty(),
-            "state should be populated by selected candidate pipeline result"
-        );
-    }
-
-    #[test]
-    fn test_detect_functions_with_shadow_config_vm_gate_uses_runtime_vm_shadow_deltas() {
-        let obj = make_obj(0x1000, &[NOP, BLR]);
-        let mut state = AnalyzerState::new(std::collections::BTreeMap::new());
-        let gate_config = CandidateShadowGateConfig {
-            enable_vm2_shadow: true,
-            enable_pipeline_shadow: false,
-            max_vm_shadow_deltas: 0,
-            max_phase_checkpoint_deltas: 0,
-        };
-        let decision = state
-            .detect_functions_with_shadow_config(&obj, gate_config)
-            .expect("vm-shadow-gated detect_functions should succeed");
-        assert_eq!(decision.vm_shadow_deltas, 0);
-        assert_eq!(decision.phase_checkpoint_deltas, 0);
-        assert!(!decision.should_fallback());
-        assert!(!state.functions.is_empty(), "state should be populated after analysis");
-    }
-
-    #[test]
-    fn test_detect_functions_candidate_mode_runs_without_shadow() {
-        let obj = make_obj(0x1000, &[NOP, BLR]);
-        let mut state = AnalyzerState::new(std::collections::BTreeMap::new());
-        state
-            .detect_functions_candidate(&obj)
-            .expect("candidate-mode detect_functions should succeed");
-        assert!(
-            !state.functions.is_empty(),
-            "candidate mode should populate analyzer state without shadow fallback"
-        );
     }
 
     #[test]
     fn test_validate_invariants_rejects_overlapping_functions() {
         let obj = make_obj(0x1000, &[NOP, BLR, NOP, NOP, NOP, NOP]);
-        let mut state = AnalyzerState::default();
+        let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+        let jump_tables: BTreeMap<SectionAddress, u32> = BTreeMap::new();
 
         let a = SectionAddress::new(0, 0x1000);
         let b = SectionAddress::new(0, 0x1008);
-        state.functions.insert(
+        functions.insert(
             a,
             FunctionInfo {
                 analyzed: true,
@@ -2008,7 +1330,7 @@ mod tests {
                 slices: Some(FunctionSlices::default()),
             },
         );
-        state.functions.insert(
+        functions.insert(
             b,
             FunctionInfo {
                 analyzed: true,
@@ -2017,8 +1339,7 @@ mod tests {
             },
         );
 
-        let err = state
-            .validate_invariants(&obj)
+        let err = validate_invariants(&obj, &functions, &jump_tables)
             .expect_err("overlapping functions should fail invariant checks");
         assert!(
             format!("{err:#}").contains("Overlapping functions"),
@@ -2031,13 +1352,8 @@ mod tests {
     // =========================================================================
 
     /// Case 1: Classic tail block — starts with `b` back into preceding function, ends with blr.
-    /// Layout:
-    ///   0x1000-0x1010: preceding function (4 instructions)
-    ///   0x1010-0x101C: gap (tail block candidate: b 0x1004; addi r3,r3,1; blr)
     #[test]
     fn test_tail_block_case1_backward_branch_then_blr() {
-        // Preceding function: nop, nop, nop, nop  (0x1000..0x1010)
-        // Gap/tail block: b -0xC (-> 0x1004), addi r3, blr  (0x1010..0x101C)
         let section = make_code_section(
             0x1000,
             &[
@@ -2057,14 +1373,11 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, Some(SectionAddress::new(0, 0x101C)));
     }
 
     /// Case 2: Tail block detected by scanning — conditional backward branch + blr.
-    /// Layout:
-    ///   0x1000-0x1010: preceding function
-    ///   0x1010-0x101C: gap (addi r3; bne -0x14 (-> 0x1004); blr)
     #[test]
     fn test_tail_block_case2_conditional_backward_branch_with_blr() {
         let section = make_code_section(
@@ -2086,7 +1399,7 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, Some(gap_end));
     }
 
@@ -2111,11 +1424,11 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
-    /// Not a tail block: gap branches forward to another function (not back into predecessor).
+    /// Not a tail block: gap branches forward to another function.
     #[test]
     fn test_not_tail_block_forward_branch() {
         let section = make_code_section(
@@ -2136,14 +1449,13 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
     /// Not a tail block: gap is too large (> 64 bytes).
     #[test]
     fn test_not_tail_block_too_large() {
-        // 20 instructions = 80 bytes > 64 byte limit
         let mut insns = vec![NOP; 4]; // preceding func
         insns.extend(std::iter::repeat(NOP).take(20)); // large gap
         let section = make_code_section(0x1000, &insns);
@@ -2154,11 +1466,11 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
-    /// Not a tail block: has backward branch but no blr (no return).
+    /// Not a tail block: has backward branch but no blr.
     #[test]
     fn test_not_tail_block_no_blr() {
         let section = make_code_section(
@@ -2180,7 +1492,7 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
@@ -2201,17 +1513,15 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         assert_eq!(result, None);
     }
 
-    /// Jump table symbols created by apply() should have Global scope.
-    /// This ensures the linker can resolve cross-object jumptable references.
+    /// Jump table symbols created by apply_cfa() should have Global scope.
     #[test]
     fn test_jump_table_symbols_are_global() {
         use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSectionKind, ObjSymbolScope};
 
-        // Create a minimal ObjInfo with a .rodata section covering the jump table
         let section = ObjSection {
             name: ".rodata".into(),
             kind: ObjSectionKind::ReadOnlyData,
@@ -2229,21 +1539,25 @@ mod tests {
             vec![section],
         );
 
-        // Create analyzer state with a jump table entry
-        let mut state = AnalyzerState::default();
+        let config = CfaConfig::default();
         let jt_addr = SectionAddress::new(0, 0x8000_0040);
-        state.jump_tables.insert(jt_addr, 0x20); // 32 bytes
+        let mut jump_tables = BTreeMap::new();
+        jump_tables.insert(jt_addr, 0x20); // 32 bytes
+        let result = CfaResult {
+            functions: BTreeMap::new(),
+            jump_tables,
+            merged_tail_blocks: Vec::new(),
+            extended_functions: Vec::new(),
+        };
 
-        // Apply the state to the object
-        state.apply(&mut obj).unwrap();
+        apply_cfa(&mut obj, &result, &config).unwrap();
 
-        // Find the jumptable symbol
         let jt_sym = obj
             .symbols
             .iter()
             .find(|(_, s)| s.name.starts_with("jumptable_"))
             .map(|(_, s)| s)
-            .expect("jumptable symbol not found after apply()");
+            .expect("jumptable symbol not found after apply_cfa()");
 
         assert_eq!(
             jt_sym.flags.scope(),
@@ -2257,7 +1571,6 @@ mod tests {
     }
 
     /// Case 1 variant: First instruction branches back, blr found before gap_end.
-    /// The tail block is shorter than the full gap.
     #[test]
     fn test_tail_block_case1_blr_before_gap_end() {
         let section = make_code_section(
@@ -2279,7 +1592,7 @@ mod tests {
         let func_end = SectionAddress::new(0, 0x1010);
 
         let result =
-            AnalyzerState::check_tail_block(&section, gap_start, gap_end, func_start, func_end);
+            check_tail_block(&section, gap_start, gap_end, func_start, func_end);
         // Should detect tail block ending at 0x1018 (right after blr at 0x1014)
         assert_eq!(result, Some(SectionAddress::new(0, 0x1018)));
     }
@@ -2313,11 +1626,11 @@ pub fn locate_bss_memsets(obj: &ObjInfo) -> Result<Vec<(u32, u32)>> {
                         if branch.link {
                             // Some ProDG crt0.s versions use the wrong registers, some don't
                             if let (
-                                GprValue::Constant(addr),
-                                GprValue::Constant(value),
-                                GprValue::Constant(size),
+                                Value::Constant(addr),
+                                Value::Constant(value),
+                                Value::Constant(size),
                             ) = {
-                                if vm.gpr_value(4) == GprValue::Constant(0) {
+                                if vm.gpr_value(4) == Value::Constant(0) {
                                     (vm.gpr_value(3), vm.gpr_value(4), vm.gpr_value(5))
                                 } else {
                                     (vm.gpr_value(4), vm.gpr_value(5), vm.gpr_value(6))
