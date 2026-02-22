@@ -22,7 +22,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{
     analysis::{
-        cfa::{AnalyzerState, SectionAddress},
+        cfa::{CfaConfig, SectionAddress, run_cfa, apply_cfa},
         objects::{detect_objects, detect_strings},
         pass::{AnalysisPass, FindSaveRestSledsXbox},
         tracker::Tracker,
@@ -550,11 +550,11 @@ fn load_analyze_xex(config: &ProjectConfig) -> Result<ExeAnalyzeResult> {
     apply_block_relocations(&mut obj, &config.base.block_relocations)?;
 
     if !config.symbols_known && !config.quick_analysis {
-        let mut state = AnalyzerState::default();
+        let mut config = CfaConfig::default();
         debug!("Detecting function boundaries");
-        FindSaveRestSledsXbox::execute(&mut state, &obj)?;
-        state.detect_functions(&obj)?; // perform CFA
-        state.apply(&mut obj)?; // give each found function a symbol
+        FindSaveRestSledsXbox::execute(&mut config, &obj)?;
+        let result = run_cfa(&obj, &config)?; // perform CFA
+        apply_cfa(&mut obj, &result, &config)?; // give each found function a symbol
     }
 
     // Apply additional relocations from config
@@ -590,19 +590,19 @@ fn disasm(args: DisasmArgs) -> Result<()> {
     // step 1. process xex, and return an ObjInfo
     let mut obj = process_xex(&args.xex_file)?;
 
-    let mut state = AnalyzerState::default();
+    let mut config = CfaConfig::default();
 
     // step 2. find common functions (save/restore reg funcs, XAPI calls)
     // rename the save/restore gpr/fpr funcs that were previously found in pdata
-    FindSaveRestSledsXbox::execute(&mut state, &obj)?;
+    FindSaveRestSledsXbox::execute(&mut config, &obj)?;
 
-    state.detect_functions(&obj)?;
+    let result = run_cfa(&obj, &config)?;
     log::info!(
         "Discovered {} functions",
-        state.functions.iter().filter(|(_, i)| i.end.is_some()).count()
+        result.functions.iter().filter(|(_, i)| i.end.is_some()).count()
     );
     // give each found function a symbol
-    state.apply(&mut obj)?;
+    apply_cfa(&mut obj, &result, &config)?;
 
     println!("Checking for relocatable targets...");
     // look at dol's split_write_obj

@@ -21,7 +21,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{
     analysis::{
-        cfa::{AnalyzerState, SectionAddress},
+        cfa::{CfaConfig, CfaResult, SectionAddress, run_cfa, apply_cfa},
         objects::{detect_objects, detect_strings},
         pass::{
             AnalysisPass, FindRelCtorsDtors, FindRelRodataData, FindSaveRestSleds,
@@ -568,16 +568,19 @@ pub fn info(args: InfoArgs) -> Result<()> {
     };
     apply_signatures(&mut obj)?;
 
-    let mut state = AnalyzerState::default();
-    FindSaveRestSleds::execute(&mut state, &obj)?;
-    state.detect_functions(&obj)?;
+    let mut config = CfaConfig::default();
+    FindSaveRestSleds::execute(&mut config, &obj)?;
+    let result = run_cfa(&obj, &config)?;
     log::debug!(
         "Discovered {} functions",
-        state.functions.iter().filter(|(_, i)| i.end.is_some()).count()
+        result.functions.iter().filter(|(_, i)| i.end.is_some()).count()
     );
 
-    FindTRKInterruptVectorTable::execute(&mut state, &obj)?;
-    state.apply(&mut obj)?;
+    // NOTE: FindTRKInterruptVectorTable was a mid-pipeline pass that read analyzed functions.
+    // In the new architecture, it runs pre-CFA on seed_functions. It may not find matches
+    // here since seed_functions aren't analyzed yet. TODO: revisit if needed.
+    FindTRKInterruptVectorTable::execute(&mut config, &obj)?;
+    apply_cfa(&mut obj, &result, &config)?;
 
     apply_signatures_post(&mut obj)?;
 
@@ -945,12 +948,12 @@ fn load_analyze_dol(config: &ProjectConfig, object_base: &ObjectBase) -> Result<
         if !config.quick_analysis {
             let skip_ranges =
                 config.base.skip_cfa_ranges(&obj).context("Resolving skip CFA ranges")?;
-            let mut state = AnalyzerState::new(skip_ranges);
+            let mut config = CfaConfig { skip_ranges, ..Default::default() };
             debug!("Detecting function boundaries");
-            FindSaveRestSleds::execute(&mut state, &obj)?;
-            state.detect_functions(&obj)?;
-            FindTRKInterruptVectorTable::execute(&mut state, &obj)?;
-            state.apply(&mut obj)?;
+            FindSaveRestSleds::execute(&mut config, &obj)?;
+            let result = run_cfa(&obj, &config)?;
+            FindTRKInterruptVectorTable::execute(&mut config, &obj)?;
+            apply_cfa(&mut obj, &result, &config)?;
         }
 
         apply_signatures_post(&mut obj)?;
@@ -1247,12 +1250,12 @@ fn load_analyze_rel(
         if !config.quick_analysis {
             let skip_ranges =
                 module_config.skip_cfa_ranges(&module_obj).context("Resolving skip CFA ranges")?;
-            let mut state = AnalyzerState::new(skip_ranges);
-            FindSaveRestSleds::execute(&mut state, &module_obj)?;
-            state.detect_functions(&module_obj)?;
-            FindRelCtorsDtors::execute(&mut state, &module_obj)?;
-            FindRelRodataData::execute(&mut state, &module_obj)?;
-            state.apply(&mut module_obj)?;
+            let mut config = CfaConfig { skip_ranges, ..Default::default() };
+            FindSaveRestSleds::execute(&mut config, &module_obj)?;
+            let result = run_cfa(&module_obj, &config)?;
+            FindRelCtorsDtors::execute(&mut config, &module_obj)?;
+            FindRelRodataData::execute(&mut config, &module_obj)?;
+            apply_cfa(&mut module_obj, &result, &config)?;
         }
         apply_signatures(&mut module_obj)?;
         apply_signatures_post(&mut module_obj)?;
@@ -1567,7 +1570,7 @@ fn split(args: SplitArgs) -> Result<()> {
 }
 
 #[allow(dead_code)]
-fn validate(obj: &ObjInfo, elf_file: &Utf8NativePath, state: &AnalyzerState) -> Result<()> {
+fn validate(obj: &ObjInfo, elf_file: &Utf8NativePath, result: &CfaResult) -> Result<()> {
     let real_obj = process_elf(elf_file)?;
     for (section_index, real_section) in real_obj.sections.iter() {
         let obj_section = match obj.sections.get(section_index) {
@@ -1593,7 +1596,7 @@ fn validate(obj: &ObjInfo, elf_file: &Utf8NativePath, state: &AnalyzerState) -> 
         for (_symbol_idx, symbol) in real_obj.symbols.for_section(section_index) {
             let symbol_addr = SectionAddress::new(section_index, symbol.address as u32);
             real_functions.insert(symbol_addr, symbol.name.clone());
-            match state.functions.get(&symbol_addr) {
+            match result.functions.get(&symbol_addr) {
                 Some(info) => {
                     if let Some(end) = info.end {
                         if symbol.size > 0 && end != (symbol_addr + symbol.size as u32) {
@@ -1623,7 +1626,7 @@ fn validate(obj: &ObjInfo, elf_file: &Utf8NativePath, state: &AnalyzerState) -> 
             }
         }
     }
-    for (&start, info) in &state.functions {
+    for (&start, info) in &result.functions {
         let Some(end) = info.end else {
             continue;
         };
