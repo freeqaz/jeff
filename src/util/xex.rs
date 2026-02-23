@@ -1377,6 +1377,42 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
         comdat_regions.insert((section_idx, offset), (idx, effective_size));
     }
 
+    // Remove COMDAT entries involved in REL14 relocations.
+    // REL14 (conditional branch) has only ±32KB range. If either the source or
+    // target of a REL14 is in a separate .text$dup COMDAT section, the linker may
+    // interleave other sections between them, causing REL14 fixup overflow (LNK2013).
+    // Keeping both source and target in the contiguous main .text prevents overflow.
+    {
+        let mut rel14_keep: Vec<(ObjSectionIndex, u64)> = Vec::new();
+        for (sect_idx, sect) in obj.sections.iter() {
+            for (addr, reloc) in sect.relocations.iter() {
+                if matches!(reloc.kind, ObjRelocKind::PpcRel14) {
+                    // Keep the TARGET in main .text
+                    let target_sym = &obj.symbols[reloc.target_symbol];
+                    if let Some(target_section) = target_sym.section {
+                        let target_sect = &obj.sections[target_section];
+                        let offset = target_sym.address - target_sect.address;
+                        rel14_keep.push((target_section, offset));
+                    }
+                    // Keep the SOURCE (containing function) in main .text
+                    // Find which COMDAT region contains this relocation address
+                    let reloc_offset = addr as u64;
+                    for (&(si, start), &(_sym_idx, sz)) in &comdat_regions {
+                        if si == sect_idx && reloc_offset >= start && reloc_offset < start + sz {
+                            rel14_keep.push((si, start));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for key in &rel14_keep {
+            if comdat_regions.remove(key).is_some() {
+                log::debug!("Keeping REL14-involved function in main .text (not COMDAT): {:?}", key);
+            }
+        }
+    }
+
     // Track COMDAT sections: maps (section_index, offset) -> comdat_section_id
     let mut comdat_extracted_sections: BTreeMap<(ObjSectionIndex, u64), SectionId> = Default::default();
 
