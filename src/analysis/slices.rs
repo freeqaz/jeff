@@ -855,9 +855,33 @@ impl FunctionSlices {
             }
         }
 
-        // Sanity check
+        // Sanity check. Malformed seeds / branch targets can leave an out-of-bounds
+        // block start behind (especially on older split baselines). Prune those
+        // instead of aborting the entire XEX split. Still fail on unresolved
+        // in-range blocks, which indicate a real analysis bug.
+        let mut invalid_block_starts = Vec::new();
         for (&start, &end) in &self.blocks {
-            ensure!(end.is_some(), "Failed to finalize block @ {start:#010X}");
+            if end.is_some() {
+                continue;
+            }
+            let section = &obj.sections[start.section];
+            if !section.contains(start.address) {
+                log::warn!(
+                    "Dropping out-of-bounds unfinished block @ {:#010X} in section {} ({:#010X}-{:#010X})",
+                    start,
+                    section.name,
+                    section.address,
+                    section.address + section.size
+                );
+                invalid_block_starts.push(start);
+                continue;
+            }
+            ensure!(false, "Failed to finalize block @ {start:#010X}");
+        }
+        for start in invalid_block_starts {
+            self.blocks.remove(&start);
+            self.branches.remove(&start);
+            self.possible_blocks.remove(&start);
         }
 
         Ok(true)

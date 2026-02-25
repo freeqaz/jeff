@@ -1,4 +1,4 @@
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use fixedbitset::FixedBitSet;
 use powerpc::Ins;
 
@@ -32,18 +32,20 @@ impl VisitedAddresses {
     }
 
     pub fn contains(&self, section_address: u32, address: SectionAddress) -> bool {
-        self.inner[address.section as usize]
-            .contains(Self::bit_for(section_address, address.address))
+        Self::bit_for(section_address, address.address).is_some_and(|bit| {
+            self.inner[address.section as usize].contains(bit)
+        })
     }
 
     pub fn insert(&mut self, section_address: u32, address: SectionAddress) {
-        self.inner[address.section as usize]
-            .insert(Self::bit_for(section_address, address.address));
+        if let Some(bit) = Self::bit_for(section_address, address.address) {
+            self.inner[address.section as usize].insert(bit);
+        }
     }
 
     #[inline]
-    fn bit_for(section_address: u32, address: u32) -> usize {
-        ((address - section_address) / 4) as usize
+    fn bit_for(section_address: u32, address: u32) -> Option<usize> {
+        address.checked_sub(section_address).map(|delta| (delta / 4) as usize)
     }
 }
 
@@ -84,14 +86,16 @@ impl Executor {
     where Cb: FnMut(ExecCbData) -> Result<ExecCbResult<R>> {
         while let Some(mut state) = self.vm_stack.pop() {
             let section = &obj.sections[state.address.section];
-            ensure!(
-                section.contains(state.address.address),
-                "Invalid address {:#010X} within section {} ({:#010X}-{:#010X})",
-                state.address.address,
-                section.name,
-                section.address,
-                section.address + section.size
-            );
+            if !section.contains(state.address.address) {
+                log::warn!(
+                    "Skipping out-of-bounds code candidate {:#010X} in section {} ({:#010X}-{:#010X})",
+                    state.address.address,
+                    section.name,
+                    section.address,
+                    section.address + section.size
+                );
+                continue;
+            }
             if section.kind != ObjSectionKind::Code {
                 log::warn!("Attempted to visit non-code address {:#010X}", state.address);
                 continue;
@@ -105,6 +109,16 @@ impl Executor {
 
             let mut block_start = state.address;
             loop {
+                if !section.contains(state.address.address) {
+                    log::warn!(
+                        "Stopping block walk on out-of-bounds address {:#010X} in section {} ({:#010X}-{:#010X})",
+                        state.address.address,
+                        section.name,
+                        section.address,
+                        section.address + section.size
+                    );
+                    break;
+                }
                 self.visited.insert(section_address, state.address);
 
                 let ins = match disassemble(section, state.address.address) {
@@ -125,6 +139,14 @@ impl Executor {
                         state.address += 4;
                     }
                     ExecCbResult::Jump(addr) => {
+                        if addr.section != state.address.section || !section.contains(addr.address) {
+                            log::warn!(
+                                "Ignoring out-of-bounds/direct cross-section jump target {:#010X} from {:#010X}",
+                                addr,
+                                state.address
+                            );
+                            break;
+                        }
                         if self.visited.contains(section_address, addr) {
                             break;
                         }
@@ -148,6 +170,63 @@ impl Executor {
     }
 
     pub fn visited(&self, section_address: u32, address: SectionAddress) -> bool {
+        if address.address < section_address {
+            return false;
+        }
         self.visited.contains(section_address, address)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::{ExecCbResult, Executor};
+    use crate::{
+        analysis::{cfa::SectionAddress, vm::StepResult},
+        obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind},
+    };
+
+    fn make_code_section(base_addr: u32, instructions: &[u32]) -> ObjSection {
+        let data: Vec<u8> = instructions.iter().flat_map(|w| w.to_be_bytes()).collect();
+        ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base_addr as u64,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            ..Default::default()
+        }
+    }
+
+    fn make_obj(base_addr: u32, instructions: &[u32]) -> ObjInfo {
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "executor-test".into(),
+            vec![],
+            vec![make_code_section(base_addr, instructions)],
+        )
+    }
+
+    #[test]
+    fn run_ignores_out_of_bounds_direct_jump_target() -> Result<()> {
+        const NOP: u32 = 0x60000000;
+        let obj = make_obj(0x1000, &[NOP]);
+        let mut executor = Executor::new(&obj);
+        executor.push(SectionAddress::new(0, 0x1000), crate::analysis::vm::VM::new_from_obj(&obj), false);
+
+        let result = executor.run(&obj, |data| {
+            match data.result {
+                StepResult::Continue => {
+                    Ok(ExecCbResult::<()>::Jump(SectionAddress::new(0, 0x0FFC)))
+                }
+                _ => Ok(ExecCbResult::EndBlock),
+            }
+        })?;
+
+        assert!(result.is_none());
+        Ok(())
     }
 }
