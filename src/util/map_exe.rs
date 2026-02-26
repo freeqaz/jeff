@@ -211,11 +211,13 @@ pub fn apply_map_exe(result: ExeMapInfo, obj: &mut ObjInfo) -> Result<()> {
             {
                 match obj.sections.at_address(sym.addr) {
                     Ok((sec_idx, sec)) => {
-                        let sym_name = if result.merged_addrs.contains(&sym.addr) {
-                            format!("merged_{:08X}", sym.addr)
-                        } else {
-                            sym.symbol.clone()
-                        };
+                        // For ICF-merged addresses (multiple symbols at same address),
+                        // keep each symbol's original name rather than renaming to
+                        // merged_<address>.  This lets split objects reference functions
+                        // by their real mangled names, which decomp objects also export.
+                        // Without this, dropping split objects for Matching units breaks
+                        // the link because merged_<address> symbols are undefined.
+                        let sym_name = sym.symbol.clone();
                         // if func came from pdata, DO NOT override the size
                         let the_sec_addr = SectionAddress::new(sec_idx, sym.addr);
                         let sym_to_add = if obj.pdata_funcs.contains(&the_sec_addr) {
