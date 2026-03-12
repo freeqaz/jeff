@@ -406,6 +406,17 @@ fn discover_seeds(
 
     // Apply known functions from pdata/import data
     for (&addr, &size) in &obj.known_functions {
+        let Some(section) = obj.sections.get(addr.section) else { continue };
+        if section.kind != ObjSectionKind::Code || !section.contains(addr.address) {
+            log::warn!(
+                "Ignoring out-of-bounds known-function seed {:#010X} in section {} ({:#010X}-{:#010X})",
+                addr,
+                section.name,
+                section.address,
+                section.address + section.size
+            );
+            continue;
+        }
         functions.insert(
             addr,
             FunctionInfo { analyzed: false, end: size.map(|size| addr + size), slices: None },
@@ -416,6 +427,18 @@ fn discover_seeds(
     for (_, symbol) in obj.symbols.by_kind(ObjSymbolKind::Function) {
         let Some(section_index) = symbol.section else { continue };
         let addr_ref = SectionAddress::new(section_index, symbol.address as u32);
+        let Some(section) = obj.sections.get(section_index) else { continue };
+        if section.kind != ObjSectionKind::Code || !section.contains(addr_ref.address) {
+            log::warn!(
+                "Ignoring out-of-bounds function symbol seed {} @ {:#010X} in section {} ({:#010X}-{:#010X})",
+                symbol.name,
+                addr_ref,
+                section.name,
+                section.address,
+                section.address + section.size
+            );
+            continue;
+        }
         functions.insert(
             addr_ref,
             FunctionInfo {
@@ -616,12 +639,26 @@ fn try_add_function(
     functions: &mut BTreeMap<SectionAddress, FunctionInfo>,
     address: SectionAddress,
 ) {
-    // Only create functions for code sections
-    // Some games use branches to data sections to prevent dead stripping (Mario Party)
-    if !matches!(obj.sections.get(address.section), Some(section) if section.kind == ObjSectionKind::Code)
-        // Avoid creating functions in skipped ranges
-        || in_skipped_range(&config.skip_ranges, address)
-    {
+    // Only create functions for in-bounds code addresses.
+    // Some games use branches to data sections to prevent dead stripping (Mario Party),
+    // and malformed analysis seeds may also produce out-of-bounds targets with a stale
+    // section index. Both should be ignored.
+    let Some(section) = obj.sections.get(address.section) else { return };
+    if section.kind != ObjSectionKind::Code {
+        return;
+    }
+    if !section.contains(address.address) {
+        log::warn!(
+            "Ignoring out-of-bounds discovered function {:#010X} in section {} ({:#010X}-{:#010X})",
+            address,
+            section.name,
+            section.address,
+            section.address + section.size
+        );
+        return;
+    }
+    // Avoid creating functions in skipped ranges
+    if in_skipped_range(&config.skip_ranges, address) {
         return;
     }
     functions.entry(address).or_default();
