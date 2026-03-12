@@ -1183,6 +1183,19 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
     // for each obj:
     let mut cur_coff =
         object::write::Object::new(BinaryFormat::Coff, Architecture::PowerPc, Endianness::Big);
+    // Add a dummy symbol for PAIR relocations. MSVC writes SymbolTableIndex=0 in
+    // IMAGE_REL_PPC_PAIR entries (the field encodes a displacement, not a symbol ref).
+    // The `object::write` crate requires a SymbolId, so we add this early placeholder.
+    let pair_dummy_sym = cur_coff.add_symbol(object::write::Symbol {
+        name: b"@comp.id".to_vec(),
+        value: 0,
+        size: 0,
+        kind: SymbolKind::Data,
+        scope: SymbolScope::Compilation,
+        weak: false,
+        section: object::write::SymbolSection::Absolute,
+        flags: SymbolFlags::None,
+    });
     let mut sect_map: BTreeMap<SectionIndex, SectionId> = Default::default();
     let mut sym_map: BTreeMap<SymbolIndex, SymbolId> = Default::default();
 
@@ -1334,13 +1347,7 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
         }
         let section_idx = sym.section.unwrap();
         let Some(sect) = obj.sections.get(section_idx) else { continue };
-        // Only extract code sections to COMDAT. Data/rdata symbols stay in
-        // their parent sections to preserve relocations (e.g., vtable entries
-        // that reference COMDAT functions). Without this, vtable relocations
-        // get claimed by the COMDAT branch but dropped when the .rdata$dup
-        // extraction doesn't properly preserve them, resulting in null vtable
-        // entries at link time.
-        if sect.kind != ObjSectionKind::Code {
+        if sect.kind == ObjSectionKind::Bss {
             continue;
         }
         let offset = sym.address - sect.address;
@@ -1796,7 +1803,7 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                                         comdat_sect_id,
                                         object::write::Relocation {
                                             offset: comdat_offset,
-                                            symbol: sym_id.clone(),
+                                            symbol: pair_dummy_sym,
                                             addend: 0,
                                             flags: RelocationFlags::Coff {
                                                 typ: object::pe::IMAGE_REL_PPC_PAIR,
@@ -1832,14 +1839,17 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                         flags: RelocationFlags::Coff { typ: reloc.to_coff() },
                     },
                 )?;
-                // MSVC requires an extra relocation to pair up high and low ones
+                // MSVC requires an extra PAIR relocation to accompany REFHI/REFLO.
+                // The PAIR's SymbolTableIndex field encodes a 16-bit displacement (not
+                // an actual symbol reference). MSVC writes 0 here; we use pair_dummy_sym
+                // (symbol index 0) to match.
                 match reloc.kind {
                     ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
                         cur_coff.add_relocation(
                             sect_map.get(&sect_idx).unwrap().clone(),
                             object::write::Relocation {
                                 offset: addr as u64,
-                                symbol: sym_id.clone(),
+                                symbol: pair_dummy_sym,
                                 addend: 0,
                                 flags: RelocationFlags::Coff { typ: object::pe::IMAGE_REL_PPC_PAIR },
                             },
