@@ -496,8 +496,40 @@ where
         if current_address == end {
             break;
         }
+        // Skip past any symbol entries whose declared address has already
+        // been crossed. Real-world XEX inputs contain pdata/symbols.txt
+        // entries whose `size` doesn't cover all the relocations that
+        // actually live in the symbol's footprint (e.g. RB3 retail's
+        // `lbl_8200E420 size 0x1B` actually spans 7 relocations = 0x1C
+        // bytes, pushing the writer past the next symbol's Start). Bailing
+        // here truncates the asm file mid-write; instead, snap forward and
+        // log a warning so the rest of the section still gets emitted.
+        while let Some((&sym_addr, vec)) = entry {
+            if current_address > sym_addr {
+                let dbg_symbols: Vec<&str> =
+                    vec.iter().map(|e| symbols[e.index as usize].name.as_str()).collect();
+                log::warn!(
+                    "Unaligned symbol entry @ {:#010X}: emitting at {:#010X} ({:?})",
+                    section.virtual_address.unwrap_or(0) as u32 + sym_addr,
+                    section.virtual_address.unwrap_or(0) as u32 + current_address,
+                    dbg_symbols,
+                );
+                for entry in vec {
+                    if entry.kind == SymbolEntryKind::End && begin {
+                        continue;
+                    }
+                    write_symbol_entry(w, symbols, entry, section)?;
+                }
+                current_symbol_kind =
+                    find_symbol_kind(current_symbol_kind, symbols, vec, section.kind)?;
+                current_data_kind = find_data_kind(current_data_kind, symbols, vec)
+                    .with_context(|| format!("At address {sym_addr:#010X}"))?;
+                entry = entry_iter.next();
+            } else {
+                break;
+            }
+        }
         if let Some((&sym_addr, vec)) = entry {
-            #[allow(clippy::comparison_chain)]
             if current_address == sym_addr {
                 for entry in vec {
                     if entry.kind == SymbolEntryKind::End && begin {
@@ -505,17 +537,11 @@ where
                     }
                     write_symbol_entry(w, symbols, entry, section)?;
                 }
-                current_symbol_kind = find_symbol_kind(current_symbol_kind, symbols, vec)?;
+                current_symbol_kind =
+                    find_symbol_kind(current_symbol_kind, symbols, vec, section.kind)?;
                 current_data_kind = find_data_kind(current_data_kind, symbols, vec)
                     .with_context(|| format!("At address {sym_addr:#010X}"))?;
                 entry = entry_iter.next();
-            } else if current_address > sym_addr {
-                let dbg_symbols = vec.iter().map(|e| &symbols[e.index as usize]).collect_vec();
-                bail!(
-                    "Unaligned symbol entry @ {:#010X}:\n\t{:?}",
-                    section.virtual_address.unwrap_or(0) as u32 + sym_addr,
-                    dbg_symbols
-                );
             }
         }
         begin = false;
@@ -530,6 +556,19 @@ where
         } else {
             current_symbol_kind
         };
+        // If a previous reloc was overshot by a snap-forward, skip it.
+        while let Some((&reloc_addr, _)) = reloc {
+            if reloc_addr < current_address {
+                log::warn!(
+                    "Skipping relocation at {:#010X} that lies before current write position {:#010X}",
+                    section.virtual_address.unwrap_or(0) as u32 + reloc_addr,
+                    section.virtual_address.unwrap_or(0) as u32 + current_address,
+                );
+                reloc = reloc_iter.next();
+            } else {
+                break;
+            }
+        }
         if let Some((&reloc_addr, r)) = reloc {
             if current_address == reloc_addr {
                 reloc = reloc_iter.next();
@@ -585,6 +624,7 @@ fn find_symbol_kind(
     current: ObjSymbolKind,
     symbols: &[ObjSymbol],
     entries: &Vec<SymbolEntry>,
+    section_kind: ObjSectionKind,
 ) -> Result<ObjSymbolKind> {
     let mut kind = current;
     let mut found = false;
@@ -607,22 +647,59 @@ fn find_symbol_kind(
         }
     }
 
+    // The "preferred" kind for this section when symbol metadata disagrees:
+    // Code sections prefer Function, Data/ReadOnlyData/Bss sections prefer Object.
+    // RB3 retail XEX contains real cases where multiple symbols claim the same
+    // address with conflicting kinds (e.g. `fn_822734D8` Function and
+    // `except_data_822734E0` Object both at 0x822734D8 in .text). Bailing here
+    // truncates the asm output mid-write; instead, log a warning, pick the
+    // section-appropriate kind, and keep going. Both .obj and .fn directives
+    // still get emitted by write_symbol_entry — only the kind that drives the
+    // subsequent data/code chunk is forced to match the section.
+    let preferred = match section_kind {
+        ObjSectionKind::Code => ObjSymbolKind::Function,
+        ObjSectionKind::Data | ObjSectionKind::ReadOnlyData | ObjSectionKind::Bss => {
+            ObjSymbolKind::Object
+        }
+    };
+
     // Then process Start entries to set new kind
+    let mut conflict_names: Vec<&str> = Vec::new();
     for entry in entries {
         match entry.kind {
             SymbolEntryKind::Start => {
-                let new_kind = symbols[entry.index as usize].kind;
+                let sym = &symbols[entry.index as usize];
+                let new_kind = sym.kind;
                 if !matches!(new_kind, ObjSymbolKind::Unknown | ObjSymbolKind::Section) {
-                    ensure!(
-                        !found || new_kind == kind,
-                        "Conflicting symbol kinds found: {kind:?} and {new_kind:?}"
-                    );
+                    if found && new_kind != kind {
+                        conflict_names.push(&sym.name);
+                        // Prefer the section-appropriate kind on conflict.
+                        if new_kind == preferred {
+                            kind = new_kind;
+                        }
+                        // else: keep the existing `kind` (also section-appropriate
+                        // or the first-seen).
+                        continue;
+                    }
                     kind = new_kind;
                     found = true;
                 }
             }
             _ => continue,
         }
+    }
+    if !conflict_names.is_empty() {
+        let address = entries
+            .first()
+            .map(|e| symbols[e.index as usize].address)
+            .unwrap_or(0);
+        log::warn!(
+            "Conflicting symbol kinds at {:#010X}; picked {:?} for section kind {:?}: {:?}",
+            address,
+            kind,
+            section_kind,
+            conflict_names,
+        );
     }
     Ok(kind)
 }
@@ -755,48 +832,102 @@ where W: Write + ?Sized {
 fn write_data_chunk<W>(w: &mut W, data: &[u8], data_kind: ObjDataKind) -> Result<()>
 where W: Write + ?Sized {
     let remain = data;
+    // If the declared data_kind doesn't match the data we actually have
+    // (e.g. a string symbol whose footprint was truncated by a misaligned
+    // following symbol, or whose declared size omits a trailing null),
+    // fall back to a raw byte dump instead of bailing. The string writers
+    // require terminator/length invariants the snapped-forward chunk may
+    // no longer satisfy.
     match data_kind {
         ObjDataKind::String => {
-            return write_string(w, data);
+            if matches!(data.last(), Some(&0)) {
+                return write_string(w, data);
+            } else {
+                log::warn!(
+                    "Non-terminated string of length {:#X}; emitting as raw bytes",
+                    data.len()
+                );
+                return write_data_chunk(w, data, ObjDataKind::Byte);
+            }
         }
         ObjDataKind::ShiftJIS => {
-            if data.is_empty() || data.last() != Some(&0x00) {
-                anyhow::bail!("Non-terminated Shift-JIS string");
+            if !data.is_empty() && data.last() == Some(&0x00) {
+                return write_string_shiftjis(w, data);
+            } else {
+                log::warn!(
+                    "Non-terminated Shift-JIS string of length {:#X}; emitting as raw bytes",
+                    data.len()
+                );
+                return write_data_chunk(w, data, ObjDataKind::Byte);
             }
-            return write_string_shiftjis(w, data);
         }
         ObjDataKind::String16 => {
-            if data.len() % 2 != 0 {
-                bail!("Attempted to write wstring with length {:#X}", data.len());
+            if data.len() % 2 == 0
+                && data.len() >= 2
+                && data[data.len() - 2] == 0
+                && data[data.len() - 1] == 0
+            {
+                let data16 = data
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes(c.try_into().unwrap()))
+                    .collect::<Vec<u16>>();
+                return write_string16(w, &data16);
+            } else {
+                log::warn!(
+                    "Non-terminated UTF-16 string of length {:#X}; emitting as raw bytes",
+                    data.len()
+                );
+                return write_data_chunk(w, data, ObjDataKind::Byte);
             }
-            let data = data
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes(c.try_into().unwrap()))
-                .collect::<Vec<u16>>();
-            return write_string16(w, &data);
         }
         ObjDataKind::StringTable => {
             for slice in data.split_inclusive(|&b| b == 0) {
-                write_string(w, slice)?;
+                if matches!(slice.last(), Some(&0)) {
+                    write_string(w, slice)?;
+                } else {
+                    log::warn!(
+                        "Non-terminated string in StringTable; emitting trailing fragment as bytes"
+                    );
+                    write_data_chunk(w, slice, ObjDataKind::Byte)?;
+                }
             }
             return Ok(());
         }
         ObjDataKind::String16Table => {
             if data.len() % 2 != 0 {
-                bail!("Attempted to write wstring_table with length {:#X}", data.len());
+                log::warn!(
+                    "Odd-length UTF-16 string table of length {:#X}; emitting as raw bytes",
+                    data.len()
+                );
+                return write_data_chunk(w, data, ObjDataKind::Byte);
             }
-            let data = data
+            let data16 = data
                 .chunks_exact(2)
                 .map(|c| u16::from_be_bytes(c.try_into().unwrap()))
                 .collect::<Vec<u16>>();
-            for slice in data.split_inclusive(|&b| b == 0) {
-                write_string16(w, slice)?;
+            for slice in data16.split_inclusive(|&b| b == 0) {
+                if matches!(slice.last(), Some(&0)) {
+                    write_string16(w, slice)?;
+                } else {
+                    log::warn!(
+                        "Non-terminated UTF-16 in String16Table; emitting trailing fragment as bytes"
+                    );
+                    let raw: Vec<u8> = slice.iter().flat_map(|c| c.to_be_bytes()).collect();
+                    write_data_chunk(w, &raw, ObjDataKind::Byte)?;
+                }
             }
             return Ok(());
         }
         ObjDataKind::ShiftJISTable => {
             for slice in data.split_inclusive(|&b| b == 0) {
-                write_string_shiftjis(w, slice)?;
+                if matches!(slice.last(), Some(&0)) {
+                    write_string_shiftjis(w, slice)?;
+                } else {
+                    log::warn!(
+                        "Non-terminated Shift-JIS in ShiftJISTable; emitting trailing fragment as bytes"
+                    );
+                    write_data_chunk(w, slice, ObjDataKind::Byte)?;
+                }
             }
             return Ok(());
         }
@@ -899,11 +1030,27 @@ where
             writeln!(w)?;
             Ok(reloc_address + 4)
         }
-        _ => Err(anyhow!(
-            "Unsupported data relocation type {:?} @ {:#010X}",
-            reloc.kind,
-            reloc_address
-        )),
+        // Code-style relocs (branches, hi/ha/lo halves of an address load)
+        // appearing while we're in Object context usually mean the
+        // surrounding symbol is mis-typed (Object marker covers what is
+        // really code, e.g. RB3 retail's `except_data_82270580` Object
+        // inside a Function range, or fn_822734D8 colliding with
+        // except_data_822734E0). Emit the raw word so the asm stays
+        // well-formed instead of bailing mid-file.
+        ObjRelocKind::PpcRel24
+        | ObjRelocKind::PpcRel14
+        | ObjRelocKind::PpcAddr16Hi
+        | ObjRelocKind::PpcAddr16Ha
+        | ObjRelocKind::PpcAddr16Lo
+        | ObjRelocKind::PpcEmbSda21 => {
+            log::warn!(
+                "Skipping code relocation {:?} @ {:#010X} in data context (writing raw word)",
+                reloc.kind,
+                reloc_address
+            );
+            writeln!(w, "\t.4byte 0 # skipped {:?} reloc", reloc.kind)?;
+            Ok(reloc_address + 4)
+        }
     }
 }
 
@@ -1077,7 +1224,9 @@ mod tests {
         let symbols = vec![make_test_symbol(ObjSymbolKind::Object)];
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
 
-        let result = find_symbol_kind(ObjSymbolKind::Unknown, &symbols, &entries).unwrap();
+        let result =
+            find_symbol_kind(ObjSymbolKind::Unknown, &symbols, &entries, ObjSectionKind::Data)
+                .unwrap();
         assert_eq!(result, ObjSymbolKind::Object);
     }
 
@@ -1087,7 +1236,9 @@ mod tests {
         let symbols = vec![make_test_symbol(ObjSymbolKind::Function)];
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Label }];
 
-        let result = find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries).unwrap();
+        let result =
+            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Data)
+                .unwrap();
         // Label entries should not change the kind
         assert_eq!(result, ObjSymbolKind::Object);
     }
@@ -1114,7 +1265,9 @@ mod tests {
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::End }];
 
         // FIXED behavior: End entry resets kind to Unknown
-        let result = find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries).unwrap();
+        let result =
+            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Code)
+                .unwrap();
 
         // Kind should reset to Unknown so write_data() can default to Function for Code sections
         assert_eq!(
@@ -1141,7 +1294,9 @@ mod tests {
             SymbolEntry { index: 1, kind: SymbolEntryKind::Start },
         ];
 
-        let result = find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries).unwrap();
+        let result =
+            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Code)
+                .unwrap();
         // B's Start entry should set the kind to Function
         assert_eq!(result, ObjSymbolKind::Function);
     }
@@ -1152,7 +1307,9 @@ mod tests {
         let symbols = vec![make_test_symbol(ObjSymbolKind::Unknown)];
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
 
-        let result = find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries).unwrap();
+        let result =
+            find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries, ObjSectionKind::Code)
+                .unwrap();
         // Unknown symbols shouldn't change the kind
         assert_eq!(result, ObjSymbolKind::Function);
     }
@@ -1163,14 +1320,20 @@ mod tests {
         let symbols = vec![make_test_symbol(ObjSymbolKind::Section)];
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
 
-        let result = find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries).unwrap();
+        let result =
+            find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries, ObjSectionKind::Code)
+                .unwrap();
         // Section symbols shouldn't change the kind
         assert_eq!(result, ObjSymbolKind::Function);
     }
 
-    /// Test error when conflicting symbol kinds are found at the same address.
+    /// Conflicting symbol kinds at the same address: pick the section-appropriate kind
+    /// instead of bailing. This regression covers the RB3 retail XEX pattern where
+    /// `fn_822734D8` (Function) and `except_data_822734E0` (Object) both claim 0x822734D8
+    /// in .text. Previously the writer truncated the asm file mid-write with
+    /// "Conflicting symbol kinds found: Object and Function".
     #[test]
-    fn test_find_symbol_kind_conflicting_kinds_error() {
+    fn test_find_symbol_kind_conflict_prefers_section_default() {
         let symbols = vec![
             make_test_symbol(ObjSymbolKind::Object),
             make_test_symbol(ObjSymbolKind::Function),
@@ -1182,8 +1345,35 @@ mod tests {
             SymbolEntry { index: 1, kind: SymbolEntryKind::Start },
         ];
 
-        let result = find_symbol_kind(ObjSymbolKind::Unknown, &symbols, &entries);
-        assert!(result.is_err(), "Should error on conflicting kinds");
+        // Code section -> prefer Function on conflict
+        let code = find_symbol_kind(
+            ObjSymbolKind::Unknown,
+            &symbols,
+            &entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
+        assert_eq!(code, ObjSymbolKind::Function);
+
+        // Data section -> prefer Object on conflict
+        let data = find_symbol_kind(
+            ObjSymbolKind::Unknown,
+            &symbols,
+            &entries,
+            ObjSectionKind::Data,
+        )
+        .unwrap();
+        assert_eq!(data, ObjSymbolKind::Object);
+
+        // ReadOnlyData section -> also prefer Object on conflict
+        let rdata = find_symbol_kind(
+            ObjSymbolKind::Unknown,
+            &symbols,
+            &entries,
+            ObjSectionKind::ReadOnlyData,
+        )
+        .unwrap();
+        assert_eq!(rdata, ObjSymbolKind::Object);
     }
 
     /// Test that Function End entries also reset kind (not just Object).
@@ -1192,7 +1382,13 @@ mod tests {
         let symbols = vec![make_test_symbol(ObjSymbolKind::Function)];
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::End }];
 
-        let result = find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries).unwrap();
+        let result = find_symbol_kind(
+            ObjSymbolKind::Function,
+            &symbols,
+            &entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
         assert_eq!(result, ObjSymbolKind::Unknown);
     }
 
@@ -1205,7 +1401,13 @@ mod tests {
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::End }];
 
         // Current kind is Function, ending Object shouldn't reset it
-        let result = find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries).unwrap();
+        let result = find_symbol_kind(
+            ObjSymbolKind::Function,
+            &symbols,
+            &entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
         assert_eq!(result, ObjSymbolKind::Function);
     }
 
@@ -1217,18 +1419,178 @@ mod tests {
 
         // Step 1: At jump table start
         let start_entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
-        let kind = find_symbol_kind(ObjSymbolKind::Unknown, &symbols, &start_entries).unwrap();
+        let kind = find_symbol_kind(
+            ObjSymbolKind::Unknown,
+            &symbols,
+            &start_entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
         assert_eq!(kind, ObjSymbolKind::Object, "Jump table start should set Object");
 
         // Step 2: At jump table end
         let end_entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::End }];
-        let kind = find_symbol_kind(ObjSymbolKind::Object, &symbols, &end_entries).unwrap();
+        let kind = find_symbol_kind(
+            ObjSymbolKind::Object,
+            &symbols,
+            &end_entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
         assert_eq!(kind, ObjSymbolKind::Unknown, "Jump table end should reset to Unknown");
 
         // Step 3: After jump table (no entries)
         let empty_entries: Vec<SymbolEntry> = vec![];
-        let kind = find_symbol_kind(ObjSymbolKind::Unknown, &symbols, &empty_entries).unwrap();
+        let kind = find_symbol_kind(
+            ObjSymbolKind::Unknown,
+            &symbols,
+            &empty_entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
         assert_eq!(kind, ObjSymbolKind::Unknown, "No entries should preserve Unknown");
         // In write_data(), Unknown would then default to Function for Code sections
+    }
+
+    use crate::obj::{
+        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjRelocations, ObjSection,
+        ObjSymbolFlagSet, ObjSymbolFlags,
+    };
+
+    fn make_obj_for_data_test(
+        section_addr: u32,
+        section_data: Vec<u8>,
+        symbols: Vec<ObjSymbol>,
+        relocs: Vec<(u32, ObjReloc)>,
+    ) -> ObjInfo {
+        let section = ObjSection {
+            name: ".rdata".into(),
+            kind: ObjSectionKind::ReadOnlyData,
+            address: section_addr as u64,
+            size: section_data.len() as u64,
+            data: section_data,
+            align: 4,
+            relocations: ObjRelocations::new(relocs).unwrap(),
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test.exe".into(),
+            symbols,
+            vec![section],
+        )
+    }
+
+    fn make_obj_symbol(name: &str, address: u32, size: u32, kind: ObjSymbolKind) -> ObjSymbol {
+        ObjSymbol {
+            name: name.into(),
+            address: address as u64,
+            section: Some(0),
+            size: size as u64,
+            size_known: size > 0,
+            flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+            kind,
+            ..Default::default()
+        }
+    }
+
+    /// Regression: a symbol whose declared size is smaller than the
+    /// relocation footprint it actually contains used to bail the entire
+    /// asm write with "Unaligned symbol entry @ ...:". The writer must now
+    /// snap forward, log a warning, and keep emitting the rest of the
+    /// section.
+    ///
+    /// Reproduces the RB3 retail .rdata pattern:
+    ///   lbl_8200E420 size 0x1B contains 7 Absolute relocations (28 bytes),
+    ///   pushing the writer 1 byte past the End at 0x8200E43B.
+    #[test]
+    fn test_write_asm_snaps_forward_on_undersize_data_symbol() {
+        let base = 0x82000000u32;
+        // 0x40 bytes of section data, content irrelevant since all of it is
+        // covered by absolute relocations.
+        let data = vec![0u8; 0x40];
+
+        // Symbols:
+        //   0: short undersize - declares 0x18 bytes but contains 7 Abs relocs (28 bytes)
+        //   1: next symbol whose Start will be overshot
+        //   2: target symbol for the relocs
+        let symbols = vec![
+            make_obj_symbol("undersize", base, 0x18, ObjSymbolKind::Object),
+            make_obj_symbol("next_sym", base + 0x1B, 0x4, ObjSymbolKind::Object),
+            make_obj_symbol("target", base + 0x100, 0x4, ObjSymbolKind::Function),
+        ];
+
+        // 7 absolute relocs spanning [base..base+0x1C). 1 byte past undersize's
+        // declared End (base+0x18). Reloc 7 ends at base+0x1C; next_sym starts
+        // at base+0x1B — current_address will be base+0x1C > base+0x1B.
+        let mut relocs = Vec::new();
+        for i in 0..7u32 {
+            relocs.push((
+                base + i * 4,
+                ObjReloc { kind: ObjRelocKind::Absolute, target_symbol: 2, addend: 0, module: None },
+            ));
+        }
+
+        let obj = make_obj_for_data_test(base, data, symbols, relocs);
+        let mut out = Vec::new();
+        write_asm(&mut out, &obj).expect("write_asm should snap forward, not bail");
+
+        let s = String::from_utf8(out).unwrap();
+        // The asm must have completed and emitted the next symbol's directives.
+        assert!(s.contains(".obj next_sym"), "next_sym .obj should be emitted: {s}");
+        assert!(s.contains(".endobj next_sym"), "next_sym .endobj should be emitted");
+    }
+
+    /// Regression: an Object symbol covering what is really code (e.g.
+    /// `except_data_<addr>` Object inside a Function range) with a PpcRel24
+    /// branch reloc used to bail with "Unsupported data relocation type
+    /// PpcRel24 @ ..." mid-write. The writer must now emit a raw .4byte
+    /// placeholder and keep going.
+    #[test]
+    fn test_write_asm_skips_code_reloc_in_data_context() {
+        let base = 0x82000000u32;
+        // Section of 16 bytes. Single Object symbol covering all of it.
+        let data = vec![0x48, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let symbols = vec![
+            make_obj_symbol("except_blob", base, 0x10, ObjSymbolKind::Object),
+            make_obj_symbol("branch_target", base + 0x100, 0x4, ObjSymbolKind::Function),
+        ];
+        let relocs = vec![(
+            base,
+            ObjReloc {
+                kind: ObjRelocKind::PpcRel24,
+                target_symbol: 1,
+                addend: 0,
+                module: None,
+            },
+        )];
+
+        let mut section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base as u64,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            relocations: ObjRelocations::new(relocs).unwrap(),
+            ..Default::default()
+        };
+        // Promote to a Code-kind section so the writer treats it as code by default.
+        section.kind = ObjSectionKind::Code;
+        let obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test.exe".into(),
+            symbols,
+            vec![section],
+        );
+
+        let mut out = Vec::new();
+        write_asm(&mut out, &obj).expect("write_asm should skip code reloc in data context");
+
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(".obj except_blob"));
+        assert!(s.contains(".endobj except_blob"));
     }
 }

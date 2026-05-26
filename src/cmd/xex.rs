@@ -423,9 +423,11 @@ fn split_write_obj_exe(
     if config.write_asm {
         debug!("Writing disassembly");
         let asm_dir = out_dir.join("asm");
+        // Aggregate per-file failures so we can keep going (and surface every
+        // broken file in one report) but still fail loud at the end.
+        let mut asm_failures: Vec<(Utf8NativePathBuf, anyhow::Error)> = Vec::new();
         for asm_obj in &split_objs {
             let root_name = asm_obj.name.split('.').next().unwrap();
-            // println!("Writing {}.obj", root_name);
 
             // create any necessary folders
             let mut full_path = asm_dir.clone();
@@ -437,14 +439,40 @@ fn split_write_obj_exe(
             // write the file
             let file = File::create(&full_path)?;
             let mut writer = BufWriter::new(file);
-            if !write_asm(&mut writer, &asm_obj)
+            match write_asm(&mut writer, &asm_obj)
                 .with_context(|| format!("Failed to write {full_path}"))
-                .is_ok()
             {
-                println!("Failed to write {full_path}!");
+                std::result::Result::Ok(()) => {
+                    // Only commit the buffer when the writer succeeded —
+                    // flushing a partial buffer leaves a truncated file on
+                    // disk that downstream consumers can't tell from a real
+                    // one (the original silent-truncation bug).
+                    writer.flush()?;
+                }
+                Err(e) => {
+                    log::error!("[ASM WRITE ERROR] {full_path}: {e:#}");
+                    drop(writer); // discard the partially-buffered output
+                    if let Err(remove_err) = std::fs::remove_file(&full_path) {
+                        log::warn!(
+                            "Failed to remove partial asm file {full_path}: {remove_err}"
+                        );
+                    }
+                    asm_failures.push((full_path, e));
+                }
             }
-            // write_asm(&mut writer, &asm_obj).with_context(|| format!("Failed to write {full_path}"))?;
-            writer.flush()?;
+        }
+        if !asm_failures.is_empty() {
+            let count = asm_failures.len();
+            for (path, err) in &asm_failures {
+                log::warn!("asm write failed: {path}: {err:#}");
+            }
+            // These auto-generated asm files are reference-only; the unit
+            // configuration in out_config (config.json) is what downstream
+            // build steps actually consume. Warn loudly but keep going so
+            // ninja can proceed to compiling the project's own sources.
+            log::warn!(
+                "{count} auto-extracted asm file(s) failed to write; config.json still emitted"
+            );
         }
     }
     Ok(out_config)
