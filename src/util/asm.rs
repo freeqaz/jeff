@@ -663,6 +663,27 @@ fn find_symbol_kind(
         }
     };
 
+    // Did a Function End at this address group? (i.e. the open function we
+    // were carrying closes here). If so, a following Object Start really is a
+    // new data region (e.g. the 8-byte PDATA_EH struct that precedes the next
+    // function, or a jump table in the gap), so we must NOT keep Function.
+    let function_ended_here = entries.iter().any(|e| {
+        e.kind == SymbolEntryKind::End
+            && symbols[e.index as usize].kind == ObjSymbolKind::Function
+    });
+
+    // Are we still INSIDE an open function body coming into this group?
+    // `current == Function` means write_asm last set Function and no matching
+    // End reset it (the End loop above runs first). When that's the case in a
+    // Code section, a lone Object Start mid-body is spurious: it's almost
+    // always a stray `except_data_<addr>`/EH-fragment symbol that the XEX's
+    // LTCG-fragmented .pdata produced *inside* a real function. Flipping to
+    // Object here would carve live instructions (incl. their PpcRel24/Ha
+    // relocations) into a data blob, making byte-identical code unscorable in
+    // objdiff. Keep it as code.
+    let inside_open_function =
+        section_kind == ObjSectionKind::Code && kind == ObjSymbolKind::Function;
+
     // Then process Start entries to set new kind
     let mut conflict_names: Vec<&str> = Vec::new();
     for entry in entries {
@@ -671,6 +692,17 @@ fn find_symbol_kind(
                 let sym = &symbols[entry.index as usize];
                 let new_kind = sym.kind;
                 if !matches!(new_kind, ObjSymbolKind::Unknown | ObjSymbolKind::Section) {
+                    // A lone Object Start arriving while a function is still
+                    // open (and didn't end here) does not interrupt the code
+                    // stream — see `inside_open_function` above. Keep Function.
+                    if inside_open_function
+                        && !function_ended_here
+                        && new_kind == ObjSymbolKind::Object
+                    {
+                        conflict_names.push(&sym.name);
+                        found = true;
+                        continue;
+                    }
                     if found && new_kind != kind {
                         conflict_names.push(&sym.name);
                         // Prefer the section-appropriate kind on conflict.
@@ -1390,6 +1422,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, ObjSymbolKind::Unknown);
+    }
+
+    /// Regression: a lone Object Start arriving while a Function is still open
+    /// (no Function End at this address group) must NOT flip a Code section to
+    /// data. RB3 retail's LTCG-fragmented .pdata emits stray `except_data_<addr>`
+    /// Object symbols *inside* real function bodies (e.g. Rot::GetYAngle at
+    /// 0x824DBFC0 carries except_data_824DBFF8 / _824DC060 / _824DC0F8 mid-body);
+    /// treating those as data carved live `bl`/`@ha` instructions into `.4byte 0`
+    /// blobs, making byte-identical functions unscorable in objdiff.
+    #[test]
+    fn test_find_symbol_kind_object_start_inside_open_function_stays_code() {
+        // Object symbol whose Start lands while a function is mid-body.
+        let symbols = vec![make_test_symbol(ObjSymbolKind::Object)];
+        let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
+
+        // Carried-in kind is Function (function still open) -> keep Function.
+        let result = find_symbol_kind(
+            ObjSymbolKind::Function,
+            &symbols,
+            &entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
+        assert_eq!(result, ObjSymbolKind::Function);
+    }
+
+    /// Counterpart to the above: when a Function End and an Object Start share
+    /// the same address group (the legitimate "function ends, then an 8-byte
+    /// PDATA_EH struct / jump table begins" layout), the Object must win so the
+    /// data region is emitted as data.
+    #[test]
+    fn test_find_symbol_kind_function_end_then_object_start_is_data() {
+        // index 0 = the function that ends here; index 1 = the new Object.
+        let symbols = vec![
+            make_test_symbol(ObjSymbolKind::Function),
+            make_test_symbol(ObjSymbolKind::Object),
+        ];
+        let entries = vec![
+            SymbolEntry { index: 0, kind: SymbolEntryKind::End },
+            SymbolEntry { index: 1, kind: SymbolEntryKind::Start },
+        ];
+
+        let result = find_symbol_kind(
+            ObjSymbolKind::Function,
+            &symbols,
+            &entries,
+            ObjSectionKind::Code,
+        )
+        .unwrap();
+        assert_eq!(result, ObjSymbolKind::Object);
     }
 
     /// Test that End entry only resets when kinds match.

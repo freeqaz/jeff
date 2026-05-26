@@ -46,8 +46,8 @@ use crate::{
         proposed_splits::write_proposed_splits,
         split::{split_obj, update_splits},
         xex::{
-            coff_path_for_unit, extract_exe, list_exe_sections, process_xex, write_coff,
-            XexCompression, XexEncryption, XexInfo,
+            coff_path_for_unit, extract_exe, genuine_except_data_set, list_exe_sections,
+            process_xex, write_coff, XexCompression, XexEncryption, XexInfo,
         },
         xpdb::try_parse_pdb,
     },
@@ -288,6 +288,16 @@ fn split_write_obj_exe(
         write_splits_file(&splits_path.with_encoding(), &module.obj, false, module.splits_cache)?;
     }
 
+    // Determine which `except_data_<addr>` symbols are genuine PDATA_EH structs
+    // (vs. spurious symbols sitting on live code left by a prior split). Must be
+    // computed on the FULL module so the shared cross-unit C++ frame handler VA
+    // resolves; the per-unit split objs can't see it. See `genuine_except_data_set`.
+    let genuine_except_data = genuine_except_data_set(&module.obj);
+    log::info!(
+        "Classified {} genuine PDATA_EH structs (handler VA resolves to code)",
+        genuine_except_data.len()
+    );
+
     debug!("Splitting {} objects", module.obj.link_order.len());
     let module_name = module.config.name().to_string();
     let split_objs = split_obj(&module.obj, None, config.globalize_symbols)?;
@@ -318,7 +328,7 @@ fn split_write_obj_exe(
     };
     for (unit, split_obj) in module.obj.link_order.iter().zip(&split_objs) {
         // pub fn write_elf(obj: &ObjInfo, export_all: bool) -> Result<Vec<u8>>
-        let out_obj = write_coff(split_obj)?;
+        let out_obj = write_coff(split_obj, &genuine_except_data)?;
         let obj_path = coff_path_for_unit(&unit.name);
         let out_path = obj_dir.join(&obj_path);
         out_config.units.push(OutputUnit {

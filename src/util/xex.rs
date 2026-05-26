@@ -1255,7 +1255,45 @@ pub fn process_xex(path: &Utf8NativePathBuf) -> Result<ObjInfo> {
     Ok(obj)
 }
 
-pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
+/// Build the set of `except_data_<suffix>` symbols (keyed by hex suffix, the
+/// function VA) that are *genuine* PDATA_EH structs, as opposed to spurious
+/// over-broad symbols left by a prior split run sitting on top of live code.
+///
+/// Must be called against the FULL (un-split) module so that the handler VA in
+/// word1 can be resolved: the retail XEX shares a single `__CxxFrameHandler`
+/// that lives in a different unit than most EH structs, so a per-split-object
+/// `at_address` lookup would wrongly reject every cross-unit handler. A genuine
+/// struct's word1 is a code-section VA (the handler); a spurious one's word1 is
+/// an instruction encoding that does not resolve to a code section.
+pub fn genuine_except_data_set(obj: &ObjInfo) -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    for (_idx, sym) in obj.symbols.iter() {
+        let Some(suffix) = sym.name.strip_prefix("except_data_") else { continue };
+        let Some(section_idx) = sym.section else { continue };
+        let Some(sect) = obj.sections.get(section_idx) else { continue };
+        let offset = (sym.address - sect.address) as usize;
+        let handler_va = if offset + 4 <= sect.data.len() {
+            u32::from_be_bytes(sect.data[offset..offset + 4].try_into().unwrap())
+        } else {
+            0
+        };
+        let handler_is_code = handler_va != 0
+            && obj
+                .sections
+                .at_address(handler_va)
+                .map(|(_, s)| s.kind == ObjSectionKind::Code)
+                .unwrap_or(false);
+        if handler_is_code {
+            set.insert(suffix.to_string());
+        }
+    }
+    set
+}
+
+pub fn write_coff(
+    obj: &ObjInfo,
+    genuine_except_data: &std::collections::BTreeSet<String>,
+) -> Result<Vec<u8>> {
     // for each obj:
     let mut cur_coff =
         object::write::Object::new(BinaryFormat::Coff, Architecture::PowerPc, Endianness::Big);
@@ -1300,6 +1338,29 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
             if let Some(section_idx) = sym.section {
                 if let Some(sect) = obj.sections.get(section_idx) {
                     let offset = sym.address - sect.address;
+                    // Only treat this `except_data_<addr>` as a genuine PDATA_EH
+                    // struct if its function VA is in `genuine_except_data` (built
+                    // by the caller against the *full* module — word1 must resolve
+                    // to a code-section handler there). See `write_coff`'s doc and
+                    // `genuine_except_data_set`.
+                    //
+                    // RB3's LTCG-combined .pdata produced stray func_type==3
+                    // records pointing *into* the middle of real functions, so a
+                    // prior split run left over-broad `except_data_<addr>` symbols
+                    // sitting on top of live instructions (word1 is an instruction
+                    // encoding, not a handler VA). Treating those as EH structs
+                    // zeroes 8 bytes of code and bolts ADDR32 handler relocs onto
+                    // instructions, corrupting the COFF so objdiff renders the
+                    // bytes as <illegal> and can't score otherwise byte-identical
+                    // functions. Skip them here (the bytes stay code).
+                    if !genuine_except_data.contains(suffix) {
+                        log::debug!(
+                            "Skipping spurious except_data {} @ {:#010X} (treating bytes as code)",
+                            sym.name,
+                            sym.address as u32,
+                        );
+                        continue;
+                    }
                     // Read original data to check if pHandlerData is non-null
                     let hd_off = offset as usize + 4;
                     let has_handler_data = if hd_off + 4 <= sect.data.len() {
@@ -2096,7 +2157,7 @@ mod tests {
             ObjSymbolKind::Unknown,
             ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
         );
-        let coff_data = write_coff(&obj).unwrap();
+        let coff_data = write_coff(&obj, &Default::default()).unwrap();
         let symbols = parse_coff_symbol_classes(&coff_data);
         let (_, storage_class) = symbols
             .iter()
@@ -2115,7 +2176,7 @@ mod tests {
             ObjSymbolKind::Unknown,
             ObjSymbolFlagSet(ObjSymbolFlags::Local.into()),
         );
-        let coff_data = write_coff(&obj).unwrap();
+        let coff_data = write_coff(&obj, &Default::default()).unwrap();
         let symbols = parse_coff_symbol_classes(&coff_data);
         let (_, storage_class) = symbols
             .iter()
@@ -2162,7 +2223,7 @@ mod tests {
             vec![section],
         );
         obj.symbols.add_direct(unwind_sym).unwrap();
-        let coff_data = write_coff(&obj).unwrap();
+        let coff_data = write_coff(&obj, &Default::default()).unwrap();
 
         // Parse COFF and verify a single EXTERNAL __unwind$ symbol in COMDAT .text$x
         let symbols = parse_coff_symbol_classes(&coff_data);
@@ -2209,7 +2270,7 @@ mod tests {
             ObjSymbolKind::Function,
             ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
         );
-        let coff_data = write_coff(&obj).unwrap();
+        let coff_data = write_coff(&obj, &Default::default()).unwrap();
         let symbols = parse_coff_symbol_classes(&coff_data);
         let (_, storage_class) = symbols
             .iter()
@@ -2300,7 +2361,7 @@ mod tests {
         // Mark func_b as COMDAT
         obj.comdat_symbols.insert("func_b".into());
 
-        let coff_data = write_coff(&obj).unwrap();
+        let coff_data = write_coff(&obj, &Default::default()).unwrap();
 
         // Parse sections
         let sections = parse_coff_sections(&coff_data);
@@ -2467,6 +2528,69 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("zero output bytes"));
+    }
+
+    /// `genuine_except_data_set` must keep an `except_data_` whose word1 is a
+    /// real code-section handler VA, and reject one whose word1 is an
+    /// instruction encoding (the RB3 LTCG-fragmented-.pdata false positive that
+    /// corrupted byte-identical functions in the COFF).
+    #[test]
+    fn test_genuine_except_data_set_filters_spurious() {
+        // .text at base 0x82000000, 0x20 bytes.
+        //   - except_data_82000018 @ 0x82000008: word1 = 0x82000000 (a code VA
+        //     within this section → genuine EH struct).
+        //   - except_data_82000028 @ 0x82000010: word1 = 0x7D8802A6 (`mflr r12`,
+        //     not a code VA → spurious, on top of live code).
+        let base = 0x82000000u32;
+        let mut data = vec![0u8; 0x20];
+        data[0x08..0x0C].copy_from_slice(&0x82000000u32.to_be_bytes()); // genuine handler VA
+        data[0x0C..0x10].copy_from_slice(&0x8200001Cu32.to_be_bytes()); // record VA (unused here)
+        data[0x10..0x14].copy_from_slice(&0x7D8802A6u32.to_be_bytes()); // mflr r12 (spurious)
+        data[0x14..0x18].copy_from_slice(&0x9181FFF8u32.to_be_bytes()); // stw r12 (spurious)
+
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base as u64,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            elf_index: 0,
+            relocations: ObjRelocations::default(),
+            virtual_address: Some(base as u64),
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test.exe".into(),
+            vec![],
+            vec![section],
+        );
+        for (name, addr) in [("except_data_82000018", base + 8), ("except_data_82000028", base + 0x10)]
+        {
+            obj.symbols
+                .add_direct(ObjSymbol {
+                    name: name.into(),
+                    address: addr as u64,
+                    section: Some(0),
+                    size: 8,
+                    size_known: true,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    kind: ObjSymbolKind::Object,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let set = genuine_except_data_set(&obj);
+        assert!(set.contains("82000018"), "genuine EH struct (code handler VA) must be kept");
+        assert!(
+            !set.contains("82000028"),
+            "spurious except_data on live code (instruction word1) must be rejected"
+        );
     }
 }
 
