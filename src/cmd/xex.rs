@@ -24,7 +24,7 @@ use crate::{
     analysis::{
         cfa::{CfaConfig, SectionAddress, run_cfa, apply_cfa},
         objects::{detect_objects, detect_strings},
-        pass::{AnalysisPass, FindSaveRestSledsXbox},
+        pass::{AnalysisPass, FindSaveRestSledsXbox, FindXboxVtables, VtableCandidate},
         tracker::Tracker,
     },
     cmd::dol::{
@@ -43,6 +43,7 @@ use crate::{
         file::{buf_writer, FileReadInfo},
         map_exe::{apply_map_file_exe, is_reg_intrinsic, process_map_exe},
         path::native_path,
+        proposed_splits::write_proposed_splits,
         split::{split_obj, update_splits},
         xex::{
             coff_path_for_unit, extract_exe, list_exe_sections, process_xex, write_coff,
@@ -148,6 +149,9 @@ struct ExeAnalyzeResult {
     pub dep: Vec<Utf8NativePathBuf>,
     pub symbols_cache: Option<FileReadInfo>,
     pub splits_cache: Option<FileReadInfo>,
+    /// Vtable candidates surfaced by FindXboxVtables (rb3-xenon enhancement).
+    /// Drained by `split` to write `proposed_splits.txt` next to config.json.
+    pub vtable_candidates: Vec<VtableCandidate>,
 }
 
 struct ExeModuleInfo<'a> {
@@ -180,16 +184,17 @@ fn split(args: SplitArgs) -> Result<()> {
     // load_dol_module - returns a Result<(ObjInfo, Utf8NativePathBuf)> - process_xex, then the path of the object
     info!("Loading and analyzing xex");
     let xex_result: Option<Result<ExeAnalyzeResult>> = Some(load_analyze_xex(&config));
-    let mut exe = {
+    let (mut exe, vtable_candidates) = {
         let result = xex_result.unwrap()?;
         dep.extend(result.dep);
-        ExeModuleInfo {
+        let module = ExeModuleInfo {
             obj: result.obj,
             config: &config.base,
             symbols_cache: result.symbols_cache,
             splits_cache: result.splits_cache,
             dep: Default::default(),
-        }
+        };
+        (module, result.vtable_candidates)
     };
     let function_count = exe.obj.symbols.by_kind(ObjSymbolKind::Function).count();
     info!("Initial analysis completed (found {} functions)", function_count);
@@ -199,6 +204,19 @@ fn split(args: SplitArgs) -> Result<()> {
 
     // Create out dirs
     DirBuilder::new().recursive(true).create(&args.out_dir)?;
+
+    // rb3-xenon: emit proposed_splits.txt next to config.json. Paste-bait for
+    // splits.txt — not consumed by jeff itself. See util::proposed_splits.
+    {
+        let proposed_path = args.out_dir.join("proposed_splits.txt");
+        info!(
+            "Writing {} ({} vtable candidate(s))",
+            proposed_path,
+            vtable_candidates.len()
+        );
+        write_proposed_splits(&proposed_path, &exe.obj, &vtable_candidates)?;
+    }
+
     // write the exe in the same dir the xex is
     let exe_path: Utf8NativePathBuf =
         config.base.object.with_encoding().parent().unwrap().join(&exe_name);
@@ -577,10 +595,15 @@ fn load_analyze_xex(config: &ProjectConfig) -> Result<ExeAnalyzeResult> {
     // Apply block relocations from config
     apply_block_relocations(&mut obj, &config.base.block_relocations)?;
 
+    let mut vtable_candidates: Vec<VtableCandidate> = Vec::new();
     if !config.symbols_known && !config.quick_analysis {
         let mut config = CfaConfig::default();
         debug!("Detecting function boundaries");
         FindSaveRestSledsXbox::execute(&mut config, &obj)?;
+        // rb3-xenon: detect MSVC C++ vtables in .rdata. Pushes synthetic
+        // `vftable_<addr>` known_symbols and surfaces candidates the `split`
+        // caller writes to proposed_splits.txt.
+        vtable_candidates = FindXboxVtables::execute_collect(&mut config, &obj)?;
         let result = run_cfa(&obj, &config)?; // perform CFA
         apply_cfa(&mut obj, &result, &config)?; // give each found function a symbol
     }
@@ -588,7 +611,7 @@ fn load_analyze_xex(config: &ProjectConfig) -> Result<ExeAnalyzeResult> {
     // Apply additional relocations from config
     apply_add_relocations(&mut obj, &config.base.add_relocations)?;
 
-    Ok(ExeAnalyzeResult { obj, dep, symbols_cache, splits_cache })
+    Ok(ExeAnalyzeResult { obj, dep, symbols_cache, splits_cache, vtable_candidates })
 }
 
 // references:
@@ -623,6 +646,10 @@ fn disasm(args: DisasmArgs) -> Result<()> {
     // step 2. find common functions (save/restore reg funcs, XAPI calls)
     // rename the save/restore gpr/fpr funcs that were previously found in pdata
     FindSaveRestSledsXbox::execute(&mut config, &obj)?;
+    // rb3-xenon: detect MSVC C++ vtables in .rdata before CFA so the synthetic
+    // `vftable_<addr>` known_symbols seed downstream analysis. Result is also
+    // written to proposed_splits.txt alongside `args.out`.
+    let vtables = FindXboxVtables::execute_collect(&mut config, &obj)?;
 
     let result = run_cfa(&obj, &config)?;
     log::info!(
@@ -645,6 +672,18 @@ fn disasm(args: DisasmArgs) -> Result<()> {
 
     println!("Detecting strings");
     detect_strings(&mut obj)?;
+
+    // rb3-xenon: drop proposed_splits.txt next to args.out so disasm runs also
+    // surface vtable-derived TU boundary candidates.
+    if let Some(out_dir) = args.out.parent() {
+        let proposed_path = out_dir.join("proposed_splits.txt");
+        log::info!(
+            "Writing {} ({} vtable candidate(s))",
+            proposed_path,
+            vtables.len()
+        );
+        write_proposed_splits(&proposed_path, &obj, &vtables)?;
+    }
 
     // println!("Writing symbols.txt");
     // let mut w = buf_writer(&args.out)?;
