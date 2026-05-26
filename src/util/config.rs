@@ -58,6 +58,60 @@ pub fn apply_symbols_file(
                 Err(e) => bail!("Failed to process symbols file: {e:?}"),
             };
             if let Some(symbol) = parse_symbol_line(&line, obj)? {
+                // If the same name already exists from an earlier loader
+                // (e.g., XEX pdata adds except_record_<func> /
+                // except_data_<func> at the binary's real addresses
+                // before symbols.txt is read), prefer the existing entry.
+                // symbols.txt can be stale across rebuilds, and the
+                // duplicate name later trips create_gap_splits into
+                // emitting an auto-split boundary that bisects a
+                // legitimate object.
+                if let Some((_, existing)) = obj.symbols.by_name(&symbol.name)? {
+                    if existing.address != symbol.address {
+                        log::warn!(
+                            "Dropping symbol {} @ {:#010X}: name already used by \
+                             prior loader at {:#010X} (likely stale symbols.txt entry)",
+                            symbol.name, symbol.address, existing.address,
+                        );
+                        continue;
+                    }
+                }
+                // A function symbol from symbols.txt whose address falls
+                // inside a pdata-described function is a label, not a
+                // real function. pdata is the authoritative source of
+                // function boundaries on Xbox 360; promoting an internal
+                // label to a separate function later forces the splitter
+                // to emit a boundary inside the parent function's range,
+                // bisecting a legitimate object (see __savevmx /
+                // fn_82BBBC30 overlap).
+                //
+                // We can't tell the difference between "label inside
+                // a real function" and "an alternate-entry-point alias"
+                // from symbols.txt alone, so demote rather than discard:
+                // we drop the symbol from this load. It would have been
+                // dropped from CFA seeds by discover_seeds anyway, so
+                // omitting it here keeps obj.symbols consistent with
+                // CFA's view.
+                if symbol.kind == ObjSymbolKind::Function && symbol.section.is_some() {
+                    let sym_addr = SectionAddress::new(
+                        symbol.section.unwrap(),
+                        symbol.address as u32,
+                    );
+                    let enclosing = obj.known_functions.range(..sym_addr).next_back();
+                    if let Some((&parent_addr, &Some(parent_size))) = enclosing {
+                        if parent_addr.section == sym_addr.section
+                            && parent_addr.address < sym_addr.address
+                            && parent_addr.address + parent_size > sym_addr.address
+                        {
+                            log::warn!(
+                                "Dropping function symbol {} @ {}: lies inside \
+                                 pdata function {} (size {:#x}); treating as label",
+                                symbol.name, sym_addr, parent_addr, parent_size,
+                            );
+                            continue;
+                        }
+                    }
+                }
                 obj.add_symbol(symbol, true)?;
             }
         }
@@ -82,7 +136,29 @@ pub fn parse_symbol_line(line: &str, obj: &mut ObjInfo) -> Result<Option<ObjSymb
         let section_name = captures["section"].to_string();
         let section = if section_name == "ABS" {
             None
-        } else if let Some((section_index, _)) = obj.sections.by_name(&section_name)? {
+        } else if let Some((section_index, section)) = obj.sections.by_name(&section_name)? {
+            // symbols.txt may declare a symbol as belonging to section X by
+            // name, while its address falls past section X's virtual size
+            // (e.g. inside file-alignment padding). On Xbox 360 XEX inputs
+            // this happens with stale labels like `lbl_821E99C0 = .rdata:…`
+            // where .rdata's virtual size ends at 0x821E99AC. Trusting the
+            // declaration would later make data_range() bail with
+            // "Range … outside of section …" during detect_strings /
+            // detect_objects / the gap-detection sweep, killing the entire
+            // split for one bad row. Drop the symbol with a warning so the
+            // rest of the file still loads.
+            if !section.contains(addr) {
+                log::warn!(
+                    "Dropping symbol {} @ {:#010X}: declared in section {} but \
+                     address is outside the section's range ({:#010X}..{:#010X})",
+                    name,
+                    addr,
+                    section_name,
+                    section.address,
+                    section.address + section.size,
+                );
+                return Ok(None);
+            }
             Some(section_index)
         } else if obj.kind == ObjKind::Executable {
             let (section_index, section) = obj.sections.at_address_mut(addr)?;
@@ -165,6 +241,32 @@ pub fn parse_symbol_line(line: &str, obj: &mut ObjInfo) -> Result<Option<ObjSymb
                         symbol.flags.0 |= ObjSymbolFlags::NoExport;
                     }
                     _ => bail!("Unknown symbol attribute '{attr}'"),
+                }
+            }
+        }
+        // Final-pass containment check: now that `size` has been parsed,
+        // make sure the symbol's declared range fits inside its section.
+        // The earlier check only validated the start address; a stale
+        // entry like `lbl_82E1BF2C = .data:…; size:0x29733` has a valid
+        // start but a size that runs off the end of .data, which later
+        // makes detect_strings / split's gap sweep bail with
+        // "Range … outside of section …".
+        if symbol.size_known && symbol.size > 0 {
+            if let Some(sec_idx) = symbol.section {
+                if let Some(section) = obj.sections.get(sec_idx) {
+                    let sym_start = symbol.address as u32;
+                    let sym_end = sym_start.wrapping_add(symbol.size as u32);
+                    let sec_end = (section.address as u32)
+                        .wrapping_add(section.size as u32);
+                    if sym_end > sec_end || sym_end < sym_start {
+                        log::warn!(
+                            "Dropping symbol {} @ {:#010X}..{:#010X}: declared range \
+                             escapes section {} ({:#010X}..{:#010X})",
+                            symbol.name, sym_start, sym_end,
+                            section.name, section.address, sec_end,
+                        );
+                        return Ok(None);
+                    }
                 }
             }
         }

@@ -169,33 +169,42 @@ pub fn run_cfa(obj: &ObjInfo, config: &CfaConfig) -> Result<CfaResult> {
     for &addr in &seed_addrs {
         process_function_at(obj, config, &mut functions, &mut jump_tables, addr)?;
 
-        // Assertions for known function boundaries (from pdata/import data)
-        if let Some(value) = obj.known_functions.get(&addr) {
-            if let Some(func) = functions.get(&addr) {
-                if let Some(known_size) = value {
-                    let known_end = addr + *known_size;
-                    assert_eq!(func.end.is_some(), true, "Function at {} has no detected end rather than known end {}. There must be an error in processing!", addr, known_end);
-                    let func_end = func.end.unwrap();
-                    // pdata sizes are conservative and may not include
-                    // out-of-line tail blocks, so allow func_end >= known_end
-                    if func_end < known_end {
-                        panic!(
-                            "Function at {} has known end addr {}, but during processing, \
-                             ending was found to be {} (smaller than expected)!",
-                            addr, known_end, func_end
-                        );
-                    } else if func_end != known_end {
-                        log::info!(
-                            "Function at {} extends beyond pdata end {} to {} \
-                             (likely tail block inclusion)",
-                            addr,
-                            known_end,
-                            func_end
-                        );
-                    }
+        // Reconcile CFA's traced extent against pdata (Xbox 360 unwind table).
+        // pdata is emitted by the linker and is authoritative for function
+        // bounds. CFA's tracer is best-effort and can stop short when it hits
+        // instructions it doesn't decode (VMX128, etc.) — when that happens
+        // we extend the function's recorded end to pdata's value rather than
+        // panic. When CFA finds *more* than pdata (out-of-line tail block
+        // absorbed into the function) we keep CFA's larger extent.
+        if let Some(&Some(known_size)) = obj.known_functions.get(&addr) {
+            let known_end = addr + known_size;
+            let func_end_opt = functions.get(&addr).and_then(|f| f.end);
+            match func_end_opt {
+                None => {
+                    // CFA gave up entirely. Trust pdata.
+                    log::warn!(
+                        "Function at {} has no CFA-detected end; using \
+                         pdata extent {}",
+                        addr, known_end
+                    );
+                    functions.entry(addr).or_default().end = Some(known_end);
                 }
-            } else {
-                unreachable!();
+                Some(func_end) if func_end < known_end => {
+                    log::warn!(
+                        "Function at {} traced to {} but pdata reports {}; \
+                         extending to pdata extent",
+                        addr, func_end, known_end
+                    );
+                    functions.entry(addr).or_default().end = Some(known_end);
+                }
+                Some(func_end) if func_end != known_end => {
+                    log::info!(
+                        "Function at {} extends beyond pdata end {} to {} \
+                         (likely tail block inclusion)",
+                        addr, known_end, func_end
+                    );
+                }
+                Some(_) => {} // exact match: nothing to do
             }
         }
     }
@@ -358,6 +367,70 @@ pub fn apply_cfa(obj: &mut ObjInfo, result: &CfaResult, config: &CfaConfig) -> R
     }
     for (&_addr, symbols) in &config.known_symbols {
         for symbol in symbols {
+            // Drop sled / signature-derived function symbols whose address
+            // lies strictly inside a pdata-described function. The
+            // save/restore-sled scanners (FindSaveRestSleds in
+            // analysis::pass) emit byte-pattern matches that can
+            // legitimately overlap pdata-described parents on Xbox 360
+            // (e.g. `__savegprlr` at 0x82829220 inside the pdata function
+            // at 0x82829198..0x828293F8). pdata is authoritative; adding
+            // the sled as a separate function makes the splitter cut the
+            // parent in half later (`Split … ends within symbol …`).
+            if symbol.kind == ObjSymbolKind::Function {
+                if let Some(section_index) = symbol.section {
+                    let sym_addr =
+                        SectionAddress::new(section_index, symbol.address as u32);
+                    let enclosing = result.functions.range(..sym_addr).next_back();
+                    if let Some((&parent_addr, parent_info)) = enclosing {
+                        if let Some(parent_end) = parent_info.end {
+                            if parent_addr.section == sym_addr.section
+                                && parent_addr.address < sym_addr.address
+                                && parent_end > sym_addr
+                            {
+                                log::warn!(
+                                    "Skipping signature-derived function symbol {} @ {}: \
+                                     lies inside pdata function {}..{}",
+                                    symbol.name, sym_addr, parent_addr, parent_end,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // Strip any stale duplicate-name entries (from symbols.txt /
+            // map / PDB) before adding this known symbol. The sled and
+            // intrinsic scanners place symbols at the binary's *real*
+            // addresses; if symbols.txt previously declared the same
+            // name at a different address (common when symbols.txt was
+            // generated against a different build), keeping that stale
+            // entry tricks create_gap_splits's duplicate-name boundary
+            // logic into emitting a split at the wrong address, which
+            // later trips "Split … ends within symbol …".
+            if let Ok(matches) = obj.symbols.by_name(&symbol.name) {
+                if let Some((stale_idx, stale_sym)) = matches {
+                    if stale_sym.address != symbol.address {
+                        log::warn!(
+                            "Stripping stale duplicate-name symbol {} @ {:#010X} \
+                             (replaced by known_symbol at {:#010X})",
+                            stale_sym.name, stale_sym.address, symbol.address,
+                        );
+                        let renamed = ObjSymbol {
+                            name: format!("__DELETED_{}", stale_sym.name),
+                            kind: ObjSymbolKind::Unknown,
+                            size: 0,
+                            flags: ObjSymbolFlagSet(
+                                ObjSymbolFlags::RelocationIgnore
+                                    | ObjSymbolFlags::NoWrite
+                                    | ObjSymbolFlags::NoExport
+                                    | ObjSymbolFlags::Stripped,
+                            ),
+                            ..stale_sym.clone()
+                        };
+                        obj.symbols.replace(stale_idx, renamed)?;
+                    }
+                }
+            }
             // Remove overlapping symbols
             if symbol.size > 0 {
                 let end = symbol.address + symbol.size;
@@ -439,14 +512,70 @@ fn discover_seeds(
             );
             continue;
         }
-        functions.insert(
-            addr_ref,
-            FunctionInfo {
-                analyzed: false,
-                end: if symbol.size_known { Some(addr_ref + symbol.size as u32) } else { None },
-                slices: None,
-            },
-        );
+
+        // Drop symbol-derived function seeds whose declared range conflicts
+        // with an already-registered function (typically a pdata entry
+        // inserted in the loop above). symbols.txt is sometimes stale or
+        // hand-curated and can label internal control-flow targets, dead
+        // padding, or pre-link aliases as `type:function`; trusting them
+        // as separate functions then makes detect_new_functions bail with
+        // "Overlapping functions". pdata is the authoritative source of
+        // function bounds on Xbox 360 — keep it, treat the conflicting
+        // symbol as a label.
+        //
+        // Two conflict shapes need to be handled:
+        //   (a) symbol address lies strictly inside a prior pdata range,
+        //       e.g. fn_82270000 inside pdata's [0x8226FFD8..0x82270350);
+        //   (b) symbol's claimed [address..address+size) crosses into the
+        //       *next* pdata function's start, e.g. fn_82272EB4 size 0x28
+        //       overlapping pdata's 0x82272EB8 entry.
+        let symbol_end_opt = symbol
+            .size_known
+            .then(|| addr_ref + symbol.size as u32);
+
+        if let Some((&prev_start, prev_info)) = functions.range(..addr_ref).next_back() {
+            if prev_start.section == addr_ref.section {
+                if let Some(prev_end) = prev_info.end {
+                    if prev_end > addr_ref {
+                        log::warn!(
+                            "Dropping function symbol {} @ {}: lies inside existing function {}..{} (treating as label)",
+                            symbol.name, addr_ref, prev_start, prev_end,
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(symbol_end) = symbol_end_opt {
+            if let Some((&next_start, _)) =
+                functions.range(addr_ref..symbol_end).next()
+            {
+                if next_start != addr_ref && next_start.section == addr_ref.section {
+                    log::warn!(
+                        "Dropping function symbol {} @ {} (claimed end {}): crosses into existing function at {} (treating as label)",
+                        symbol.name, addr_ref, symbol_end, next_start,
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // If an entry already exists at this exact address (from pdata or
+        // config.seed_functions), prefer its `end` — that source is more
+        // authoritative than symbols.txt's stored size, which can drift
+        // from the binary's actual function bounds. Only fill in `end`
+        // from the symbol when the prior entry didn't have one.
+        use std::collections::btree_map::Entry;
+        match functions.entry(addr_ref) {
+            Entry::Vacant(e) => {
+                e.insert(FunctionInfo { analyzed: false, end: symbol_end_opt, slices: None });
+            }
+            Entry::Occupied(mut occupied) => {
+                if occupied.get().end.is_none() && symbol_end_opt.is_some() {
+                    occupied.get_mut().end = symbol_end_opt;
+                }
+            }
+        }
     }
 
     // Also check the beginning of every code section
@@ -462,6 +591,49 @@ fn discover_seeds(
             continue;
         }
         functions.entry(this_sec_start).or_default();
+    }
+
+    // Final sweep: drop any seed function that lies strictly inside another
+    // seed function's [start, end) range. The seed set is the union of:
+    //   - config.seed_functions (analysis passes — save/restore sleds,
+    //     CRT helpers, etc.)
+    //   - obj.known_functions (pdata + import data)
+    //   - obj.symbols function entries (symbols.txt, PDB, map)
+    //
+    // The pass-side scanners (FindSaveRestSleds in particular) fire on
+    // byte signatures and can match inside larger pdata functions —
+    // e.g. RB3 retail has `__savegprlr` at 0x82829220 inside the pdata
+    // function at 0x82829198 (size 0x260). Pdata is authoritative; an
+    // inside-pdata seed is a label, not a separate function. Letting it
+    // through makes the splitter cut the parent in half later, killing
+    // the run with `Split … ends within symbol …`.
+    //
+    // This runs after all the per-source loops above so it can drop
+    // overlapping entries regardless of insertion order.
+    let candidates: Vec<(SectionAddress, Option<SectionAddress>)> =
+        functions.iter().map(|(&a, info)| (a, info.end)).collect();
+    let mut to_drop: Vec<SectionAddress> = Vec::new();
+    for (addr, _end) in &candidates {
+        if let Some((&parent_addr, parent_info)) =
+            functions.range(..*addr).next_back()
+        {
+            if parent_addr.section == addr.section {
+                if let Some(parent_end) = parent_info.end {
+                    if parent_addr.address < addr.address
+                        && parent_end > *addr
+                    {
+                        log::warn!(
+                            "Dropping function seed {} (lies inside {}..{})",
+                            addr, parent_addr, parent_end,
+                        );
+                        to_drop.push(*addr);
+                    }
+                }
+            }
+        }
+    }
+    for addr in to_drop {
+        functions.remove(&addr);
     }
 
     functions
@@ -661,6 +833,27 @@ fn try_add_function(
     if in_skipped_range(&config.skip_ranges, address) {
         return;
     }
+    // Don't add a discovered function that falls strictly inside an
+    // already-registered function's range (typically a pdata entry).
+    // slices.function_references can legitimately include addresses
+    // that are internal labels of the parent function — jump-table
+    // dispatch blocks, out-of-line tails, or block boundaries that
+    // CFA mistook for tail calls. Promoting any of those to a
+    // separate function entry creates a structural overlap that
+    // makes detect_new_functions bail downstream.
+    if let Some((&prev_start, prev_info)) = functions.range(..address).next_back() {
+        if prev_start.section == address.section {
+            if let Some(prev_end) = prev_info.end {
+                if prev_end > address {
+                    log::debug!(
+                        "Skipping discovered function {} inside existing function {}..{}",
+                        address, prev_start, prev_end,
+                    );
+                    return;
+                }
+            }
+        }
+    }
     functions.entry(address).or_default();
 }
 
@@ -722,7 +915,20 @@ pub fn process_function_at(
             slices.finalize(obj, functions)?;
             let info = functions.entry(addr).or_default();
             info.analyzed = true;
-            info.end = slices.end();
+            // Don't shrink a pre-existing authoritative end. pdata seeds
+            // it from the linker's unwind table; detect_new_functions
+            // extends it when it absorbs a tail block that CFA can't
+            // reach from the main body (e.g., dispatched via bctr / jump
+            // table). Replacing it here with the smaller slices.end()
+            // makes detect_new_functions and process_function_at oscillate
+            // forever (extend → re-analyze → revert → re-detect → ...).
+            // Adopt slices.end() only when there's no prior value or
+            // when CFA actually traced further than the prior end.
+            info.end = match (info.end, slices.end()) {
+                (Some(prev), Some(traced)) if traced > prev => Some(traced),
+                (Some(prev), _) => Some(prev),
+                (None, traced) => traced,
+            };
             info.slices = Some(slices);
         } else {
             let info = functions.entry(addr).or_default();
@@ -735,7 +941,13 @@ pub fn process_function_at(
         log::info!("Not a function @ {:#010X}", addr);
         let info = functions.entry(addr).or_default();
         info.analyzed = true;
-        info.end = None;
+        // Don't clobber a pre-seeded end. discover_seeds populates info.end
+        // from pdata (Xbox 360 unwind table) and from symbols.txt entries
+        // whose sizes are known. Those bounds are authoritative even when
+        // CFA can't trace through the body — RB3 contains VMX128 (Xbox 360
+        // SIMD) opcodes that the disassembler doesn't decode, which makes
+        // slices.analyze bail with `false`. Preserving info.end lets
+        // apply_cfa still emit a properly-sized symbol.
         false
     })
 }
@@ -1351,6 +1563,341 @@ mod tests {
         assert_eq!(info.end, slices.end());
     }
 
+    // Regression test for the RB3 retail XEX bail
+    //   "Overlapping functions 3:0x8226FFD8-3:0x82270350 -> 3:0x82270000"
+    // observed after the prior session's CFA hang fix unblocked Phase 2.
+    //
+    // Cause: pdata says the function at 0x8226FFD8 is 222 instructions long
+    // (extends to 0x82270350). symbols.txt also has fn_82270000 (size 0x14)
+    // — but the instructions at 0x82270000 are not a function prologue
+    // (`li r3, 0; cmplwi cr6, r3, 0; beq ...`) — it's a label inside the
+    // pdata-described function. The stale symbol shouldn't be promoted to
+    // a seed function; pdata is authoritative.
+    //
+    // discover_seeds must drop the symbol-derived seed when it lies
+    // strictly inside an already-registered (pdata) function.
+    #[test]
+    fn discover_seeds_drops_symbol_inside_pdata_function() {
+        use crate::obj::{ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind};
+
+        let mut obj = make_obj(0x1000, &[NOP; 0x80]); // 0x1000..0x1200
+
+        let pdata_start = SectionAddress::new(0, 0x1000);
+        let pdata_size = 0x100u32; // function spans [0x1000, 0x1100]
+        obj.known_functions.insert(pdata_start, Some(pdata_size));
+        obj.pdata_funcs.push(pdata_start);
+
+        // Spurious symbol "label_at_0x1040" inside the pdata function, with
+        // size_known = true and a small reported size — mirrors the stale
+        // fn_82270000 in symbols.txt.
+        obj.add_symbol(
+            ObjSymbol {
+                name: "label_at_0x1040".into(),
+                address: 0x1040,
+                section: Some(0),
+                size: 0x14,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add_symbol");
+
+        // A legitimate function symbol *outside* the pdata range should
+        // still be picked up.
+        obj.add_symbol(
+            ObjSymbol {
+                name: "real_neighbor".into(),
+                address: 0x1100,
+                section: Some(0),
+                size: 0x40,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add_symbol");
+
+        let config = CfaConfig::default();
+        let seeds = discover_seeds(&obj, &config);
+
+        // The pdata function is present with the pdata-derived end.
+        let pdata_info = seeds.get(&pdata_start).expect("pdata function present");
+        assert_eq!(
+            pdata_info.end,
+            Some(pdata_start + pdata_size),
+            "pdata function end should not be overridden by symbol",
+        );
+
+        // The spurious inside-pdata symbol is dropped.
+        assert!(
+            !seeds.contains_key(&SectionAddress::new(0, 0x1040)),
+            "symbol-derived function inside a pdata range should be dropped; \
+             seed map: {:?}",
+            seeds.keys().collect::<Vec<_>>()
+        );
+
+        // The legitimate non-overlapping symbol is preserved.
+        let neighbor = seeds
+            .get(&SectionAddress::new(0, 0x1100))
+            .expect("legitimate neighbor function present");
+        assert_eq!(neighbor.end, Some(SectionAddress::new(0, 0x1140)));
+    }
+
+    // Regression test for the second-form RB3 overlap
+    //   "Overlapping functions 3:0x82272EB4-3:0x82272EDC -> 3:0x82272EB8"
+    //
+    // Cause: pdata has consecutive entries 0x82272DB0..0x82272EB4 and
+    // 0x82272EB8..0x82272FBC (4-byte gap between them). symbols.txt
+    // additionally lists fn_82272EB4 size 0x28 — i.e. it claims a function
+    // STARTING in the 4-byte gap and EXTENDING into the next pdata
+    // function. The symbol's address itself doesn't lie inside any
+    // existing function (case (a) doesn't fire), but its *claimed end*
+    // crosses into pdata's 0x82272EB8 entry.
+    //
+    // discover_seeds must drop the symbol-derived seed whose [addr..end)
+    // range crosses into the next registered function's start.
+    #[test]
+    fn discover_seeds_drops_symbol_whose_end_crosses_into_next_function() {
+        use crate::obj::{ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind};
+
+        let mut obj = make_obj(0x1000, &[NOP; 0x40]); // 0x1000..0x1100
+
+        // Pdata: function at 0x1080 of size 0x40 (ends at 0x10C0).
+        let pdata_start = SectionAddress::new(0, 0x1080);
+        obj.known_functions.insert(pdata_start, Some(0x40));
+        obj.pdata_funcs.push(pdata_start);
+
+        // Symbol claiming a function at 0x107C size 0x10 — the start is in
+        // the 4-byte gap before pdata's entry, but the claimed end 0x108C
+        // crosses into pdata's [0x1080..0x10C0).
+        obj.add_symbol(
+            ObjSymbol {
+                name: "stale_label_before_pdata".into(),
+                address: 0x107C,
+                section: Some(0),
+                size: 0x10,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add_symbol");
+
+        let config = CfaConfig::default();
+        let seeds = discover_seeds(&obj, &config);
+
+        assert!(
+            seeds.contains_key(&pdata_start),
+            "pdata function survives"
+        );
+        assert!(
+            !seeds.contains_key(&SectionAddress::new(0, 0x107C)),
+            "symbol whose range crosses into a pdata function should be dropped; \
+             seed map: {:?}",
+            seeds.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Sister test: when a function symbol shares the *same* address as a
+    // pdata function, the pdata `end` must win — symbols.txt sizes can lag
+    // behind pdata when the binary has been re-linked or pdata was
+    // regenerated.
+    #[test]
+    fn discover_seeds_keeps_pdata_end_when_symbol_collides_at_same_address() {
+        use crate::obj::{ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind};
+
+        let mut obj = make_obj(0x1000, &[NOP; 0x40]);
+
+        let addr = SectionAddress::new(0, 0x1000);
+        obj.known_functions.insert(addr, Some(0x100));
+        obj.pdata_funcs.push(addr);
+
+        obj.add_symbol(
+            ObjSymbol {
+                name: "fn_with_stale_size".into(),
+                address: 0x1000,
+                section: Some(0),
+                size: 0x10, // STALE: pdata says 0x100
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add_symbol");
+
+        let config = CfaConfig::default();
+        let seeds = discover_seeds(&obj, &config);
+        let info = seeds.get(&addr).expect("function present");
+        assert_eq!(
+            info.end,
+            Some(addr + 0x100u32),
+            "pdata end must beat symbol size at same address"
+        );
+    }
+
+    // Regression test for the detect_new_functions ↔ process_function_at
+    // oscillation observed on RB3 retail (Phase 3 logged "Detected tail
+    // block @ 0x82511618-0x82511658 of function 0x82511590, extending
+    // function end from 0x82511614" indefinitely).
+    //
+    // Cause: detect_new_functions detects a tail block via byte-pattern
+    // matching and extends the parent's end. CFA then re-analyzes the
+    // function — but the tail block is reached only via a path CFA can't
+    // see (bctr / jump table), so slices.end() reports the *original*
+    // main-body end. Previously, process_function_at unconditionally wrote
+    // `info.end = slices.end()`, reverting the extension. The next
+    // detect_new_functions iteration finds the same gap and extends
+    // again, ad infinitum.
+    //
+    // Fix: info.end is monotonic in process_function_at — never shrink it
+    // below a previously-set value. Pdata seeds, detect_new_functions's
+    // tail-block extensions, and prior CFA traces are all authoritative
+    // upper bounds.
+    #[test]
+    fn process_function_at_does_not_shrink_existing_end() {
+        // Synthetic function whose CFA-traced end is 0x1010 but whose
+        // pre-recorded info.end is 0x1040 (as if detect_new_functions had
+        // absorbed a tail block CFA can't reach).
+        let obj = make_obj(0x1000, &[BLR; 16]); // 0x1000..0x1040, all blr
+
+        let addr = SectionAddress::new(0, 0x1000);
+        let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+        functions.insert(
+            addr,
+            FunctionInfo {
+                analyzed: false,
+                end: Some(SectionAddress::new(0, 0x1040)), // pre-recorded extended end
+                slices: None,
+            },
+        );
+
+        let config = CfaConfig::default();
+        let mut jump_tables = BTreeMap::new();
+        process_function_at(&obj, &config, &mut functions, &mut jump_tables, addr)
+            .expect("process_function_at should succeed");
+
+        let info = functions.get(&addr).expect("function still present");
+        assert!(
+            info.analyzed,
+            "function should be marked analyzed"
+        );
+        assert_eq!(
+            info.end,
+            Some(SectionAddress::new(0, 0x1040)),
+            "process_function_at must not shrink info.end below the \
+             pre-recorded extended value (got {:?})",
+            info.end
+        );
+    }
+
+    // Regression test for the third-form RB3 overlap:
+    //   "Overlapping functions 3:0x82274490-3:0x822745B0 -> 3:0x822745A0"
+    //
+    // Cause: pdata describes a function 0x82274490..0x822745B0. During
+    // slices.analyze, an internal label (jump-table dispatch / out-of-line
+    // tail block) at 0x822745A0 was misclassified as a tail call and ended
+    // up in slices.function_references. process_function_at then called
+    // try_add_function with that address, which unconditionally created a
+    // Regression test for the discover_seeds final sweep — RB3 retail
+    // tripped a "Split … ends within symbol …" bail because the
+    // FindSaveRestSledsXbox analysis pass put `__savegprlr` (size 0x50)
+    // at 0x82829220 in seed_functions, while pdata had a function at
+    // 0x82829198 (size 0x260) covering it. Both ended up in the seed
+    // set with overlapping ranges, and the later splitter cut the
+    // pdata-described parent in half at the sled boundary.
+    //
+    // discover_seeds must, after merging all seed sources, drop any
+    // seed function whose address lies strictly inside another seed's
+    // [start, end) range.
+    #[test]
+    fn discover_seeds_final_sweep_drops_sled_inside_pdata_function() {
+        let obj = make_obj(0x1000, &[NOP; 0x80]);
+
+        let pdata_start = SectionAddress::new(0, 0x1000);
+        let mut config = CfaConfig::default();
+        // Simulate FindSaveRestSledsXbox inserting `__savegprlr` as a seed
+        // at an address that pdata's enclosing function already covers.
+        let sled_addr = SectionAddress::new(0, 0x1080);
+        let sled_size = 0x50u32;
+        config.seed_functions.insert(
+            sled_addr,
+            FunctionInfo {
+                analyzed: false,
+                end: Some(sled_addr + sled_size),
+                slices: None,
+            },
+        );
+
+        // Pdata says the parent function covers [0x1000, 0x1100), which
+        // strictly encloses the sled.
+        let mut obj = obj;
+        obj.known_functions.insert(pdata_start, Some(0x100));
+        obj.pdata_funcs.push(pdata_start);
+
+        let seeds = discover_seeds(&obj, &config);
+
+        assert!(seeds.contains_key(&pdata_start), "pdata function survives");
+        assert!(
+            !seeds.contains_key(&sled_addr),
+            "sled-derived seed inside a pdata range should be dropped by the \
+             final sweep; got seeds: {:?}",
+            seeds.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // new function entry — overlapping the parent.
+    //
+    // try_add_function must skip addresses that lie strictly inside an
+    // already-registered function.
+    #[test]
+    fn try_add_function_rejects_addresses_inside_existing_function() {
+        let obj = make_obj(0x1000, &[NOP; 0x80]);
+
+        let mut functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+        // Pre-existing function [0x1000..0x1100].
+        functions.insert(
+            SectionAddress::new(0, 0x1000),
+            FunctionInfo {
+                analyzed: false,
+                end: Some(SectionAddress::new(0, 0x1100)),
+                slices: None,
+            },
+        );
+
+        let config = CfaConfig::default();
+
+        // Address inside the existing function: must not be added.
+        try_add_function(&obj, &config, &mut functions, SectionAddress::new(0, 0x1080));
+        assert!(
+            !functions.contains_key(&SectionAddress::new(0, 0x1080)),
+            "address inside existing function should not be added"
+        );
+
+        // Address right at the parent's end (== first address past it):
+        // safe to add as a new function.
+        try_add_function(&obj, &config, &mut functions, SectionAddress::new(0, 0x1100));
+        assert!(
+            functions.contains_key(&SectionAddress::new(0, 0x1100)),
+            "address at the parent's end-boundary should be added"
+        );
+
+        // Address well outside the existing function: safe to add.
+        try_add_function(&obj, &config, &mut functions, SectionAddress::new(0, 0x1140));
+        assert!(
+            functions.contains_key(&SectionAddress::new(0, 0x1140)),
+            "address outside existing function should be added"
+        );
+    }
+
     #[test]
     fn test_validate_invariants_rejects_overlapping_functions() {
         let obj = make_obj(0x1000, &[NOP, BLR, NOP, NOP, NOP, NOP]);
@@ -1605,6 +2152,88 @@ mod tests {
         assert_eq!(jt_sym.kind, ObjSymbolKind::Object);
         assert_eq!(jt_sym.size, 0x20);
         assert_eq!(jt_sym.address, 0x8000_0040);
+    }
+
+    // Regression test for apply_cfa's stale-duplicate-name strip — RB3
+    // retail had `__savegprlr_14` in symbols.txt at 0x82829220 (a stale
+    // label inside a pdata function), while the sled scanner produces
+    // the same label at the binary's real sled address (e.g. 0x82803F00).
+    // Both end up in obj.symbols with the same name. create_gap_splits
+    // treats duplicate names as a split boundary and ends the parent
+    // function's split at 0x82829220, which then bisects the parent
+    // function's symbol.
+    //
+    // apply_cfa must, before adding a known_symbols entry, strip any
+    // pre-existing symbol with the same name at a different address.
+    #[test]
+    fn apply_cfa_strips_stale_duplicate_name_symbol() {
+        let mut obj = make_obj(0x1000, &[NOP; 0x80]);
+
+        // Stale symbol from a prior loader (simulating symbols.txt).
+        obj.add_symbol(
+            ObjSymbol {
+                name: "__savegprlr".into(),
+                address: 0x1080,
+                section: Some(0),
+                size: 0x50,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add stale symbol");
+
+        // Run apply_cfa with a config that has the SAME name in
+        // known_symbols at a different address (simulating the sled
+        // scanner finding the real sled location).
+        let real_sled_addr = SectionAddress::new(0, 0x1020);
+        let mut config = CfaConfig::default();
+        config.known_symbols.entry(real_sled_addr).or_default().push(ObjSymbol {
+            name: "__savegprlr".into(),
+            address: real_sled_addr.address as u64,
+            section: Some(0),
+            size: 0x50,
+            size_known: true,
+            flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+            kind: ObjSymbolKind::Function,
+            ..Default::default()
+        });
+
+        let empty_result = CfaResult {
+            functions: BTreeMap::new(),
+            jump_tables: BTreeMap::new(),
+            merged_tail_blocks: vec![],
+            extended_functions: vec![],
+        };
+        apply_cfa(&mut obj, &empty_result, &config).expect("apply_cfa");
+
+        // The stale entry should have been renamed to __DELETED_*.
+        let stale_lookup = obj.symbols.by_name("__savegprlr").expect("lookup");
+        let (_, kept_sym) = stale_lookup.expect("__savegprlr present");
+        assert_eq!(
+            kept_sym.address, real_sled_addr.address as u64,
+            "the kept __savegprlr should be at the sled scanner's address; \
+             got {:#010X}",
+            kept_sym.address
+        );
+
+        // Ensure only one live __savegprlr remains; the stale 0x1080 entry
+        // should now be __DELETED_ and not appear under that name.
+        let stale_at_addr = obj
+            .symbols
+            .for_section_range(0, 0x1080..0x1084)
+            .find(|(_, s)| s.name == "__savegprlr");
+        assert!(
+            stale_at_addr.is_none(),
+            "no live __savegprlr should remain at 0x1080"
+        );
+        let deleted = obj
+            .symbols
+            .for_section_range(0, 0x1080..0x1084)
+            .find(|(_, s)| s.name == "__DELETED___savegprlr");
+        assert!(deleted.is_some(), "stale entry should have been renamed");
     }
 
     /// Case 1 variant: First instruction branches back, blr found before gap_end.

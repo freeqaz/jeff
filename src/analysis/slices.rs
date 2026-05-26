@@ -37,6 +37,7 @@ pub struct FunctionSlices {
     pub unvisited_seed_cap_hits: u32,
     pub total_block_cap_hits: u32,
     pub rejected_unvisited_seed_count: u32,
+    pub ic_count: u64,
 }
 
 pub enum TailCallResult {
@@ -53,6 +54,11 @@ type InsCheck = dyn Fn(Ins) -> bool;
 const MAX_POSSIBLE_BLOCK_EXPLORES_PER_FUNCTION: usize = 512;
 const MAX_UNVISITED_SEEDS_PER_FUNCTION: usize = 128;
 const MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION: usize = 4096;
+/// Hard cap on instruction-callback invocations during a single
+/// `FunctionSlices::analyze` call. Guards against pathological VM-state
+/// explosions on Xbox 360 binaries (jump tables and VMX128-heavy regions can
+/// cause runaway exploration). Reasonable functions fit in well under 100k.
+const MAX_INSTRUCTION_CALLBACKS_PER_FUNCTION: u64 = 5_000_000;
 
 const UNVISITED_SEED_REASON_PDATA_RANGE: u32 = 1 << 0;
 const UNVISITED_SEED_REASON_GAP_BOUNDARY: u32 = 1 << 1;
@@ -322,6 +328,21 @@ impl FunctionSlices {
     ) -> Result<ExecCbResult<bool>> {
         let ExecCbData { executor, vm, result, ins_addr, section, ins, block_start } = data;
 
+        // Hard cap on instruction callbacks per function. RB3 retail's first
+        // .text function (and a handful of others) trip a runaway VM state
+        // explosion that we haven't fully diagnosed; capping the work lets
+        // analysis make progress on the rest of the binary. Functions that
+        // hit the cap fall back to pdata-derived bounds via the "Not a
+        // function" path (which preserves info.end from pdata in cfa.rs).
+        self.ic_count = self.ic_count.wrapping_add(1);
+        if self.ic_count > MAX_INSTRUCTION_CALLBACKS_PER_FUNCTION {
+            log::warn!(
+                "Bailing on function {} after {} instruction callbacks (cap hit at {})",
+                function_start, self.ic_count, ins_addr
+            );
+            return Ok(ExecCbResult::End(false));
+        }
+
         // no need to check for prologues/epilogues in MSVC
         // if a func came from pdata, it not only has a prologue/epilogue, but a known confirmed ending
 
@@ -347,7 +368,16 @@ impl FunctionSlices {
                 // if we know the function end from pdata, just end the block here and continue processing
                 return match function_end {
                     Some(end) => {
-                        self.blocks.insert(block_start, function_end);
+                        // Don't record a block that starts at or past
+                        // function_end. block_start lives outside our
+                        // function (we got here only because the speculative
+                        // pass or gap-detection pushed past pdata bounds),
+                        // and a zero/negative-width [block_start, end] entry
+                        // wedges first_disconnected_block into an
+                        // infinite-no-progress loop.
+                        if block_start < end {
+                            self.blocks.insert(block_start, Some(end));
+                        }
                         Ok(ExecCbResult::EndBlock)
                     }
                     None => Ok(ExecCbResult::End(false)),
@@ -419,6 +449,17 @@ impl FunctionSlices {
                         || matches!(section.data_range(ins_addr.address, ins_addr.address + 4), Ok(data) if data == [0u8; 4])
                     {
                         self.function_references.insert(addr);
+                    } else if function_end.is_some_and(|end| addr >= end) {
+                        // pdata (Xbox 360 .pdata or equivalent) gave us an
+                        // authoritative function end; an unconditional
+                        // forward branch past that end is a tail call to
+                        // an out-of-line block or sibling function, not a
+                        // possibly-internal block. Treating it as a
+                        // possible_block lets the speculative pass trace
+                        // past function_end and create blocks beyond it,
+                        // which then drives first_disconnected_block into
+                        // a degenerate gap that can't be bridged.
+                        self.function_references.insert(addr);
                     } else {
                         self.possible_blocks.insert(addr, vm.clone_all());
                     }
@@ -482,9 +523,18 @@ impl FunctionSlices {
                         self.branches.insert(ins_addr, branches);
                     } else {
                         // If the table doesn't contain the next address,
-                        // it could be a function jump table instead
-                        self.possible_blocks
-                            .extend(entries.into_iter().map(|addr| (addr, vm.clone_all())));
+                        // it could be a function jump table instead.
+                        // Entries past a pdata-known function_end are
+                        // sibling functions, not possibly-internal blocks
+                        // (same rationale as the unconditional-branch
+                        // path above).
+                        for entry in entries {
+                            if function_end.is_some_and(|end| entry >= end) {
+                                self.function_references.insert(entry);
+                            } else {
+                                self.possible_blocks.insert(entry, vm.clone_all());
+                            }
+                        }
                     }
                     Ok(ExecCbResult::EndBlock)
                 }
@@ -1483,5 +1533,146 @@ mod tests {
         }
         assert_eq!(slices.blocks.len(), MAX_TOTAL_DISCOVERED_BLOCKS_PER_FUNCTION);
         assert!(slices.total_block_cap_hits > 0);
+    }
+
+    // Regression test for the RB3 retail XEX hang observed at seed
+    // 0x82273B58 (dtk xex split stuck at ~99% CPU, no progress, 5+ minutes).
+    //
+    // Chain of events:
+    //   1. Function A spans [0x1000, 0x1040] per pdata. A has a forward
+    //      unconditional branch to 0x1080 — past function_end — which lands
+    //      in possible_blocks.
+    //   2. Another known function B starts exactly at 0x1040 (== A's
+    //      function_end). On Xbox 360 .text this is the common case:
+    //      pdata-driven adjacent functions.
+    //   3. The speculative pass pops 0x1080 from possible_blocks and traces
+    //      it, creating a block [0x1080, 0x1084] past function_end.
+    //   4. The post-speculative gap-detection loop sees a gap between the
+    //      last in-function block (ending at function_end) and the new
+    //      out-of-function block, and pushes the executor at first.end =
+    //      function_end = 0x1040.
+    //   5. The executor starts a block walk at 0x1040, where
+    //      is_known_function reports function B. The "control flow hit a
+    //      known function" branch in instruction_callback then inserts
+    //      blocks[block_start = 0x1040] = Some(function_end = 0x1040) — a
+    //      ZERO-WIDTH block.
+    //   6. The inner gap-detection loop now returns the zero-width block
+    //      as `first`. It pushes the executor at first.end = first.start =
+    //      0x1040, but that address is already visited — executor.run
+    //      returns Ok(None) without doing any work. blocks/possible_blocks
+    //      are unchanged, so the same gap is returned on the next
+    //      iteration. Infinite loop.
+    //
+    // With the fix in place, analyze() terminates promptly. We run it on a
+    // worker thread guarded by a 10-second deadline: a healthy run is
+    // sub-millisecond, while the bug hangs forever.
+    #[test]
+    fn gap_detection_terminates_when_pdata_neighbor_sits_at_function_end() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use crate::analysis::cfa::FunctionInfo;
+
+        // Instructions (relative to base 0x1000):
+        //   0x1000: b 0x1080   (forward branch past function_end → possible_blocks)
+        //   0x1004..0x107C:    nops (executor will trace through these from 0x1004,
+        //                       so the gap between blocks closes naturally)
+        //   0x1080:            blr  (epilogue for the out-of-bounds tail block)
+        let nop: u32 = 0x6000_0000;
+        let blr: u32 = 0x4E80_0020;
+        let b_to_0x1080_from_0x1000: u32 = 0x4800_0080; // I-form, +0x80 offset, no AA/LK
+        let mut words = vec![nop; 0x21];
+        words[0] = b_to_0x1080_from_0x1000;
+        words[0x20] = blr;
+
+        let code_section = make_code_section(".text", 0x1000, &words);
+        let obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "rb3-xenon-hang-repro".into(),
+            vec![],
+            vec![code_section],
+        );
+
+        let function_start = SectionAddress::new(0, 0x1000);
+        let function_end = SectionAddress::new(0, 0x1040);
+
+        // Function B (a separate known function) starts at A's function_end.
+        let mut known_functions: BTreeMap<SectionAddress, FunctionInfo> = BTreeMap::new();
+        known_functions.insert(
+            SectionAddress::new(0, 0x1040),
+            FunctionInfo {
+                analyzed: false,
+                end: Some(SectionAddress::new(0, 0x1080)),
+                slices: None,
+            },
+        );
+
+        // Run analyze on a worker thread so we can enforce a deadline.
+        // Use a flag to abandon the thread if it hangs — we can't kill it,
+        // but at least the test fails fast and reports the bug.
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_for_thread = finished.clone();
+        let handle = thread::Builder::new()
+            .name("hang-repro-worker".into())
+            .spawn(move || {
+                let mut slices = FunctionSlices::default();
+                let result = slices.analyze(
+                    &obj,
+                    function_start,
+                    function_start,
+                    Some(function_end),
+                    &known_functions,
+                    None,
+                );
+                finished_for_thread.store(true, Ordering::Release);
+                (result, slices)
+            })
+            .expect("spawn worker");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            finished.load(Ordering::Acquire),
+            "FunctionSlices::analyze did not terminate within 10s — gap \
+             detection is stuck on a zero-width block at function_end. \
+             See test comment for the chain of events."
+        );
+        let (result, slices) = handle.join().expect("worker panicked");
+        let analyzed = result.expect("analyze should not error");
+        assert!(analyzed, "analyze returned Ok(false)");
+
+        // The fix is structural: branches past function_end go to
+        // function_references (tail call), so the speculative pass never
+        // touches 0x1080 and no out-of-function block is ever created.
+        // Verify that:
+        //   - 0x1080 is recorded as a function reference, not an internal block
+        //   - blocks contain no entries at or past function_end
+        //   - blocks contain no zero-width entries
+        assert!(
+            slices.function_references.contains(&SectionAddress::new(0, 0x1080)),
+            "branch past function_end should be a function reference; \
+             got function_references={:?}",
+            slices.function_references
+        );
+        for (&start, &end_opt) in &slices.blocks {
+            assert!(
+                start < function_end,
+                "block {start} starts at or past function_end {function_end}"
+            );
+            if let Some(end) = end_opt {
+                assert!(start < end, "zero/negative-width block [{start}..{end}]");
+                assert!(
+                    end <= function_end,
+                    "block [{start}..{end}] extends past function_end {function_end}"
+                );
+            }
+        }
     }
 }
