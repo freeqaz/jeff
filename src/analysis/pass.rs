@@ -236,6 +236,7 @@ impl FindXboxVtables {
         let mut drop_align = 0u32;
         let mut drop_skip = 0u32;
         let mut drop_hull = 0u32;
+        let mut drop_user = 0u32;
 
         // Precompute (section_idx, base_addr, end_exclusive) for every text
         // section so we can identify which one a candidate fn pointer belongs to
@@ -326,6 +327,7 @@ impl FindXboxVtables {
                         &mut drop_align,
                         &mut drop_skip,
                         &mut drop_hull,
+                        &mut drop_user,
                     );
 
                     if let Some(sa) = hit {
@@ -356,18 +358,20 @@ impl FindXboxVtables {
                 &mut drop_align,
                 &mut drop_skip,
                 &mut drop_hull,
+                &mut drop_user,
             );
         }
 
         log::info!(
             "FindXboxVtables: emitted {} vtable candidate(s) in {:?} \
-             (dropped: short={} align={} skip={} hull={})",
+             (dropped: short={} align={} skip={} hull={} user={})",
             candidates.len(),
             start_time.elapsed(),
             drop_short,
             drop_align,
             drop_skip,
             drop_hull,
+            drop_user,
         );
 
         Ok(candidates)
@@ -389,6 +393,7 @@ impl FindXboxVtables {
         drop_align: &mut u32,
         drop_skip: &mut u32,
         drop_hull: &mut u32,
+        drop_user: &mut u32,
     ) {
         let run_start_off = match run_start_off {
             Some(o) => o,
@@ -454,6 +459,24 @@ impl FindXboxVtables {
             return;
         }
 
+        // User-symbol overlap exclusion. symbols.txt is authoritative for any
+        // address range it covers; if a user-declared (non-synthetic) symbol
+        // with a known nonzero size overlaps this candidate range, the
+        // heuristic is wrong (it has either found the tail of a longer
+        // user-declared vtable, or a sub-vtable inside a multi-inheritance
+        // table). Emitting a `vftable_<addr>` here would later trip the
+        // splitter's "ends within symbol" check because the synthetic symbol
+        // spans across the next split boundary. Suppress entirely — the
+        // user-declared symbol already covers this region.
+        if Self::overlaps_user_symbol(obj, rdata_addr, cand_end) {
+            *drop_user += 1;
+            log::debug!(
+                "FindXboxVtables: dropping vtable @ {:#010X} (overlaps user-declared symbol)",
+                rdata_addr.address,
+            );
+            return;
+        }
+
         // Optional EH-magic neighborhood probe (informational only).
         let probe_lo = rdata_addr.address.saturating_sub(Self::EH_PROBE_RANGE as u32);
         let probe_hi = rdata_addr.address.saturating_add(Self::EH_PROBE_RANGE as u32);
@@ -504,6 +527,61 @@ impl FindXboxVtables {
             }
         }
         false
+    }
+
+    /// Returns true if any user-declared symbol (i.e. a symbol with a known
+    /// nonzero size that is NOT itself a previously-emitted `vftable_<addr>`
+    /// synthetic) overlaps the candidate's [cand_start, cand_end) range.
+    ///
+    /// Two overlap cases are checked:
+    ///   1. A symbol starts at or after cand_start but before cand_end.
+    ///   2. A symbol starts strictly before cand_start but extends past it.
+    fn overlaps_user_symbol(
+        obj: &ObjInfo,
+        cand_start: SectionAddress,
+        cand_end: SectionAddress,
+    ) -> bool {
+        debug_assert_eq!(cand_start.section, cand_end.section);
+        let section = cand_start.section;
+
+        // Case 1: any symbol with address in [cand_start, cand_end).
+        let any_inside = obj
+            .symbols
+            .for_section_range(section, cand_start.address..cand_end.address)
+            .any(|(_, s)| Self::is_user_object_symbol(s));
+        if any_inside {
+            return true;
+        }
+
+        // Case 2: a symbol that starts strictly before cand_start but whose
+        // size carries it past cand_start (i.e. cand_start lies *inside* an
+        // already-declared symbol). Take the closest preceding symbol.
+        if let Some((_, prev)) = obj
+            .symbols
+            .for_section_range(section, ..cand_start.address)
+            .rfind(|(_, s)| Self::is_user_object_symbol(s))
+        {
+            let prev_end = (prev.address as u32).saturating_add(prev.size as u32);
+            if prev_end > cand_start.address {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A symbol counts as user-declared for overlap purposes if:
+    ///   * it has a known nonzero size (so we can reason about its extent),
+    ///   * it isn't marked stripped (stripped symbols don't bind ranges),
+    ///   * it isn't a synthetic `vftable_<addr>` we'd emit ourselves.
+    ///
+    /// We deliberately accept any kind (Object, Function, Section, etc.):
+    /// if symbols.txt names this range, FindXboxVtables shouldn't
+    /// second-guess it.
+    fn is_user_object_symbol(s: &ObjSymbol) -> bool {
+        s.size_known
+            && s.size > 0
+            && !s.flags.is_stripped()
+            && !s.name.starts_with("vftable_")
     }
 }
 
@@ -646,5 +724,195 @@ impl AnalysisPass for FindRelRodataData {
         config.known_sections.insert(data_section_index, ".data".to_string());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        analysis::cfa::CfaConfig,
+        obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind},
+    };
+
+    fn make_test_obj() -> ObjInfo {
+        // .text @ 0x82000000 .. 0x82000040 — 16 nop instructions (room for
+        // 16 distinct 4-byte function entry points). Function pointers in
+        // the .rdata payload point into here.
+        let text_bytes: Vec<u8> =
+            std::iter::repeat(0x60u8) // 0x60000000 = nop
+                .zip(std::iter::repeat([0x00u8, 0x00, 0x00]))
+                .take(16)
+                .flat_map(|(a, b)| [a, b[0], b[1], b[2]])
+                .collect();
+
+        // .rdata @ 0x82200000 .. 0x82200040 — 16 big-endian u32s, each
+        // pointing at a unique .text address (0x82000000 + i*4). This gives
+        // FindXboxVtables a single 16-pointer "vtable run".
+        let mut rdata_bytes = Vec::with_capacity(0x40);
+        for i in 0..16u32 {
+            let v = 0x8200_0000u32 + i * 4;
+            rdata_bytes.extend_from_slice(&v.to_be_bytes());
+        }
+
+        let sections = vec![
+            ObjSection {
+                name: ".text".into(),
+                kind: ObjSectionKind::Code,
+                address: 0x8200_0000,
+                size: text_bytes.len() as u64,
+                data: text_bytes,
+                align: 4,
+                ..Default::default()
+            },
+            ObjSection {
+                name: ".rdata".into(),
+                kind: ObjSectionKind::ReadOnlyData,
+                address: 0x8220_0000,
+                size: rdata_bytes.len() as u64,
+                data: rdata_bytes,
+                align: 4,
+                ..Default::default()
+            },
+        ];
+
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "vtable-test".into(),
+            vec![],
+            sections,
+        );
+
+        // Mark all 16 .text words as known functions so FindXboxVtables's
+        // "fn pointer points at known_function" check accepts them.
+        let text_idx = 0u32;
+        for i in 0..16u32 {
+            let sa = SectionAddress::new(text_idx, 0x8200_0000 + i * 4);
+            obj.known_functions.insert(sa, Some(4));
+        }
+
+        obj
+    }
+
+    /// Without a user-declared overlapping symbol, the heuristic should
+    /// happily emit a synthetic `vftable_<addr>` for our 16-pointer run.
+    #[test]
+    fn find_xbox_vtables_emits_when_no_user_symbol() {
+        let obj = make_test_obj();
+        let mut config = CfaConfig::default();
+        let candidates =
+            FindXboxVtables::execute_collect(&mut config, &obj).expect("execute_collect");
+        assert_eq!(candidates.len(), 1, "expected 1 emitted candidate");
+        let key = SectionAddress::new(1, 0x8220_0000);
+        assert!(
+            config.known_symbols.get(&key).is_some_and(|v| {
+                v.iter().any(|s| s.name == "vftable_82200000")
+            }),
+            "expected vftable_82200000 in known_symbols",
+        );
+    }
+
+    /// Regression for the DC3 `vftable_8226BC34` false positive: when a
+    /// user-declared symbol already names a slice of the candidate run,
+    /// FindXboxVtables MUST drop the synthetic instead of emitting one that
+    /// would later overlap-collide with the user-declared symbol at split
+    /// time.
+    ///
+    /// Setup mirrors the bug report: the candidate run is 16 pointers
+    /// (0x82200000..0x82200040) and a user-declared object symbol covers
+    /// the *tail* slice 0x82200010..0x82200040. That alone is the trigger
+    /// — but we also test the "candidate starts strictly inside a longer
+    /// preceding user symbol" case.
+    #[test]
+    fn find_xbox_vtables_skips_overlapping_user_symbol() {
+        let mut obj = make_test_obj();
+        obj.add_symbol(
+            ObjSymbol {
+                name: "??_7Foo@@6BBar@@@".into(),
+                address: 0x8220_0010,
+                section: Some(1),
+                size: 0x30,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add user symbol");
+
+        let mut config = CfaConfig::default();
+        let candidates =
+            FindXboxVtables::execute_collect(&mut config, &obj).expect("execute_collect");
+        assert!(
+            candidates.is_empty(),
+            "expected 0 candidates due to user-symbol overlap, got {}",
+            candidates.len(),
+        );
+        let key = SectionAddress::new(1, 0x8220_0000);
+        assert!(
+            config.known_symbols.get(&key).is_none()
+                || !config
+                    .known_symbols
+                    .get(&key)
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.name.starts_with("vftable_")),
+            "no synthetic vftable_<addr> should have been added",
+        );
+    }
+
+    /// The "candidate start lies inside a longer preceding user symbol"
+    /// case: user symbol at 0x82200000 size 0x40 fully covers the run.
+    /// We must drop the synthetic.
+    #[test]
+    fn find_xbox_vtables_skips_when_inside_longer_user_symbol() {
+        let mut obj = make_test_obj();
+        obj.add_symbol(
+            ObjSymbol {
+                name: "??_7Whole@@6B@".into(),
+                address: 0x8220_0000,
+                section: Some(1),
+                size: 0x40,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add user symbol");
+
+        let mut config = CfaConfig::default();
+        let candidates =
+            FindXboxVtables::execute_collect(&mut config, &obj).expect("execute_collect");
+        assert!(candidates.is_empty(), "expected 0 candidates");
+    }
+
+    /// A user symbol with size 0 or marked stripped must NOT block
+    /// emission — these are labels, not range-binding declarations.
+    #[test]
+    fn find_xbox_vtables_ignores_zero_size_or_stripped_user_symbols() {
+        let mut obj = make_test_obj();
+        obj.add_symbol(
+            ObjSymbol {
+                name: "label_inside_vtable".into(),
+                address: 0x8220_0010,
+                section: Some(1),
+                size: 0,
+                size_known: false,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Object,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add label");
+
+        let mut config = CfaConfig::default();
+        let candidates =
+            FindXboxVtables::execute_collect(&mut config, &obj).expect("execute_collect");
+        assert_eq!(candidates.len(), 1, "zero-size label should not block emission");
     }
 }
