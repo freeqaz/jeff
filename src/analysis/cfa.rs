@@ -407,28 +407,26 @@ pub fn apply_cfa(obj: &mut ObjInfo, result: &CfaResult, config: &CfaConfig) -> R
             // entry tricks create_gap_splits's duplicate-name boundary
             // logic into emitting a split at the wrong address, which
             // later trips "Split … ends within symbol …".
-            if let Ok(matches) = obj.symbols.by_name(&symbol.name) {
-                if let Some((stale_idx, stale_sym)) = matches {
-                    if stale_sym.address != symbol.address {
-                        log::warn!(
-                            "Stripping stale duplicate-name symbol {} @ {:#010X} \
-                             (replaced by known_symbol at {:#010X})",
-                            stale_sym.name, stale_sym.address, symbol.address,
-                        );
-                        let renamed = ObjSymbol {
-                            name: format!("__DELETED_{}", stale_sym.name),
-                            kind: ObjSymbolKind::Unknown,
-                            size: 0,
-                            flags: ObjSymbolFlagSet(
-                                ObjSymbolFlags::RelocationIgnore
-                                    | ObjSymbolFlags::NoWrite
-                                    | ObjSymbolFlags::NoExport
-                                    | ObjSymbolFlags::Stripped,
-                            ),
-                            ..stale_sym.clone()
-                        };
-                        obj.symbols.replace(stale_idx, renamed)?;
-                    }
+            if let Ok(Some((stale_idx, stale_sym))) = obj.symbols.by_name(&symbol.name) {
+                if stale_sym.address != symbol.address {
+                    log::warn!(
+                        "Stripping stale duplicate-name symbol {} @ {:#010X} \
+                         (replaced by known_symbol at {:#010X})",
+                        stale_sym.name, stale_sym.address, symbol.address,
+                    );
+                    let renamed = ObjSymbol {
+                        name: format!("__DELETED_{}", stale_sym.name),
+                        kind: ObjSymbolKind::Unknown,
+                        size: 0,
+                        flags: ObjSymbolFlagSet(
+                            ObjSymbolFlags::RelocationIgnore
+                                | ObjSymbolFlags::NoWrite
+                                | ObjSymbolFlags::NoExport
+                                | ObjSymbolFlags::Stripped,
+                        ),
+                        ..stale_sym.clone()
+                    };
+                    obj.symbols.replace(stale_idx, renamed)?;
                 }
             }
             // Remove overlapping symbols
@@ -1094,8 +1092,7 @@ fn check_tail_block(
         if target >= preceding_func_start.address && target < preceding_func_end.address {
             // Scan forward to find the end of this tail block (up to blr or gap_end)
             let mut addr = gap_start;
-            loop {
-                let Some(ins) = disassemble(section, addr.address) else { break };
+            while let Some(ins) = disassemble(section, addr.address) {
                 addr += 4;
                 // blr (unconditional return) or end of gap
                 if ins.op == Opcode::Bclr
@@ -1118,7 +1115,7 @@ fn check_tail_block(
     let mut has_backward_branch = false;
     let mut ends_with_blr = false;
     while addr < gap_end {
-        let Some(ins) = disassemble(section, addr.address) else { return None };
+        let ins = disassemble(section, addr.address)?;
 
         match ins.op {
             // Unconditional or conditional branch (not link)
@@ -1358,7 +1355,7 @@ pub fn locate_sda_bases(obj: &mut ObjInfo) -> Result<bool> {
             obj.add_symbol(
                 ObjSymbol {
                     name: "_SDA2_BASE_".to_string(),
-                    address: sda2_base as u64,
+                    address: sda2_base,
                     size_known: true,
                     flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
                     ..Default::default()
@@ -1368,7 +1365,7 @@ pub fn locate_sda_bases(obj: &mut ObjInfo) -> Result<bool> {
             obj.add_symbol(
                 ObjSymbol {
                     name: "_SDA_BASE_".to_string(),
-                    address: sda_base as u64,
+                    address: sda_base,
                     size_known: true,
                     flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
                     ..Default::default()
