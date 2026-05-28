@@ -254,6 +254,217 @@ fn split(args: SplitArgs) -> Result<()> {
     Ok(())
 }
 
+/// Remove spurious overlapping function symbols left over from CFA speculation
+/// or a stale `symbols.txt` cache.
+///
+/// ## The bug this fixes
+///
+/// dtk's symbol set occasionally contains a "phantom" function symbol whose
+/// `[address, address + size)` range straddles the boundaries of one or more
+/// *real* functions. For example, in RB3's `framing.c` cluster:
+///
+/// ```text
+///   fn_82BF8D80  size 0xE4  -> ogg_page_checksum_set (real leaf, has callers)
+///   fn_82BF8E48  size 0x94  -> PHANTOM: starts inside D80's tail, ends inside EA0
+///   fn_82BF8E68  size 0x34  -> ogg_stream_clear      (real, pdata-anchored)
+///   fn_82BF8EA0  size 0x54  -> ogg_stream_destroy    (real, pdata-anchored)
+/// ```
+///
+/// `write_coff` carves one COFF section per function symbol from the section
+/// bytes. When a phantom overlaps real functions, it captures their bytes into
+/// *its* section and leaves the real functions' COMDAT sections zero-filled.
+/// objdiff then resolves the real symbols to those empty sections and scores
+/// them 0% / all-`<illegal>`. The human-readable asm shows the same corruption
+/// as mis-nested `.fn`/`.endfn` directives.
+///
+/// ## The discriminator
+///
+/// A phantom is identified structurally + semantically. A symbol is pruned only
+/// if ALL of:
+///   1. it is a `Function` symbol in a code section, and
+///   2. its range *overlaps* another function symbol's range, and
+///   3. it is **not** anchored by a `.pdata` unwind entry, and
+///   4. it has **zero incoming references** (no relocation anywhere in the
+///      module targets it — i.e. nothing calls it or takes its address).
+///
+/// The load-bearing gate is condition (2): a *well-formed* function has a
+/// correct size and therefore does not overlap its neighbors at all, so it is
+/// never even a deletion candidate — regardless of whether it is referenced.
+/// Conditions (3) and (4) only decide the fate of symbols that DO overlap:
+/// among the overlapping set, pdata-anchored functions (3) and call/address
+/// targets (4) are kept, leaving only ranges that nothing describes and nothing
+/// references — genuine CFA / stale-cache garbage.
+///
+/// ## Residual false-positive risk (audited, not eliminated)
+///
+/// Conditions (3) and (4) are NOT independently sufficient to protect every
+/// real function. A real function that is *both* (a) mis-sized so its range
+/// bleeds into a neighbor and (b) unreferenced within this module and absent
+/// from `.pdata` would be pruned. The plausible carriers of that combination
+/// are tail-call `b` thunks, vtable-/indirect-call-only entries, and XEX
+/// exports (referenced from outside the module). This is believed rare — a
+/// correctly-sized symbol can't trip condition (2) — but it is not provably
+/// impossible. Therefore every prune is emitted to the log at `info` with its
+/// name, address, size, and the address it overlaps, so a regression in a
+/// pinned unit can be traced back to a specific stripped symbol by grepping the
+/// split log rather than guessing. Treat an unexpected match regression after a
+/// jeff bump as "grep the log for `Pruning phantom`" first.
+///
+/// Pruned symbols are renamed to `__DELETED_<name>` with the same stripped
+/// flags the CFA tail-block / stale-duplicate logic uses (see
+/// `analysis::cfa::apply_cfa`), so downstream `split_obj` / `write_coff` ignore
+/// them without re-indexing the symbol table.
+fn prune_overlapping_phantom_functions(obj: &mut ObjInfo) {
+    use std::collections::BTreeSet;
+
+    // (1) Collect every address that is the target of some relocation. These
+    //     are the "referenced" function entry points (call targets, address
+    //     taken, vtable slots, etc.). We resolve each reloc's target symbol to
+    //     its (section, address) so a phantom that merely shares a name can't
+    //     be mistaken for referenced.
+    let mut referenced: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    let symbol_count = obj.symbols.count();
+    for (_sec_idx, section) in obj.sections.iter() {
+        for (_addr, reloc) in section.relocations.iter() {
+            if reloc.target_symbol >= symbol_count {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            if let Some(tsec) = tsym.section {
+                referenced.insert((tsec, tsym.address));
+            }
+        }
+    }
+
+    // (2) pdata-anchored entry points (authoritative function bounds).
+    let mut pdata_anchored: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    for sa in &obj.pdata_funcs {
+        pdata_anchored.insert((sa.section, sa.address as u64));
+    }
+
+    // (3) Build the per-section sorted list of function symbols so we can find
+    //     overlaps. (index, address, end).
+    let mut by_section: BTreeMap<SectionIndex, Vec<(SymbolIndex, u64, u64)>> = BTreeMap::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if sym.kind != ObjSymbolKind::Function || sym.size == 0 {
+            continue;
+        }
+        let Some(sec_idx) = sym.section else { continue };
+        // Only code sections have COMDAT-carved functions.
+        if !matches!(obj.sections.get(sec_idx), Some(s) if s.kind == ObjSectionKind::Code) {
+            continue;
+        }
+        by_section.entry(sec_idx).or_default().push((idx, sym.address, sym.address + sym.size));
+    }
+
+    // (4) Within each section, flag function symbols that overlap another
+    //     function and are neither pdata-anchored nor referenced.
+    //     `overlapping_function_intervals` does the linear overlap sweep (see
+    //     its doc comment); here we apply the pdata/reference protections.
+    let mut to_delete: Vec<(SymbolIndex, u64)> = Vec::new();
+    for (sec_idx, mut funcs) in by_section {
+        funcs.sort_by_key(|&(_, addr, _)| addr);
+        for (i, overlap_addr) in overlapping_function_intervals(&funcs) {
+            let (idx, addr, _end) = funcs[i];
+            let key = (sec_idx, addr);
+            if pdata_anchored.contains(&key) || referenced.contains(&key) {
+                continue; // protected: real function
+            }
+            to_delete.push((idx, overlap_addr));
+        }
+    }
+
+    if to_delete.is_empty() {
+        return;
+    }
+
+    for &(idx, overlap_addr) in &to_delete {
+        // Clone first to avoid holding an immutable borrow across the replace.
+        let existing = obj.symbols[idx].clone();
+        // Audit log: every prune is recorded at `info` with address/size/overlap
+        // so the rare false-positive class (a real but module-unreferenced
+        // function — tail-call `b` thunk, vtable-/indirect-only entry, XEX
+        // export — that is also mis-sized into a neighbor) is greppable instead
+        // of being silently deleted. If a pinned unit regresses after a jeff
+        // bump, grep the split log for these lines first.
+        log::info!(
+            "Pruning phantom function symbol {} @ {:#010x} (size {:#x}); overlaps function @ {:#010x}",
+            existing.name,
+            existing.address,
+            existing.size,
+            overlap_addr
+        );
+        let stripped = ObjSymbol {
+            name: format!("__DELETED_{}", existing.name),
+            kind: ObjSymbolKind::Unknown,
+            size: 0,
+            flags: ObjSymbolFlagSet(
+                ObjSymbolFlags::RelocationIgnore
+                    | ObjSymbolFlags::NoWrite
+                    | ObjSymbolFlags::NoExport
+                    | ObjSymbolFlags::Stripped,
+            ),
+            ..existing
+        };
+        if let Err(e) = obj.symbols.replace(idx, stripped) {
+            log::warn!("Failed to strip phantom function symbol #{idx}: {e:#}");
+        }
+    }
+    log::info!(
+        "Pruned {} spurious overlapping function symbol(s) (unreferenced, no pdata anchor)",
+        to_delete.len()
+    );
+}
+
+/// Find every function interval that overlaps at least one other, returning
+/// `(index_into_funcs, representative_overlapped_start_addr)` for each.
+///
+/// `funcs` is `(symbol_index, start, end)` and MUST be sorted ascending by
+/// `start`. The overlap predicate is half-open-interval intersection,
+/// `start_i < end_j && start_j < end_i`. A naive all-pairs `any()` is O(n^2),
+/// and the full-module split puts ~66k functions in a single `.text` section
+/// (~4.4 billion comparisons). Because `funcs` is sorted by start, an interval
+/// overlaps some other interval iff EITHER:
+///   - some strictly-earlier interval's end reaches past its start — tracked by
+///     `prefix_max_end`, the running max end over funcs[0..i]. This is the case
+///     that catches a large phantom swallowing the functions after it; their
+///     immediate predecessor may be tiny, so a neighbor-only check is NOT
+///     enough — the running max is required. OR
+///   - the immediately-following interval starts before this one ends — the
+///     next interval has the smallest start of all later ones, so if it does
+///     not intersect, none do.
+///
+/// This is exactly equivalent to the all-pairs test, but linear after the sort
+/// (asserted against a brute-force reference in the unit tests below). The
+/// returned address is a representative overlapped neighbor, used only for the
+/// audit log.
+fn overlapping_function_intervals(funcs: &[(SymbolIndex, u64, u64)]) -> Vec<(usize, u64)> {
+    let mut out: Vec<(usize, u64)> = Vec::new();
+    let mut prefix_max_end: u64 = 0;
+    let mut prefix_max_addr: u64 = 0; // start of the function owning prefix_max_end
+    let mut have_prefix = false;
+    for i in 0..funcs.len() {
+        let (_, addr, end) = funcs[i];
+        // Evaluate overlap against the prefix BEFORE folding funcs[i] into it.
+        let overlaps_earlier = have_prefix && prefix_max_end > addr;
+        let earlier_addr = prefix_max_addr; // meaningful only if overlaps_earlier
+        let next_overlap_addr =
+            funcs.get(i + 1).filter(|&&(_, n_addr, _)| n_addr < end).map(|&(_, n_addr, _)| n_addr);
+        // Extend the running prefix max to include funcs[i] for later iters.
+        if !have_prefix || end > prefix_max_end {
+            prefix_max_end = end;
+            prefix_max_addr = addr;
+            have_prefix = true;
+        }
+        if overlaps_earlier {
+            out.push((i, earlier_addr));
+        } else if let Some(n_addr) = next_overlap_addr {
+            out.push((i, n_addr));
+        }
+    }
+    out
+}
+
 fn split_write_obj_exe(
     module: &mut ExeModuleInfo,
     config: &ProjectConfig,
@@ -265,6 +476,13 @@ fn split_write_obj_exe(
 
     debug!("Applying relocations");
     tracker.apply(&mut module.obj, false)?;
+
+    // Prune spurious overlapping function symbols (CFA / stale-symbols.txt
+    // phantoms). Must run AFTER tracker.apply (so every real reference has been
+    // resolved to a target symbol) and BEFORE write_symbols_file / split_obj /
+    // write_coff (so the phantom is gone from the committed symbols.txt cache
+    // and never captures a real function's bytes into its own COMDAT section).
+    prune_overlapping_phantom_functions(&mut module.obj);
 
     if !config.symbols_known && config.detect_objects {
         debug!("Detecting object boundaries");
@@ -1116,4 +1334,120 @@ fn info(args: InfoArgs) -> Result<()> {
     list_exe_sections(&PeFile32::parse(&*xex.exe_bytes).expect("Failed to parse object file"));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overlapping_function_intervals;
+
+    /// O(n^2) reference oracle: an interval overlaps if it half-open-intersects
+    /// any *other* interval. Returns the sorted set of overlapping indices.
+    fn brute_overlap_indices(funcs: &[(u32, u64, u64)]) -> Vec<usize> {
+        let mut v = Vec::new();
+        for i in 0..funcs.len() {
+            let (_, a, e) = funcs[i];
+            let hit = funcs.iter().enumerate().any(|(j, &(_, oa, oe))| j != i && a < oe && oa < e);
+            if hit {
+                v.push(i);
+            }
+        }
+        v
+    }
+
+    /// Run the linear sweep on an already-sorted slice, return just the indices.
+    fn linear_overlap_indices(funcs: &[(u32, u64, u64)]) -> Vec<usize> {
+        let mut idxs: Vec<usize> =
+            overlapping_function_intervals(funcs).into_iter().map(|(i, _)| i).collect();
+        idxs.sort_unstable();
+        idxs
+    }
+
+    #[test]
+    fn canonical_phantom_cluster() {
+        // framing.c cluster from the docstring: D80 real (0xE4), E48 PHANTOM
+        // (0x94, swallows the E68/EA0 tails), E68 real (0x34), EA0 real (0x54).
+        // Every member overlaps the phantom, so the sweep flags all four; the
+        // pdata/reference protections (applied by the caller, not here) then
+        // keep the three real ones and delete only E48.
+        let mut funcs = vec![
+            (0u32, 0x82BF8D80u64, 0x82BF8D80 + 0xE4),
+            (1u32, 0x82BF8E48, 0x82BF8E48 + 0x94),
+            (2u32, 0x82BF8E68, 0x82BF8E68 + 0x34),
+            (3u32, 0x82BF8EA0, 0x82BF8EA0 + 0x54),
+        ];
+        funcs.sort_by_key(|&(_, a, _)| a);
+        assert_eq!(linear_overlap_indices(&funcs), brute_overlap_indices(&funcs));
+        assert_eq!(linear_overlap_indices(&funcs), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn disjoint_functions_flag_nothing() {
+        let mut funcs =
+            vec![(0u32, 0x1000u64, 0x1010), (1u32, 0x1010, 0x1020), (2u32, 0x1020, 0x1030)];
+        funcs.sort_by_key(|&(_, a, _)| a);
+        assert!(linear_overlap_indices(&funcs).is_empty());
+        assert!(overlapping_function_intervals(&funcs).is_empty());
+    }
+
+    #[test]
+    fn phantom_behind_a_tiny_disjoint_neighbor_is_still_caught() {
+        // The phantom A=[0x100,0x300) is the FIRST interval; C=[0x120,0x128)
+        // sits inside A but its immediate predecessor B=[0x110,0x118) is tiny
+        // and disjoint from C. A backward neighbor-only check would miss that C
+        // overlaps A; the running-max-end catches it. Guards the design choice.
+        let mut funcs = vec![
+            (0u32, 0x100u64, 0x300), // big phantom
+            (1u32, 0x110, 0x118),    // tiny, inside A
+            (2u32, 0x120, 0x128),    // tiny, inside A, disjoint from B
+        ];
+        funcs.sort_by_key(|&(_, a, _)| a);
+        assert_eq!(linear_overlap_indices(&funcs), vec![0, 1, 2]);
+        assert_eq!(linear_overlap_indices(&funcs), brute_overlap_indices(&funcs));
+    }
+
+    #[test]
+    fn duplicate_start_addresses_overlap() {
+        // Two symbols sharing a start (stale-cache duplicate) overlap each other.
+        let mut funcs = vec![(0u32, 0x200u64, 0x210), (1u32, 0x200, 0x208)];
+        funcs.sort_by_key(|&(_, a, _)| a);
+        assert_eq!(linear_overlap_indices(&funcs), vec![0, 1]);
+        assert_eq!(linear_overlap_indices(&funcs), brute_overlap_indices(&funcs));
+    }
+
+    #[test]
+    fn linear_sweep_matches_brute_force_over_many_cases() {
+        // Deterministic LCG (no rng dep). Tight address range forces frequent
+        // overlaps, ties, nesting, and chains — the cases the linear sweep must
+        // get exactly right vs the O(n^2) oracle.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for _ in 0..5000 {
+            let n = (next() % 12) as usize;
+            let mut funcs: Vec<(u32, u64, u64)> = Vec::with_capacity(n);
+            for k in 0..n {
+                let start = next() % 16; // tight range → frequent overlaps & ties
+                let size = 1 + next() % 6; // nonzero (matches the size==0 prefilter)
+                funcs.push((k as u32, start, start + size));
+            }
+            funcs.sort_by_key(|&(_, a, _)| a);
+
+            let swept = overlapping_function_intervals(&funcs);
+            let mut linear: Vec<usize> = swept.iter().map(|&(i, _)| i).collect();
+            linear.sort_unstable();
+            assert_eq!(linear, brute_overlap_indices(&funcs), "indices mismatch: {funcs:?}");
+
+            // The representative overlap address must be a real overlapping neighbor.
+            for &(i, oa) in &swept {
+                let (_, a, e) = funcs[i];
+                let ok = funcs
+                    .iter()
+                    .enumerate()
+                    .any(|(j, &(_, oa2, oe2))| j != i && oa2 == oa && a < oe2 && oa2 < e);
+                assert!(ok, "reported overlap addr {oa:#x} for index {i} is bogus: {funcs:?}");
+            }
+        }
+    }
 }
