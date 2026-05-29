@@ -314,6 +314,129 @@ fn split(args: SplitArgs) -> Result<()> {
 /// flags the CFA tail-block / stale-duplicate logic uses (see
 /// `analysis::cfa::apply_cfa`), so downstream `split_obj` / `write_coff` ignore
 /// them without re-indexing the symbol table.
+/// Clamp oversized function symbols down to their authoritative length before
+/// pruning runs.
+///
+/// ## The bug this fixes
+///
+/// CFA / a stale `symbols.txt` cache frequently records a function symbol whose
+/// `size` is LARGER than the function's true length, so its
+/// `[address, address + size)` range straddles one or more *real* neighbor
+/// functions. `write_coff` carves one COFF section per function symbol from the
+/// section bytes; an oversized symbol captures its neighbors' bytes into *its*
+/// section, leaving the real neighbors' COMDAT sections starved. objdiff then
+/// scores those neighbors 0% / all-`<illegal>`. This is the same corruption the
+/// phantom prune addresses, except here the oversized symbol is itself a real,
+/// pdata-anchored or referenced function — the prune correctly spares it, so it
+/// stays oversized and keeps clobbering its neighbors.
+///
+/// The downstream pin-ranker (`tools/pin_candidates.py`) additionally refuses
+/// any pin span that touches an overlap region, so every oversized symbol
+/// poisons whole TUs for pinning, not just the immediate neighbor.
+///
+/// ## The two authoritative length oracles
+///
+/// 1. `.pdata` (`obj.known_functions`) gives the EXACT length of every
+///    pdata-anchored function. A pdata-anchored symbol sized larger than its
+///    `.pdata` length is unambiguously wrong; we clamp it to the `.pdata`
+///    length. This is provably safe — the `.pdata` table is a clean partition
+///    of `.text`: no entry's `[start, start+len)` ever overruns the next entry's
+///    start (verified across all 56,836 RB3 `.text` entries).
+///
+/// 2. For a NON-pdata-anchored function symbol that straddles a pdata-anchored
+///    neighbor's start, the next pdata start is a hard function boundary the
+///    symbol cannot legitimately cross (it would mean two real functions share
+///    one symbol). We clamp such a symbol to end exactly at the first
+///    pdata-anchored start it would otherwise swallow. These symbols are CFA
+///    artifacts (their first instruction is padding / a mid-function branch
+///    target, not a prologue); clamping restores the real boundary without
+///    deleting the referenced entry the prune must keep.
+///
+/// Neither clamp ever *grows* a symbol or touches a correctly-sized one, so it
+/// can only shrink genuine overruns. Every clamp is logged at `info` for audit,
+/// mirroring the prune's policy.
+fn clamp_oversized_function_symbols(obj: &mut ObjInfo) {
+    use std::collections::BTreeMap as StdBTreeMap;
+
+    // (1) Per code section, the sorted list of pdata-anchored function starts
+    //     (a hard boundary set) and the exact length of each.
+    let mut pdata_starts: StdBTreeMap<SectionIndex, Vec<u64>> = StdBTreeMap::new();
+    let mut pdata_len: StdBTreeMap<(SectionIndex, u64), u32> = StdBTreeMap::new();
+    for (sa, &len) in &obj.known_functions {
+        // known_functions also holds import-thunk entries with no length; only
+        // .pdata entries carry an authoritative Some(len). A None entry still
+        // marks a real boundary, so record the start either way.
+        pdata_starts.entry(sa.section).or_default().push(sa.address as u64);
+        if let Some(l) = len {
+            pdata_len.insert((sa.section, sa.address as u64), l);
+        }
+    }
+    for v in pdata_starts.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+
+    // (2) Decide the clamped size for every oversized function symbol.
+    //     to_clamp: (symbol_index, old_size, new_size, reason).
+    let mut to_clamp: Vec<(SymbolIndex, u64, u64, &'static str)> = Vec::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if sym.kind != ObjSymbolKind::Function || sym.size == 0 {
+            continue;
+        }
+        let Some(sec_idx) = sym.section else { continue };
+        if !matches!(obj.sections.get(sec_idx), Some(s) if s.kind == ObjSectionKind::Code) {
+            continue;
+        }
+        let addr = sym.address;
+        let end = addr + sym.size;
+
+        // (2a) pdata-anchored and oversized -> clamp to the exact pdata length.
+        if let Some(&len) = pdata_len.get(&(sec_idx, addr)) {
+            if sym.size > len as u64 {
+                to_clamp.push((idx, sym.size, len as u64, "pdata-length"));
+                continue;
+            }
+        }
+
+        // (2b) not pdata-anchored but straddles a pdata-anchored start ->
+        //      clamp to end exactly at the first such start.
+        if let Some(starts) = pdata_starts.get(&sec_idx) {
+            // first pdata start strictly greater than addr
+            let pos = starts.partition_point(|&s| s <= addr);
+            if pos < starts.len() {
+                let next_start = starts[pos];
+                if next_start < end {
+                    to_clamp.push((idx, sym.size, next_start - addr, "next-pdata-boundary"));
+                }
+            }
+        }
+    }
+
+    if to_clamp.is_empty() {
+        return;
+    }
+
+    for &(idx, old_size, new_size, reason) in &to_clamp {
+        let existing = obj.symbols[idx].clone();
+        log::info!(
+            "Clamping oversized function symbol {} @ {:#010x} {:#x} -> {:#x} ({})",
+            existing.name,
+            existing.address,
+            old_size,
+            new_size,
+            reason
+        );
+        let resized = ObjSymbol { size: new_size, size_known: true, ..existing };
+        if let Err(e) = obj.symbols.replace(idx, resized) {
+            log::warn!("Failed to clamp oversized function symbol #{idx}: {e:#}");
+        }
+    }
+    log::info!(
+        "Clamped {} oversized function symbol(s) to their authoritative length",
+        to_clamp.len()
+    );
+}
+
 fn prune_overlapping_phantom_functions(obj: &mut ObjInfo) {
     use std::collections::BTreeSet;
 
@@ -482,6 +605,13 @@ fn split_write_obj_exe(
     // resolved to a target symbol) and BEFORE write_symbols_file / split_obj /
     // write_coff (so the phantom is gone from the committed symbols.txt cache
     // and never captures a real function's bytes into its own COMDAT section).
+    //
+    // First clamp oversized-but-real function symbols (pdata-anchored or
+    // referenced) down to their authoritative length. These survive the prune
+    // by design (they are real), so without the clamp they keep straddling and
+    // starving their neighbors' COMDAT sections. Clamping also collapses the
+    // residual symbols.txt overlap regions that block the pin-ranker.
+    clamp_oversized_function_symbols(&mut module.obj);
     prune_overlapping_phantom_functions(&mut module.obj);
 
     if !config.symbols_known && config.detect_objects {
