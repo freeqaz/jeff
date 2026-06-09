@@ -16,6 +16,7 @@ use object::{
 use typed_path::Utf8NativePathBuf;
 
 use crate::{
+    analysis::objects::detect_strings,
     obj::ObjKind,
     util::{
         IntoCow, ToCow,
@@ -131,7 +132,13 @@ fn config(args: ConfigArgs) -> Result<()> {
 
 fn disasm(args: DisasmArgs) -> Result<()> {
     log::info!("Loading {}", args.elf_file);
-    let obj = process_elf(&args.elf_file)?;
+    let mut obj = process_elf(&args.elf_file)?;
+    // Detect string-pool symbols (@stringBase*) and other string data so that a
+    // relocatable .o is disassembled with `.string` literals, matching how the
+    // executable `dol split` path (which always runs detect_strings) renders the
+    // same rodata. Without this, string-pool bytes come out as raw `.4byte`
+    // words on the .o side, which desymmetrizes downstream m2c output.
+    detect_strings(&mut obj)?;
     match obj.kind {
         ObjKind::Executable => {
             log::info!("Splitting {} objects", obj.link_order.len());
