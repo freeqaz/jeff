@@ -363,9 +363,65 @@ fn clamp_oversized_function_symbols(obj: &mut ObjInfo) {
     let mut pdata_starts: StdBTreeMap<SectionIndex, Vec<u64>> = StdBTreeMap::new();
     let mut pdata_len: StdBTreeMap<(SectionIndex, u64), u32> = StdBTreeMap::new();
     for (sa, &len) in &obj.known_functions {
-        // known_functions also holds import-thunk entries with no length; only
-        // .pdata entries carry an authoritative Some(len). A None entry still
-        // marks a real boundary, so record the start either way.
+        pdata_starts.entry(sa.section).or_default().push(sa.address as u64);
+        if let Some(l) = len {
+            pdata_len.insert((sa.section, sa.address as u64), l);
+        }
+    }
+    for v in pdata_starts.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    clamp_oversized_function_symbols_inner(obj, &pdata_starts, &pdata_len)
+}
+
+/// Grow an UNDERSIZED pdata-anchored function symbol up to its authoritative
+/// `.pdata` length. This is the mirror image of the clamp pass and fixes the
+/// "funclet truncation" / premature-`.endfn` class of bug.
+///
+/// ## The bug this fixes (truncation mode 1: stale-size, NOT mis-decode)
+///
+/// A stale `symbols.txt` cache (or a too-short CFA boundary that an earlier
+/// split persisted) records a function symbol whose `size` is SMALLER than the
+/// function's true `.pdata` length. When the split re-runs, CFA recomputes the
+/// correct (larger) size, but `Symbols::add` keeps the existing too-small size
+/// whenever both sizes are `size_known` and `replace` is false
+/// (`src/obj/symbols.rs` — `existing.size` wins). So the cached truncation is
+/// self-perpetuating. `write_coff` then carves a COFF section of only the
+/// truncated length: objdiff compares our full compiled body against the
+/// short stub bytes and scores a FALSE 0%, and the orphan tail (plus the
+/// binary tail) is lost.
+///
+/// Examples: GemTrack::See @0x82B63200 (pdata length 0x64, cached at 0x28),
+/// the Award ctor (truncated at 0x28 before its unwind record), LicenseMgr.
+///
+/// ## Why `.pdata` length is the right, overlap-safe oracle
+///
+/// `.pdata` (`obj.known_functions`) gives the EXACT length of every
+/// pdata-anchored function, and the `.pdata` table is a clean partition of
+/// `.text`: no entry's `[start, start + len)` ever overruns the next entry's
+/// start (verified across all 56,836 RB3 `.text` entries). Therefore growing a
+/// pdata-anchored symbol to exactly its `.pdata` length can never make it
+/// straddle the next pdata-anchored start. We additionally cap the grown size
+/// at the next pdata start as a belt-and-suspenders no-op (it would only fire
+/// on a malformed `.pdata`), so the pass is provably overlap-safe.
+///
+/// This pass only ever GROWS a symbol that is strictly shorter than its
+/// authoritative `.pdata` length, and never touches a correctly-sized or
+/// oversized one (the clamp pass handles oversized). It runs BEFORE the clamp
+/// so the clamp's invariant (no overlaps remain) still holds afterward. Every
+/// grow is logged at `info` for audit, mirroring the clamp/prune policy.
+///
+/// This fixes truncation mode 1 (stale/short size) only. Mode 2 — an
+/// `except_data` mis-decode that drops the real `.pdata` entry entirely — is a
+/// different defect not addressed here.
+fn grow_undersized_function_symbols(obj: &mut ObjInfo) {
+    use std::collections::BTreeMap as StdBTreeMap;
+
+    // (1) Per code section, pdata starts (sorted) + the exact length of each.
+    let mut pdata_starts: StdBTreeMap<SectionIndex, Vec<u64>> = StdBTreeMap::new();
+    let mut pdata_len: StdBTreeMap<(SectionIndex, u64), u32> = StdBTreeMap::new();
+    for (sa, &len) in &obj.known_functions {
         pdata_starts.entry(sa.section).or_default().push(sa.address as u64);
         if let Some(l) = len {
             pdata_len.insert((sa.section, sa.address as u64), l);
@@ -376,6 +432,70 @@ fn clamp_oversized_function_symbols(obj: &mut ObjInfo) {
         v.dedup();
     }
 
+    // (2) Decide the grown size for every undersized pdata-anchored symbol.
+    //     to_grow: (symbol_index, old_size, new_size).
+    let mut to_grow: Vec<(SymbolIndex, u64, u64)> = Vec::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if sym.kind != ObjSymbolKind::Function {
+            continue;
+        }
+        let Some(sec_idx) = sym.section else { continue };
+        if !matches!(obj.sections.get(sec_idx), Some(s) if s.kind == ObjSectionKind::Code) {
+            continue;
+        }
+        let addr = sym.address;
+        // Only pdata-anchored symbols have an authoritative length oracle.
+        let Some(&len) = pdata_len.get(&(sec_idx, addr)) else { continue };
+        let len = len as u64;
+        if sym.size >= len {
+            continue; // correctly sized or oversized (clamp's job)
+        }
+        // Belt-and-suspenders: never let the grown end cross the next
+        // pdata-anchored start. On a clean partition this never binds.
+        let mut new_size = len;
+        if let Some(starts) = pdata_starts.get(&sec_idx) {
+            let pos = starts.partition_point(|&s| s <= addr);
+            if pos < starts.len() {
+                let next_start = starts[pos];
+                if addr + new_size > next_start {
+                    new_size = next_start - addr;
+                }
+            }
+        }
+        if new_size > sym.size {
+            to_grow.push((idx, sym.size, new_size));
+        }
+    }
+
+    if to_grow.is_empty() {
+        return;
+    }
+
+    for &(idx, old_size, new_size) in &to_grow {
+        let existing = obj.symbols[idx].clone();
+        log::info!(
+            "Growing undersized function symbol {} @ {:#010x} {:#x} -> {:#x} (pdata-length)",
+            existing.name,
+            existing.address,
+            old_size,
+            new_size
+        );
+        let resized = ObjSymbol { size: new_size, size_known: true, ..existing };
+        if let Err(e) = obj.symbols.replace(idx, resized) {
+            log::warn!("Failed to grow undersized function symbol #{idx}: {e:#}");
+        }
+    }
+    log::info!(
+        "Grew {} undersized pdata-anchored function symbol(s) to their authoritative length",
+        to_grow.len()
+    );
+}
+
+fn clamp_oversized_function_symbols_inner(
+    obj: &mut ObjInfo,
+    pdata_starts: &std::collections::BTreeMap<SectionIndex, Vec<u64>>,
+    pdata_len: &std::collections::BTreeMap<(SectionIndex, u64), u32>,
+) {
     // (2) Decide the clamped size for every oversized function symbol.
     //     to_clamp: (symbol_index, old_size, new_size, reason).
     let mut to_clamp: Vec<(SymbolIndex, u64, u64, &'static str)> = Vec::new();
@@ -611,6 +731,17 @@ fn split_write_obj_exe(
     // by design (they are real), so without the clamp they keep straddling and
     // starving their neighbors' COMDAT sections. Clamping also collapses the
     // residual symbols.txt overlap regions that block the pin-ranker.
+    //
+    // BEFORE the clamp, grow UNDERSIZED pdata-anchored symbols up to their
+    // authoritative .pdata length. This fixes the "funclet truncation" /
+    // premature-.endfn bug (e.g. GemTrack::See, Award ctor): a stale symbols.txt
+    // size that is shorter than the function's true pdata length is otherwise
+    // self-perpetuating (Symbols::add keeps the existing short size). Growing to
+    // the pdata length is overlap-safe (pdata is a clean partition) and a no-op
+    // on correctly-sized functions, so it can only ever lengthen a truncated
+    // stub back to its real bounds. Run before the clamp so the clamp's
+    // no-overlap invariant still holds.
+    grow_undersized_function_symbols(&mut module.obj);
     clamp_oversized_function_symbols(&mut module.obj);
     prune_overlapping_phantom_functions(&mut module.obj);
 
