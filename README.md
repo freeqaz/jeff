@@ -1,5 +1,33 @@
 # jeff (freeqaz fork)
 
+## freeqaz fork
+
+This is a fork of [rjkiv/jeff](https://github.com/rjkiv/jeff), maintained as part of the
+[milohax](https://github.com/milohax) Dance Central 3 / Rock Band 3 decompilation work. It
+tracks rjkiv/jeff and layers on additional fixes and features needed for those projects.
+
+Thematic summary of what has changed here since diverging from rjkiv/jeff (133 commits):
+
+- **XEX/COFF split robustness** — numerous fixes to function-symbol bounds (oversized/undersized
+  clamping, phantom-overlap pruning, funclet-truncation growth), jump-table handling (crash fixes,
+  bounds inflation, absolute tables in `.rdata`), tail-block detection/merging, CRT/REL section
+  handling, and a new `FindXboxVtables` MSVC C++ vtable-detection pass wired into the split/disasm
+  pipelines, so `xex split` runs end-to-end on real RB3 retail XEX images.
+- **CFA (control-flow-analysis) rewrite** — a multi-phase "vm2" rearchitecture (phases r1-r7)
+  introducing a shadow/candidate pipeline with native opcode coverage, telemetry, and
+  promotion/parity gates, eventually promoting the candidate/native path to default and replacing
+  the legacy shadow VM.
+- **CFA test suite** — ~20 hand-built CFA tests plus matching m2c/Ghidra decompiled reference
+  output and disassembly fixtures, along with cutover/parity workflow scripts
+  (`scripts/dc3_cfa_parity_smoke.sh`, `scripts/cfa_cutover_gate.sh`, `scripts/xex_info_mode_matrix.sh`).
+- **DWARF/debug-info and linking fixes** — demangling, nested struct/enum support, enum-size
+  accounting, ICF-merged symbol naming, and assorted DTK linking fixes (section merge, jump-table
+  scoping, COFF symbol class fixes).
+- **Misc hardening** — REL/RELs relocation edge cases, Wii Menu (BootStage) DOL loading support,
+  clippy/cargo-deny cleanup, dependency bumps, and routine upstream version bumps (1.7.1 → 1.9.2).
+
+The canonical push target for this fork is [freeqaz/jeff](https://github.com/freeqaz/jeff) (`main`).
+
 > **This is a fork of [rjkiv/jeff](https://github.com/rjkiv/jeff)** with additional fixes and features for the [Dance Central 3 decomp](https://github.com/milohax/dc3-decomp). It stays in sync with upstream and is available as a drop-in replacement.
 
 ## Fork additions
