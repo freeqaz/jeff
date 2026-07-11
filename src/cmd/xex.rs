@@ -25,6 +25,7 @@ use crate::{
         cfa::{CfaConfig, SectionAddress, run_cfa, apply_cfa},
         objects::{detect_objects, detect_strings},
         pass::{AnalysisPass, FindSaveRestSledsXbox, FindXboxVtables, VtableCandidate},
+        read_u32,
         tracker::Tracker,
     },
     cmd::dol::{
@@ -32,13 +33,16 @@ use crate::{
         OutputUnit, ProjectConfig,
     },
     obj::{
-        best_match_for_reloc, ObjInfo, ObjKind, ObjRelocKind, ObjSectionKind, ObjSections,
-        ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope, SectionIndex,
-        SymbolIndex,
+        best_match_for_reloc, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSectionKind,
+        ObjSections, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
+        SectionIndex, SymbolIndex,
     },
     util::{
         asm::write_asm,
-        config::{apply_splits_file, apply_symbols_file, write_splits_file, write_symbols_file},
+        config::{
+            apply_splits_file, apply_symbols_file, create_auto_symbol_name, write_splits_file,
+            write_symbols_file,
+        },
         dep::DepFile,
         file::{buf_writer, FileReadInfo},
         map_exe::{apply_map_file_exe, is_reg_intrinsic, process_map_exe},
@@ -557,6 +561,373 @@ fn clamp_oversized_function_symbols_inner(
     );
 }
 
+/// True if `word` (a big-endian PowerPC instruction) unconditionally ends
+/// fall-through control flow — nothing after it is reachable without an
+/// explicit branch/call into it. Used to prove that the instruction *following*
+/// such a word begins a fresh flow unit, which — combined with that address
+/// being a relocation target — proves a leaf function entry.
+fn is_hard_flow_terminator(word: u32) -> bool {
+    // blr / blrl / bctr / bctrl (unconditional bclr/bcctr, BO=20, LK 0 or 1).
+    if matches!(word, 0x4E80_0020 | 0x4E80_0021 | 0x4E80_0420 | 0x4E80_0421) {
+        return true;
+    }
+    // Unconditional branch `b`/`ba` (primary opcode 18) with LK=0 — a tail call
+    // or goto, NOT a `bl` call (LK=1). A `bl` falls through to its return site.
+    if (word >> 26) == 18 && (word & 1) == 0 {
+        return true;
+    }
+    // Zeroed inter-function padding (dtk emits `.4byte 0 /* invalid */` between
+    // functions); the address after padding starts the next function.
+    word == 0
+}
+
+/// Synthesize `.fn` function symbols for PDATA-less leaf functions (tiny getters
+/// `lbz`/`blr`, bool-materialize `cntlzw`/`extrwi` idioms, this-adjusting
+/// thunks) that are PROVEN function entries but that CFA either
+///
+///   (a) absorbed into an oversized non-pdata neighbor — the leaf is referenced
+///       from a vtable / data pointer / call as `parent + addend`, because the
+///       parent symbol swallowed it (e.g. TrackPanel's `PushCrowdReaction`
+///       @0x82B5EA00 declared 0x90 while its real body ends at 0x82B5EA50,
+///       swallowing the three virtual getters at +0x50/+0x68/+0x80 that the
+///       vtable references as `fn_82B5EA00+0x50` &c.), or
+///
+///   (b) emitted as a bare data label (`lbl_<addr>`) sitting in the gap between
+///       two functions — the reloc target resolved to a fresh label instead of a
+///       function (e.g. TrackPanel's `AutoVocals` @0x82B60D80 = `lbz r3,0xA1(r3);
+///       blr`, referenced by the vtable but rendered `.sym lbl_82B60D80`).
+///
+/// Both leave objdiff unable to pair the leaf and the target-symbol renamer
+/// unable to name it, capping matches fleet-wide (see the closeout33/t3 report).
+///
+/// ## Why this is safe (proof-of-entry + terminator + pdata partition)
+///
+/// A candidate address `T` is synthesized ONLY when ALL of:
+///   1. `T` is the effective target (`target_symbol.address + addend`) of a
+///      relocation whose SOURCE lives in a DATA section (a vtable slot or other
+///      function-pointer table) and is not inside a jump table (those point to
+///      internal case blocks, not separate functions). A data-section function
+///      pointer proves `T` is a real entry AND that `T` is reached only
+///      indirectly — it has no internal control-flow back-edge into a
+///      neighbor, so clamping its absorbing parent is safe. We deliberately do
+///      NOT act on code-section `bl`/branch targets: those are CFA's job, and a
+///      `bl` target CFA merged as a tail block (shared-loop multi-entry helper)
+///      would be re-merged on the next re-split, so un-merging it here would
+///      break split idempotency.
+///   2. `T` is not already a `.fn` start.
+///   3. The word at `T-4` is a hard flow terminator (`blr`/`bctr`/`b`/padding),
+///      so `T` cannot be reached by fall-through: it is a genuine new unit.
+///   4. The word at `T` is a nonzero (decodable) instruction.
+///   5. If `T` lies strictly inside an existing function `P`, then `P` is NOT
+///      pdata-anchored. The Xbox 360 `.pdata` table is a clean, authoritative
+///      partition of `.text` (verified across all 56,836 RB3 entries): a
+///      pdata-anchored function never contains a separate function, so we never
+///      split one — this is what keeps switch/jump-table-heavy (framed, hence
+///      pdata-anchored) functions untouched.
+///
+/// The pass only ADDS function symbols and SHRINKS an oversized non-pdata parent
+/// down to its first real split point; it never grows a symbol, never touches a
+/// pdata-anchored function, and never deletes a real function. Sizes exclude
+/// trailing zero padding. Every synthesis/clamp is logged at `info` for audit,
+/// mirroring the grow/clamp/prune passes. Relocations that referenced the leaf
+/// as `parent+addend` are re-pointed to the new symbol so vtables render the
+/// leaf's own name (helps the vtable data-symbol match too).
+fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let is_code = |sec: SectionIndex| -> bool {
+        matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code)
+    };
+
+    // (1) pdata-anchored function starts — authoritative, never split/duplicate.
+    let mut pdata_anchored: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    for sa in &obj.pdata_funcs {
+        pdata_anchored.insert((sa.section, sa.address as u64));
+    }
+
+    // (2) Reloc-source ranges to EXCLUDE: jump tables (entries point to internal
+    //     case blocks) and exception data/records (point to EH funclets).
+    let mut excluded_source_ranges: BTreeMap<SectionIndex, Vec<(u64, u64)>> = BTreeMap::new();
+    // (2b) Existing Function symbols, per section, sorted by start: (start, end).
+    //      Plus a set of exact function starts for O(log n) membership.
+    let mut func_starts: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    let mut funcs_by_sec: BTreeMap<SectionIndex, Vec<(SymbolIndex, u64, u64)>> = BTreeMap::new();
+    for (idx, sym) in obj.symbols.iter() {
+        let Some(sec) = sym.section else { continue };
+        let name = &sym.name;
+        if (name.starts_with("jumptable_")
+            || name.starts_with("except_data_")
+            || name.starts_with("except_record_"))
+            && sym.size > 0
+        {
+            excluded_source_ranges
+                .entry(sec)
+                .or_default()
+                .push((sym.address, sym.address + sym.size));
+        }
+        if sym.kind == ObjSymbolKind::Function && sym.size > 0 && is_code(sec) {
+            func_starts.insert((sec, sym.address));
+            funcs_by_sec.entry(sec).or_default().push((idx, sym.address, sym.address + sym.size));
+        }
+    }
+    for v in funcs_by_sec.values_mut() {
+        v.sort_by_key(|&(_, a, _)| a);
+    }
+
+    // (3) Collect candidate entry VAs = effective reloc targets that land in a
+    //     code section, whose reloc source is not excluded.
+    let symbol_count = obj.symbols.count();
+    // candidate -> data_sourced (true if referenced by at least one DATA-section
+    // reloc, i.e. a vtable / function-pointer table entry). data_sourced
+    // candidates are safe to split out of an absorbing parent (a data pointer
+    // proves the leaf is reached only indirectly — no control-flow back-edge).
+    // Code-only candidates (`bl`/branch targets) are handled ONLY in gaps: a
+    // `bl` target CFA merged as a tail block is a shared-loop multi-entry helper
+    // that would be re-merged on the next re-split, so clamping its parent here
+    // would break split idempotency.
+    let mut candidates: BTreeMap<(SectionIndex, u64), bool> = BTreeMap::new();
+    for (src_sec, section) in obj.sections.iter() {
+        let src_is_data = !is_code(src_sec);
+        let excl = excluded_source_ranges.get(&src_sec);
+        for (src_addr, reloc) in section.relocations.iter() {
+            if let Some(ranges) = excl {
+                let sa = src_addr as u64;
+                if ranges.iter().any(|&(s, e)| sa >= s && sa < e) {
+                    continue;
+                }
+            }
+            if reloc.target_symbol >= symbol_count {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            if !is_code(tsec) {
+                continue;
+            }
+            let tva = tsym.address as i64 + reloc.addend;
+            if tva < 0 {
+                continue;
+            }
+            let entry = candidates.entry((tsec, tva as u64)).or_insert(false);
+            *entry = *entry || src_is_data;
+        }
+    }
+
+    // (4) Filter candidates to genuine new leaf-function entries.
+    let mut genuine: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    for (&(sec, addr), &data_sourced) in &candidates {
+        if func_starts.contains(&(sec, addr)) {
+            continue; // already a function start
+        }
+        let Some(section) = obj.sections.get(sec) else { continue };
+        if addr < section.address + 4 {
+            continue;
+        }
+        let (Some(cur), Some(prev)) = (read_u32(section, addr as u32), read_u32(section, (addr - 4) as u32))
+        else {
+            continue;
+        };
+        if cur == 0 || !is_hard_flow_terminator(prev) {
+            continue;
+        }
+        // Is T strictly inside an existing function P?
+        if let Some(funcs) = funcs_by_sec.get(&sec) {
+            let pos = funcs.partition_point(|&(_, s, _)| s <= addr);
+            if pos > 0 {
+                let (_, pstart, pend) = funcs[pos - 1];
+                if pstart < addr && addr < pend {
+                    // pdata-anchored parents are an authoritative partition — never
+                    // split one.
+                    if pdata_anchored.contains(&(sec, pstart)) {
+                        continue;
+                    }
+                    // Splitting a leaf OUT of a non-pdata parent is only safe for
+                    // data-sourced (vtable) leaves. A code-only (`bl`) target
+                    // inside a function is a shared-loop multi-entry helper CFA
+                    // merged; un-merging it breaks re-split idempotency.
+                    if !data_sourced {
+                        continue;
+                    }
+                }
+            }
+        }
+        genuine.insert((sec, addr));
+    }
+
+    if genuine.is_empty() {
+        return;
+    }
+
+    // (5) Per-section sorted boundary list = func starts ∪ pdata starts ∪ genuine
+    //     ∪ section end. Used to size each new function (end = next boundary),
+    //     with trailing zero-padding trimmed off.
+    let mut boundaries: BTreeMap<SectionIndex, BTreeSet<u64>> = BTreeMap::new();
+    for &(sec, a) in func_starts.iter().chain(pdata_anchored.iter()).chain(genuine.iter()) {
+        boundaries.entry(sec).or_default().insert(a);
+    }
+    for (sec, section) in obj.sections.iter() {
+        if is_code(sec) {
+            boundaries.entry(sec).or_default().insert(section.address + section.size);
+        }
+    }
+
+    // Precompute the padding-trimmed size of every genuine leaf (end = next
+    // boundary, trailing zero words trimmed) BEFORE any mutation, so the sizing
+    // reads don't hold a borrow across the later symbol edits.
+    let mut leaf_size: BTreeMap<(SectionIndex, u64), u64> = BTreeMap::new();
+    for &(sec, addr) in &genuine {
+        let Some(section) = obj.sections.get(sec) else { continue };
+        let Some(&next) = boundaries.get(&sec).and_then(|b| b.range((addr + 1)..).next()) else {
+            continue;
+        };
+        let mut end = next;
+        while end > addr + 4 && matches!(read_u32(section, (end - 4) as u32), Some(0)) {
+            end -= 4;
+        }
+        if end > addr {
+            leaf_size.insert((sec, addr), end - addr);
+        }
+    }
+
+    // (6) Parent clamps: an oversized non-pdata function whose interior holds a
+    //     genuine split point is shrunk to end at its first split point (also
+    //     trimming trailing padding).
+    let mut clamp_parent: Vec<(SymbolIndex, u64, u64)> = Vec::new(); // (idx, old, new)
+    for (sec, funcs) in &funcs_by_sec {
+        for &(idx, pstart, pend) in funcs {
+            if pdata_anchored.contains(&(*sec, pstart)) {
+                continue;
+            }
+            let first_split =
+                genuine.range((*sec, pstart + 1)..(*sec, pend)).next().map(|&(_, a)| a);
+            if let Some(first) = first_split {
+                let mut new_end = first;
+                if let Some(section) = obj.sections.get(*sec) {
+                    while new_end > pstart + 4
+                        && matches!(read_u32(section, (new_end - 4) as u32), Some(0))
+                    {
+                        new_end -= 4;
+                    }
+                }
+                clamp_parent.push((idx, pend - pstart, new_end - pstart));
+            }
+        }
+    }
+
+    // (7) Apply: clamp parents, then create/promote function symbols.
+    for &(idx, old_size, new_size) in &clamp_parent {
+        if new_size == 0 || new_size >= old_size {
+            continue;
+        }
+        let existing = obj.symbols[idx].clone();
+        log::info!(
+            "Clamping absorbing function symbol {} @ {:#010x} {:#x} -> {:#x} (leaf-split)",
+            existing.name, existing.address, old_size, new_size
+        );
+        let resized = ObjSymbol { size: new_size, size_known: true, ..existing };
+        if let Err(e) = obj.symbols.replace(idx, resized) {
+            log::warn!("Failed to clamp absorbing function symbol #{idx}: {e:#}");
+        }
+    }
+
+    let module_id = obj.module_id;
+    let mut created: BTreeMap<(SectionIndex, u64), SymbolIndex> = BTreeMap::new();
+    let genuine_vec: Vec<(SectionIndex, u64)> = genuine.iter().copied().collect();
+    for &(sec, addr) in &genuine_vec {
+        let Some(&size) = leaf_size.get(&(sec, addr)) else { continue };
+        if size == 0 {
+            continue;
+        }
+        // Promote an existing exact-address non-function symbol (label), else add.
+        let existing_nonfn: Option<SymbolIndex> = obj
+            .symbols
+            .at_section_address(sec, addr as u32)
+            .find(|(_, s)| s.kind != ObjSymbolKind::Function)
+            .map(|(i, _)| i);
+        if let Some(idx) = existing_nonfn {
+            let existing = obj.symbols[idx].clone();
+            log::info!(
+                "Promoting label {} @ {:#010x} to leaf function (size {:#x})",
+                existing.name, addr, size
+            );
+            let name = if existing.name.starts_with("lbl_") {
+                create_auto_symbol_name("fn", module_id, addr as u32)
+            } else {
+                existing.name.clone()
+            };
+            let promoted = ObjSymbol {
+                name,
+                kind: ObjSymbolKind::Function,
+                size,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                ..existing
+            };
+            if let Err(e) = obj.symbols.replace(idx, promoted) {
+                log::warn!("Failed to promote label to leaf function @ {addr:#010x}: {e:#}");
+                continue;
+            }
+            created.insert((sec, addr), idx);
+        } else {
+            let name = create_auto_symbol_name("fn", module_id, addr as u32);
+            log::info!("Synthesizing leaf function {} @ {:#010x} (size {:#x})", name, addr, size);
+            match obj.add_symbol(
+                ObjSymbol {
+                    name,
+                    address: addr,
+                    section: Some(sec),
+                    size,
+                    size_known: true,
+                    kind: ObjSymbolKind::Function,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    ..Default::default()
+                },
+                false,
+            ) {
+                std::result::Result::Ok(idx) => {
+                    created.insert((sec, addr), idx);
+                }
+                Err(e) => log::warn!("Failed to synthesize leaf function @ {addr:#010x}: {e:#}"),
+            }
+        }
+    }
+
+    // (8) Re-point relocations that referenced a synthesized leaf as
+    //     `parent + addend` to the leaf's own symbol (addend 0), so vtables /
+    //     call sites render the leaf's real name.
+    let mut repoints: Vec<(SectionIndex, u32, SymbolIndex)> = Vec::new();
+    for (src_sec, section) in obj.sections.iter() {
+        for (src_addr, reloc) in section.relocations.iter() {
+            if reloc.target_symbol >= symbol_count {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            let tva = tsym.address as i64 + reloc.addend;
+            if tva < 0 {
+                continue;
+            }
+            if let Some(&new_idx) = created.get(&(tsec, tva as u64)) {
+                if reloc.target_symbol != new_idx {
+                    repoints.push((src_sec, src_addr, new_idx));
+                }
+            }
+        }
+    }
+    for (src_sec, src_addr, new_idx) in &repoints {
+        let section = &mut obj.sections[*src_sec];
+        if let Some(existing) = section.relocations.at(*src_addr).cloned() {
+            let reloc = ObjReloc { target_symbol: *new_idx, addend: 0, ..existing };
+            section.relocations.replace(*src_addr, reloc);
+        }
+    }
+
+    log::info!(
+        "Synthesized/promoted {} PDATA-less leaf function symbol(s); clamped {} absorbing parent(s); re-pointed {} relocation(s)",
+        created.len(), clamp_parent.len(), repoints.len()
+    );
+}
+
 fn prune_overlapping_phantom_functions(obj: &mut ObjInfo) {
     use std::collections::BTreeSet;
 
@@ -743,6 +1114,11 @@ fn split_write_obj_exe(
     // no-overlap invariant still holds.
     grow_undersized_function_symbols(&mut module.obj);
     clamp_oversized_function_symbols(&mut module.obj);
+    // Synthesize/promote PDATA-less leaf functions that CFA absorbed into an
+    // oversized neighbor or emitted as a bare data label. Runs AFTER the clamp
+    // (so pdata-authoritative bounds are settled) and BEFORE the prune (its
+    // additions are cleanly partitioned, so the prune sees no new overlaps).
+    synthesize_reloc_targeted_leaf_functions(&mut module.obj);
     prune_overlapping_phantom_functions(&mut module.obj);
 
     if !config.symbols_known && config.detect_objects {
