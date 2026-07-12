@@ -604,16 +604,19 @@ fn is_hard_flow_terminator(word: u32) -> bool {
 ///
 /// A candidate address `T` is synthesized ONLY when ALL of:
 ///   1. `T` is the effective target (`target_symbol.address + addend`) of a
-///      relocation whose SOURCE lives in a DATA section (a vtable slot or other
-///      function-pointer table) and is not inside a jump table (those point to
-///      internal case blocks, not separate functions). A data-section function
-///      pointer proves `T` is a real entry AND that `T` is reached only
-///      indirectly — it has no internal control-flow back-edge into a
-///      neighbor, so clamping its absorbing parent is safe. We deliberately do
-///      NOT act on code-section `bl`/branch targets: those are CFA's job, and a
-///      `bl` target CFA merged as a tail block (shared-loop multi-entry helper)
-///      would be re-merged on the next re-split, so un-merging it here would
-///      break split idempotency.
+///      relocation (from EITHER a DATA section — a vtable slot / function-pointer
+///      table — OR a code-section `bl`/branch) that is not inside a jump table
+///      (those point to internal case blocks, not separate functions) or an
+///      exception record. A relocation to `T` proves `T` is a real, referenced
+///      entry. Both data-sourced and code-`bl`-sourced targets may split an
+///      absorbing non-pdata parent: the companion `merge_tail_blocks` fix
+///      (src/analysis/cfa.rs) now respects the persisted function symbol this
+///      pass writes, so a `bl` target CFA would otherwise merge as a shared-loop
+///      tail block — and the Unknown-scope parent stub left behind — are NOT
+///      re-merged on the next re-split. (The earlier iteration of this pass
+///      restricted parent-splitting to DATA sources precisely because the
+///      Global-only merge guard could not protect those clamped parents; that
+///      restriction is lifted now that the guard covers any persisted symbol.)
 ///   2. `T` is not already a `.fn` start.
 ///   3. The word at `T-4` is a hard flow terminator (`blr`/`bctr`/`b`/padding),
 ///      so `T` cannot be reached by fall-through: it is a genuine new unit.
@@ -632,7 +635,22 @@ fn is_hard_flow_terminator(word: u32) -> bool {
 /// mirroring the grow/clamp/prune passes. Relocations that referenced the leaf
 /// as `parent+addend` are re-pointed to the new symbol so vtables render the
 /// leaf's own name (helps the vtable data-symbol match too).
-fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
+///
+/// ## Single-call convergence (idempotent output)
+///
+/// Carving a leaf out of an absorbing parent can EXPOSE a further leaf that was
+/// previously interior to that same parent (e.g. a `bl` helper nested two levels
+/// deep only becomes a splittable candidate once its enclosing parent has itself
+/// been split off as a non-pdata function). One pass therefore only peels one
+/// nesting level; running the splitter twice would keep peeling, so the emitted
+/// symbols.txt would not be byte-stable across re-splits. `_once` performs a
+/// single peel and reports how many leaves it created; the public wrapper
+/// [`synthesize_reloc_targeted_leaf_functions`] iterates it to a fixed point so a
+/// single split invocation already emits the fully-converged symbol set. The
+/// pass only ever ADDS function symbols and SHRINKS non-pdata parents (never
+/// removes or grows one), and candidates are bounded by the finite reloc-target
+/// set, so the iteration is monotonic and always terminates.
+fn synthesize_reloc_targeted_leaf_functions_once(obj: &mut ObjInfo) -> usize {
     use std::collections::{BTreeMap, BTreeSet};
 
     let is_code = |sec: SectionIndex| -> bool {
@@ -715,7 +733,7 @@ fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
 
     // (4) Filter candidates to genuine new leaf-function entries.
     let mut genuine: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
-    for (&(sec, addr), &data_sourced) in &candidates {
+    for &(sec, addr) in candidates.keys() {
         if func_starts.contains(&(sec, addr)) {
             continue; // already a function start
         }
@@ -741,13 +759,20 @@ fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
                     if pdata_anchored.contains(&(sec, pstart)) {
                         continue;
                     }
-                    // Splitting a leaf OUT of a non-pdata parent is only safe for
-                    // data-sourced (vtable) leaves. A code-only (`bl`) target
-                    // inside a function is a shared-loop multi-entry helper CFA
-                    // merged; un-merging it breaks re-split idempotency.
-                    if !data_sourced {
-                        continue;
-                    }
+                    // Splitting a leaf OUT of a non-pdata parent is now safe for
+                    // BOTH data-sourced (vtable) AND code-`bl` targets. A `bl`
+                    // target inside a function is often a shared-loop
+                    // multi-entry helper CFA merged as a tail block; splitting
+                    // it clamps the parent to an Unknown-scope stub that, on the
+                    // next re-split, would be a fresh merge_tail_blocks
+                    // candidate. That re-merge is now prevented at the source:
+                    // merge_tail_blocks respects any *persisted* function symbol
+                    // (symbols.txt boundary) regardless of scope (see
+                    // src/analysis/cfa.rs). Both the Global-flagged leaf we
+                    // synthesize below and the clamped parent are persisted, so
+                    // neither is re-merged — keeping the split idempotent while
+                    // unlocking the bl-referenced leaves the DATA-only gate left
+                    // on the table.
                 }
             }
         }
@@ -755,7 +780,7 @@ fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
     }
 
     if genuine.is_empty() {
-        return;
+        return 0;
     }
 
     // (5) Per-section sorted boundary list = func starts ∪ pdata starts ∪ genuine
@@ -925,6 +950,37 @@ fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
     log::info!(
         "Synthesized/promoted {} PDATA-less leaf function symbol(s); clamped {} absorbing parent(s); re-pointed {} relocation(s)",
         created.len(), clamp_parent.len(), repoints.len()
+    );
+    created.len()
+}
+
+/// Iterate [`synthesize_reloc_targeted_leaf_functions_once`] to a fixed point.
+///
+/// A single peel can expose a deeper nested leaf (see that function's docs), so
+/// we loop until a pass creates nothing new. This makes one split invocation
+/// emit the fully-converged symbol set, so `symbols.txt`/`splits.txt` are
+/// byte-stable across re-splits (idempotent) rather than drifting one nesting
+/// level per rebuild. The iteration is monotonic (only adds symbols / shrinks
+/// parents, bounded by the finite reloc-target set) and thus always terminates;
+/// the cap is a belt-and-suspenders guard against an unforeseen oscillation.
+fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
+    const MAX_ITERS: usize = 32;
+    for iter in 0..MAX_ITERS {
+        let created = synthesize_reloc_targeted_leaf_functions_once(obj);
+        if created == 0 {
+            if iter > 0 {
+                log::info!(
+                    "Leaf-synthesis converged after {} additional peel iteration(s)",
+                    iter
+                );
+            }
+            return;
+        }
+    }
+    log::warn!(
+        "Leaf-synthesis hit iteration cap ({}) without converging; \
+         symbols.txt may still drift on the next re-split",
+        MAX_ITERS
     );
 }
 

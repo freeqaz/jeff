@@ -19,7 +19,7 @@ use crate::{
     },
     obj::{
         ObjInfo, ObjSection, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags,
-        ObjSymbolKind, ObjSymbolScope, SectionIndex,
+        ObjSymbolKind, SectionIndex,
     },
     util::config::create_auto_symbol_name,
 };
@@ -1001,18 +1001,34 @@ fn merge_tail_blocks(
                 continue;
             }
 
-            // Skip merging if the candidate has a global-scope symbol
-            // (user, PDB, or map file explicitly defined it as a real function)
+            // Skip merging if the candidate already has a persisted function
+            // symbol at its start. obj.symbols is immutable throughout CFA, so
+            // any function symbol found here was pre-seeded from config
+            // (symbols.txt / PDB / map / a prior split run's synthesized leaf) —
+            // never from this run's discovery. It is therefore a *committed
+            // split boundary*: splits.txt already cuts a unit at this address,
+            // and merging the candidate into its predecessor un-declares that
+            // boundary, tripping "Split … ends within symbol" on the next
+            // re-split (broken idempotency). Respect the boundary regardless of
+            // scope — this is what lets the reloc-targeted leaf-synthesis pass
+            // (src/cmd/xex.rs) clamp non-pdata parents around bl-referenced
+            // leaves: neither the Global-flagged synthesized leaf nor the
+            // clamped (Unknown-scope, possibly fall-through-reached) parent it
+            // leaves behind gets re-merged on the following run. Persisted =
+            // will be written to symbols.txt (not NoWrite, not Stripped).
+            // Previously this only guarded Global-scope symbols, which missed
+            // the Unknown-scope clamped parents and broke the broad leaf pass.
             if let Ok(Some((_, sym))) = obj.symbols.kind_at_section_address(
                 func_addr.section,
                 func_addr.address,
                 ObjSymbolKind::Function,
             ) {
-                if sym.flags.scope() == ObjSymbolScope::Global {
+                if !sym.flags.is_no_write() && !sym.flags.is_stripped() {
                     log::info!(
-                        "Skipping tail block merge of {:#010X} (global-scope symbol '{}')",
+                        "Skipping tail block merge of {:#010X} (persisted function symbol '{}', scope {:?})",
                         func_addr,
                         sym.name,
+                        sym.flags.scope(),
                     );
                     continue;
                 }
