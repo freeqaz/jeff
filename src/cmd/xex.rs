@@ -628,6 +628,16 @@ fn is_hard_flow_terminator(word: u32) -> bool {
 ///      split one — this is what keeps switch/jump-table-heavy (framed, hence
 ///      pdata-anchored) functions untouched.
 ///
+/// NOTE (round 3, the INVERSE pass): this pass sometimes OVER-splits one
+/// compiled function into 2+ consecutive anonymous PDATA-less leaf fragments in
+/// a `.pdata` GAP (the AddRoll class). [`merge_fallthrough_leaf_fragments`] is
+/// the exact inverse — it re-collapses those fragments AFTER this pass, in the
+/// same symbol layer. That merge does NOT weaken guard 5: it refuses to merge
+/// any pdata-anchored start (its P4), so the `.pdata` partition still partitions
+/// `.text`. If you are tempted to "fix" a merged-larger symbol back into
+/// fragments, don't — the merged extent is the real compiled function; the split
+/// was this pass's artifact.
+///
 /// The pass only ADDS function symbols and SHRINKS an oversized non-pdata parent
 /// down to its first real split point; it never grows a symbol, never touches a
 /// pdata-anchored function, and never deletes a real function. Sizes exclude
