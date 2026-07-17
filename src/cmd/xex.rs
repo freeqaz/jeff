@@ -984,6 +984,374 @@ fn synthesize_reloc_targeted_leaf_functions(obj: &mut ObjInfo) {
     );
 }
 
+/// One fall-through leaf fragment, as consumed by [`plan_fallthrough_merge_runs`].
+///
+/// `last_insn` is the last big-endian instruction word of `[addr, addr+size)`;
+/// `xref` is the number of module-wide relocations whose effective target VA is
+/// exactly `addr` (post-`tracker.apply`); `anon` is true iff the symbol name is
+/// `fn_`/`lbl_` (never merge a named/persisted symbol away); `pdata` is true iff
+/// the address is a genuine `.pdata`-anchored function start (an authoritative
+/// boundary that must never be merged across); `split_key` identifies the split
+/// UNIT containing the fragment — `Some(unit_start_addr)` for a pinned/committed
+/// split, `None` for an inter-unit gap — so the merge never crosses a compiled
+/// translation-unit boundary (P5).
+#[derive(Clone, Copy, Debug)]
+struct LeafFrag {
+    addr: u64,
+    size: u64,
+    last_insn: u32,
+    xref: u32,
+    anon: bool,
+    pdata: bool,
+    split_key: Option<u32>,
+    /// True iff this address is externally identified as a real function start
+    /// that must be preserved (e.g. present in a decomp project's symbol-
+    /// identification map applied post-split). Such a fragment is NEVER absorbed
+    /// — its independent match would be lost. See `JEFF_MERGE_PROTECT`.
+    protected: bool,
+}
+
+/// Pure planner for the fall-through leaf-fragment merge. Given a section's
+/// function symbols sorted ascending by address, return the maximal runs
+/// `(start_idx, end_idx_inclusive)` (each of length ≥ 2) that should collapse
+/// into a single function starting at `start_idx`.
+///
+/// This is the exact INVERSE of [`synthesize_reloc_targeted_leaf_functions`]:
+/// that pass CREATES a leaf-function start where a relocation proves a real
+/// entry; this pass REMOVES a leaf-function start where the split is a pure dtk
+/// CFA artifact — an anonymous, unreferenced fragment reached only by
+/// fall-through from its predecessor (the AddRoll-class over-split). The
+/// predicate mirrors census §h: for a growing chain `Sᵢ … Sⱼ`, each step absorbs
+/// the next fragment `Sₖ₊₁` iff ALL of:
+///   - **P1 adjacency:** the merged tail ends exactly at `Sₖ₊₁.addr` (no gap).
+///   - **P2 fall-through:** the last instruction of the current tail fragment
+///     `Sₖ` is NOT a hard flow terminator (`is_hard_flow_terminator`), so control
+///     flows straight into `Sₖ₊₁`.
+///   - **P3 no independent entry:** `Sₖ₊₁` has zero incoming relocations AND an
+///     anonymous name — its only reachable entry is the fall-through, so it is
+///     definitionally part of `Sᵢ`'s function.
+///   - **P4 not pdata-anchored:** neither `Sᵢ` nor `Sₖ₊₁` is a `.pdata`-anchored
+///     start (a genuine pdata boundary is authoritative — never merge across it;
+///     this subsumes `func_type==3` EH-anchored starts).
+///   - **P5 same split unit:** `Sₖ₊₁` lies in the SAME split unit as the chain
+///     head `Sᵢ` (`split_key` equal). A pinned split range is the exact byte span
+///     of one compiled translation unit; a function can never cross it. This
+///     guard is BEYOND census §h — the census predicate (P1–P4 only) over-counted
+///     because it ignored split boundaries, so a gap fragment adjacent to the
+///     first (anonymous, unreferenced) function of the NEXT pinned unit would
+///     otherwise fuse across the TU boundary (e.g. a gap fn before MoveMgr.cpp's
+///     first function), producing dtk's "split ends within symbol" error. AddRoll
+///     is unaffected: both fragments live inside Stats.cpp's pinned `.text` range.
+///   - **P6 not externally protected:** `Sₖ₊₁` is not an externally-identified
+///     real function start (`protected`). Also beyond census §h: a decomp project
+///     may carry an identification map (rb3-xenon's `target_symbol_map.json`)
+///     that renames an anonymous fragment to a real function POST-split; such a
+///     fragment can coincidentally match our (shorter/ICF-folded) compiled body
+///     as a standalone symbol, and absorbing it would delete that match. This is
+///     the dtk-visible form of the census's "exclude Sₖ₊₁ if it matches 100%
+///     standalone" tightening. Empirically (rb3-xenon A/B) two absorptions —
+///     MidiReader `_M_erase` and BandCharDesc `operator delete` — were
+///     over-split fragments whose 80B/4B body matched our shorter codegen; P6
+///     preserves them. The chain HEAD may be protected (it grows, keeping its
+///     identity); only ABSORPTION of a protected address is blocked.
+///
+/// Because the walk is greedy-forward and each absorbed fragment is anonymous +
+/// unreferenced, the result is a partition of the input into merge-runs and
+/// singletons — chains (census: 272 multi-pair runs, longest 9 fragments) fall
+/// out naturally.
+fn plan_fallthrough_merge_runs(frags: &[LeafFrag]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < frags.len() {
+        let s1 = frags[i];
+        // P4 for the chain start: a pdata-anchored function is authoritative.
+        if s1.pdata {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        let mut cur_end = s1.addr + s1.size;
+        while j + 1 < frags.len() {
+            let next = frags[j + 1];
+            // P1 adjacency (no gap / padding word).
+            if cur_end != next.addr {
+                break;
+            }
+            // P2 fall-through: the current tail fragment must flow off its end.
+            if is_hard_flow_terminator(frags[j].last_insn) {
+                break;
+            }
+            // P3 no independent entry for the absorbed fragment.
+            if next.xref != 0 || !next.anon {
+                break;
+            }
+            // P4 the absorbed fragment must not be a genuine pdata boundary.
+            if next.pdata {
+                break;
+            }
+            // P5 the absorbed fragment must be in the SAME split unit as the
+            // chain head — never merge across a compiled translation-unit
+            // boundary (pinned split range).
+            if next.split_key != s1.split_key {
+                break;
+            }
+            // P6 never absorb an externally-identified real function start.
+            if next.protected {
+                break;
+            }
+            j += 1;
+            cur_end = next.addr + next.size;
+        }
+        if j > i {
+            runs.push((i, j));
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Merge adjacent fall-through PDATA-less leaf fragments back into one function.
+///
+/// ## The defect (census 2026-07-16, `docs/plans/jeff-pdata-boundary-round3.md`)
+///
+/// jeff's own CFA / [`synthesize_reloc_targeted_leaf_functions`] (commit
+/// `a670a12`) sometimes carves ONE compiled function into 2+ consecutive
+/// anonymous leaf-function symbols inside a `.pdata` gap, persisted in
+/// `symbols.txt`. objdiff then pairs our whole compiled body against the first
+/// (truncated) fragment → a permanent mismatch no source work can close.
+/// Confirmed fixture: `Stats::AddRoll` (`band3/game/Stats.cpp`) —
+/// `fn_826976E0`(16B) + `fn_826976F0`(20B, `lastS1=addi r11,r11,1` fall-through,
+/// zero xrefs) → one 36B function `0x826976E0..0x82697704`.
+///
+/// This pass is the exact INVERSE of `a670a12`, in the SAME symbol layer (the
+/// final function-symbol set), NOT over the `.pdata` table — the raw `.pdata`
+/// predicate finds ZERO such pairs (the fragments live in pdata GAPS). See
+/// [`plan_fallthrough_merge_runs`] for the per-step predicate (census §h P1–P4).
+///
+/// ## Invariant (does NOT weaken `a670a12`'s guard 5)
+///
+/// `a670a12`'s guard 5 asserts the `.pdata` table is a clean partition of `.text`
+/// and a pdata-anchored function never contains a separate function. This pass
+/// preserves that in full: P4 refuses to merge any pdata-anchored start, so the
+/// pdata partition still partitions `.text` unchanged. We only ever collapse
+/// symbol-layer fragments that CFA/leaf-synthesis introduced inside a pdata GAP —
+/// never a pdata boundary. A future session must NOT "fix" this merge as a
+/// boundary bug: the merged extent is the real compiled function; the fragment
+/// split was the artifact.
+///
+/// ## Idempotency / re-split byte-stability
+///
+/// The pass runs every split. Once `symbols.txt` records the merged 36B symbol,
+/// the absorbed fragment `Sₖ₊₁` cannot be re-created:
+/// [`synthesize_reloc_targeted_leaf_functions`] only synthesizes reloc-TARGETED
+/// leaves, but P3 guaranteed `Sₖ₊₁` has zero relocations — so the leaf pass
+/// skips it. Should a stale cache or a fresh CFA re-carve it anyway, this pass
+/// re-merges it (deterministic), and any residual overlap is swept by the
+/// following [`prune_overlapping_phantom_functions`]. Either way the emitted
+/// `symbols.txt` converges to the merged extent. Runs AFTER leaf synthesis (its
+/// fragments are the input) and BEFORE the prune (a merge never creates an
+/// overlap, but the prune is the belt-and-suspenders for a re-carve).
+///
+/// Load the optional `JEFF_MERGE_PROTECT` set: a JSON object whose keys are hex
+/// addresses (`"0x82XXXXXX"`) of externally-identified real function starts that
+/// must never be absorbed (P6). Values (names) are ignored. Returns an empty set
+/// when the env var is unset or the file cannot be read/parsed (the pass then
+/// runs purely structurally) — a warn is logged on a present-but-unreadable path
+/// so a misconfigured project surfaces instead of silently over-firing.
+fn load_merge_protect_addrs() -> std::collections::BTreeSet<u64> {
+    let mut set = std::collections::BTreeSet::new();
+    let Some(path) = std::env::var_os("JEFF_MERGE_PROTECT") else { return set };
+    let text = match std::fs::read_to_string(&path) {
+        std::result::Result::Ok(t) => t,
+        Err(e) => {
+            log::warn!("JEFF_MERGE_PROTECT set but {:?} unreadable: {e:#}", path);
+            return set;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        std::result::Result::Ok(v) => v,
+        Err(e) => {
+            log::warn!("JEFF_MERGE_PROTECT {:?} is not valid JSON: {e:#}", path);
+            return set;
+        }
+    };
+    if let Some(map) = value.as_object() {
+        for key in map.keys() {
+            let hex = key.trim().trim_start_matches("0x").trim_start_matches("0X");
+            if let std::result::Result::Ok(addr) = u64::from_str_radix(hex, 16) {
+                set.insert(addr);
+            }
+        }
+    }
+    set
+}
+
+/// This pass is ALWAYS ON (unconditional) — it runs on every split. (During
+/// round-3 A/B bring-up it was gated by `JEFF_CLASS2_MERGE`; the gate was removed
+/// on landing, verified byte-identical to the gated-on run.)
+///
+/// `JEFF_MERGE_PROTECT` (optional): a path to a JSON object whose keys are hex
+/// addresses (`"0x82XXXXXX"`) of externally-identified real function starts —
+/// e.g. rb3-xenon's `scripts/target_symbol_map.json`, applied post-split by the
+/// target-symbol renamer. Those addresses are never absorbed (P6). Unset ⇒ the
+/// pass runs purely structurally (census P1–P5); on rb3-xenon that over-fires by
+/// exactly the two coincidental over-split matches (`_M_erase`, `operator delete`
+/// void*,void*), so the identification map should be provided for a 0-loss run.
+fn merge_fallthrough_leaf_fragments(obj: &mut ObjInfo) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let is_code = |sec: SectionIndex| -> bool {
+        matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code)
+    };
+
+    // (0) Externally-identified real function starts to never absorb (P6). Parsed
+    //     from JEFF_MERGE_PROTECT (a JSON map addr->name, e.g. target_symbol_map).
+    //     A single flat set of VAs (module-wide; .text VAs are globally unique).
+    let protected_addrs: BTreeSet<u64> = load_merge_protect_addrs();
+    if !protected_addrs.is_empty() {
+        log::info!(
+            "merge_fallthrough_leaf_fragments: {} externally-protected address(es) loaded (P6)",
+            protected_addrs.len()
+        );
+    }
+
+    // (1) pdata-anchored starts — genuine boundaries, never merged (P4).
+    let mut pdata_anchored: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    for sa in &obj.pdata_funcs {
+        pdata_anchored.insert((sa.section, sa.address as u64));
+    }
+
+    // (2) TRUE post-tracker.apply reloc-target xref counts, keyed by the
+    //     effective target VA (target_symbol.address + addend) landing in a code
+    //     section — ALL sources (bl / vtable / data pointer / jumptable). This is
+    //     the SAME set the leaf pass consumes; a fall-through fragment with an
+    //     independent entry has a nonzero count here and is left alone (P3).
+    let symbol_count = obj.symbols.count();
+    let mut xrefs: BTreeMap<(SectionIndex, u64), u32> = BTreeMap::new();
+    for (_src_sec, section) in obj.sections.iter() {
+        for (_src_addr, reloc) in section.relocations.iter() {
+            if reloc.target_symbol >= symbol_count {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            if !is_code(tsec) {
+                continue;
+            }
+            let tva = tsym.address as i64 + reloc.addend;
+            if tva < 0 {
+                continue;
+            }
+            *xrefs.entry((tsec, tva as u64)).or_insert(0) += 1;
+        }
+    }
+
+    // (3) Per code section, function symbols sorted by address, with their
+    //     symbol index so the merge can resize S1 and strip the absorbed tail.
+    let mut by_section: BTreeMap<SectionIndex, Vec<(SymbolIndex, u64, u64, bool)>> = BTreeMap::new();
+    for (idx, sym) in obj.symbols.iter() {
+        let Some(sec) = sym.section else { continue };
+        if sym.kind != ObjSymbolKind::Function || sym.size == 0 || !is_code(sec) {
+            continue;
+        }
+        let anon = sym.name.starts_with("fn_") || sym.name.starts_with("lbl_");
+        by_section.entry(sec).or_default().push((idx, sym.address, sym.size, anon));
+    }
+    for v in by_section.values_mut() {
+        v.sort_by_key(|&(_, a, _, _)| a);
+        v.dedup_by_key(|&mut (_, a, _, _)| a);
+    }
+
+    // (4) Plan merges per section, then apply: grow S1 to the run's end, strip
+    //     the absorbed fragments (mirroring prune's symbol-removal convention).
+    let mut merged_runs = 0usize;
+    let mut absorbed = 0usize;
+    for (sec, funcs) in &by_section {
+        let Some(section) = obj.sections.get(*sec) else { continue };
+        // Build the pure-planner input for this section.
+        let mut frags: Vec<LeafFrag> = Vec::with_capacity(funcs.len());
+        for &(_idx, addr, size, anon) in funcs {
+            let last_insn = read_u32(section, (addr + size - 4) as u32).unwrap_or(0);
+            let xref = xrefs.get(&(*sec, addr)).copied().unwrap_or(0);
+            let pdata = pdata_anchored.contains(&(*sec, addr));
+            // The split UNIT containing this fragment (pinned range start), or
+            // None if it sits in an inter-unit gap. Fragments merge only within
+            // one unit (P5) — a pinned split range is one TU's exact byte span.
+            let split_key = section.splits.for_address(addr as u32).map(|(start, _)| start);
+            let protected = protected_addrs.contains(&addr);
+            frags.push(LeafFrag {
+                addr,
+                size,
+                last_insn,
+                xref,
+                anon,
+                pdata,
+                split_key,
+                protected,
+            });
+        }
+        let runs = plan_fallthrough_merge_runs(&frags);
+        for (start, end) in runs {
+            let (s1_idx, s1_addr, _s1_size, _) = funcs[start];
+            let new_end = frags[end].addr + frags[end].size;
+            let new_size = new_end - s1_addr;
+            // Grow S1 to cover the whole run.
+            let existing = obj.symbols[s1_idx].clone();
+            let absorbed_addrs: Vec<u64> =
+                (start + 1..=end).map(|k| frags[k].addr).collect();
+            log::info!(
+                "Merging fallthrough leaf fragments into {} @ {:#010x}: absorbing {:#x?} \
+                 -> merged size {:#x} (end {:#010x}); reason=anon+zero-xref+fallthrough, non-pdata",
+                existing.name,
+                s1_addr,
+                absorbed_addrs,
+                new_size,
+                new_end
+            );
+            let resized = ObjSymbol { size: new_size, size_known: true, ..existing };
+            if let Err(e) = obj.symbols.replace(s1_idx, resized) {
+                log::warn!("Failed to grow merged leaf fragment head #{s1_idx}: {e:#}");
+                continue;
+            }
+            merged_runs += 1;
+            // Strip the absorbed fragment symbols (same convention as the prune:
+            // Unknown kind, size 0, non-writable/exportable/stripped, __MERGED_
+            // name prefix so the merge is greppable in symbols.txt).
+            for &(idx, _, _, _) in &funcs[start + 1..=end] {
+                let frag = obj.symbols[idx].clone();
+                let stripped = ObjSymbol {
+                    name: format!("__MERGED_{}", frag.name),
+                    kind: ObjSymbolKind::Unknown,
+                    size: 0,
+                    flags: ObjSymbolFlagSet(
+                        ObjSymbolFlags::RelocationIgnore
+                            | ObjSymbolFlags::NoWrite
+                            | ObjSymbolFlags::NoExport
+                            | ObjSymbolFlags::Stripped,
+                    ),
+                    ..frag
+                };
+                if let Err(e) = obj.symbols.replace(idx, stripped) {
+                    log::warn!("Failed to strip absorbed leaf fragment #{idx}: {e:#}");
+                    continue;
+                }
+                absorbed += 1;
+            }
+        }
+    }
+
+    if merged_runs > 0 {
+        log::info!(
+            "Merged {} fallthrough leaf-fragment run(s), absorbing {} fragment symbol(s) \
+             (inverse of leaf-synthesis; pdata partition preserved)",
+            merged_runs,
+            absorbed
+        );
+    }
+}
+
 fn prune_overlapping_phantom_functions(obj: &mut ObjInfo) {
     use std::collections::BTreeSet;
 
@@ -1175,6 +1543,14 @@ fn split_write_obj_exe(
     // (so pdata-authoritative bounds are settled) and BEFORE the prune (its
     // additions are cleanly partitioned, so the prune sees no new overlaps).
     synthesize_reloc_targeted_leaf_functions(&mut module.obj);
+    // Merge the INVERSE defect: adjacent anonymous fall-through PDATA-less leaf
+    // fragments that CFA/leaf-synthesis over-split out of one compiled function
+    // (the AddRoll class). Runs AFTER synthesis (its fragments are the input) and
+    // BEFORE the prune (a merge never creates an overlap; the prune is the
+    // belt-and-suspenders for a stale-cache re-carve). Always-on; an optional
+    // JEFF_MERGE_PROTECT identification map suppresses absorbing map-identified
+    // real functions (P6).
+    merge_fallthrough_leaf_fragments(&mut module.obj);
     prune_overlapping_phantom_functions(&mut module.obj);
 
     if !config.symbols_known && config.detect_objects {
@@ -2031,7 +2407,173 @@ fn info(args: InfoArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::overlapping_function_intervals;
+    use super::{overlapping_function_intervals, plan_fallthrough_merge_runs, LeafFrag};
+
+    // Instruction words for the merge predicate tests.
+    const BLR: u32 = 0x4E80_0020; // hard flow terminator
+    const ADDI: u32 = 0x396B_0001; // addi r11,r11,1 — fall-through (AddRoll's lastS1)
+
+    /// Builder for a fall-through fragment with the common "mergeable tail" shape
+    /// (anonymous, zero xref, non-pdata, fall-through last insn, all in one unit).
+    fn frag(addr: u64, size: u64, last: u32) -> LeafFrag {
+        LeafFrag {
+            addr,
+            size,
+            last_insn: last,
+            xref: 0,
+            anon: true,
+            pdata: false,
+            split_key: Some(1),
+            protected: false,
+        }
+    }
+
+    #[test]
+    fn addroll_two_fragment_merge() {
+        // The confirmed TU5 fixture: fn_826976E0(16B, addi fall-through) +
+        // fn_826976F0(20B, zero xref, anon, non-pdata) -> one 36B function.
+        let frags = vec![
+            frag(0x8269_76E0, 16, ADDI),
+            frag(0x8269_76F0, 20, BLR), // real tail ends on blr
+        ];
+        assert_eq!(plan_fallthrough_merge_runs(&frags), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn hard_terminator_blocks_merge() {
+        // S1 ends on blr -> control does not fall through, so no merge even
+        // though S2 is anonymous/zero-xref/adjacent.
+        let frags =
+            vec![frag(0x1000, 8, BLR), frag(0x1008, 8, BLR)];
+        assert!(plan_fallthrough_merge_runs(&frags).is_empty());
+    }
+
+    #[test]
+    fn gap_blocks_merge() {
+        // Non-adjacent (padding word between) -> P1 fails.
+        let frags =
+            vec![frag(0x1000, 8, ADDI), frag(0x100C, 8, BLR)];
+        assert!(plan_fallthrough_merge_runs(&frags).is_empty());
+    }
+
+    #[test]
+    fn referenced_second_fragment_blocks_merge() {
+        // S2 has an independent entry (nonzero xref) -> it is a real function.
+        let mut s2 = frag(0x1008, 8, BLR);
+        s2.xref = 1;
+        let frags = vec![frag(0x1000, 8, ADDI), s2];
+        assert!(plan_fallthrough_merge_runs(&frags).is_empty());
+    }
+
+    #[test]
+    fn named_second_fragment_blocks_merge() {
+        // Never merge away a named/persisted symbol.
+        let mut s2 = frag(0x1008, 8, BLR);
+        s2.anon = false;
+        let frags = vec![frag(0x1000, 8, ADDI), s2];
+        assert!(plan_fallthrough_merge_runs(&frags).is_empty());
+    }
+
+    #[test]
+    fn pdata_anchored_endpoints_block_merge() {
+        // A pdata-anchored S1 or S2 is an authoritative boundary (P4).
+        let mut s1p = frag(0x1000, 8, ADDI);
+        s1p.pdata = true;
+        assert!(plan_fallthrough_merge_runs(&[s1p, frag(0x1008, 8, BLR)]).is_empty());
+        let mut s2p = frag(0x1008, 8, BLR);
+        s2p.pdata = true;
+        assert!(plan_fallthrough_merge_runs(&[frag(0x1000, 8, ADDI), s2p]).is_empty());
+    }
+
+    #[test]
+    fn chain_of_fragments_merges_into_one_run() {
+        // Census found chains up to 9 fragments. A 4-fragment chain (each tail
+        // falling through into the next, last ending on blr) collapses to one
+        // run [0,3]. The named function AFTER the chain is untouched.
+        let frags = vec![
+            frag(0x2000, 16, ADDI),
+            frag(0x2010, 8, ADDI),
+            frag(0x2018, 8, ADDI),
+            frag(0x2020, 12, BLR),
+            LeafFrag {
+                addr: 0x2030,
+                size: 8,
+                last_insn: BLR,
+                xref: 3,
+                anon: false,
+                pdata: true,
+                split_key: Some(1),
+                protected: false,
+            },
+        ];
+        assert_eq!(plan_fallthrough_merge_runs(&frags), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn chain_stops_at_first_non_fallthrough_tail() {
+        // Fragments 0->1 fall through, but fragment 1 ends on blr, so 2 starts a
+        // fresh unit. Only [0,1] merges; 2->3 is an independent adjacent pair
+        // that also merges as its own run.
+        let frags = vec![
+            frag(0x3000, 8, ADDI),
+            frag(0x3008, 8, BLR), // terminates -> chain breaks after absorbing here
+            frag(0x3010, 8, ADDI),
+            frag(0x3018, 8, BLR),
+        ];
+        assert_eq!(plan_fallthrough_merge_runs(&frags), vec![(0, 1), (2, 3)]);
+    }
+
+    #[test]
+    fn disjoint_singletons_produce_no_runs() {
+        let frags = vec![frag(0x4000, 8, BLR), frag(0x4008, 8, BLR), frag(0x4010, 8, BLR)];
+        assert!(plan_fallthrough_merge_runs(&frags).is_empty());
+    }
+
+    #[test]
+    fn cross_split_unit_boundary_blocks_merge() {
+        // The 0x822CFD58/0x822CFD60 over-fire: a gap fragment (split_key None)
+        // adjacent to the first anonymous function of the NEXT pinned unit
+        // (split_key Some) must NOT fuse across the TU boundary (P5), even though
+        // it is adjacent + fall-through + anonymous + zero-xref + non-pdata.
+        let mut s1_gap = frag(0x822C_FD58, 8, ADDI);
+        s1_gap.split_key = None; // inter-unit gap
+        let mut s2_unit = frag(0x822C_FD60, 0x70, BLR);
+        s2_unit.split_key = Some(0x822C_FD60); // start of MoveMgr.cpp's pinned unit
+        assert!(plan_fallthrough_merge_runs(&[s1_gap, s2_unit]).is_empty());
+    }
+
+    #[test]
+    fn protected_fragment_is_not_absorbed() {
+        // The _M_erase / operator-delete over-fire: an externally-identified real
+        // function (protected) reached by fall-through must NOT be absorbed (P6),
+        // even though it is adjacent + anonymous + zero-xref + non-pdata +
+        // same-unit. The chain HEAD may be protected (it grows, keeping identity).
+        let mut s2 = frag(0x1008, 0x50, BLR);
+        s2.protected = true;
+        assert!(plan_fallthrough_merge_runs(&[frag(0x1000, 8, ADDI), s2]).is_empty());
+        // A chain stops at the protected fragment but still merges what precedes.
+        let mut prot = frag(0x1018, 4, BLR);
+        prot.protected = true;
+        let chain = vec![
+            frag(0x1000, 8, ADDI),
+            frag(0x1008, 8, ADDI),
+            frag(0x1010, 8, ADDI),
+            prot, // 0x1018 protected -> not absorbed; chain is [0,2]
+        ];
+        assert_eq!(plan_fallthrough_merge_runs(&chain), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn same_gap_fragments_still_merge() {
+        // Two adjacent fragments both in the same inter-unit gap (split_key None)
+        // are one CFA-split function and DO merge — P5 only blocks CROSSING a
+        // boundary, not merging within a gap.
+        let mut a = frag(0x5000, 8, ADDI);
+        a.split_key = None;
+        let mut b = frag(0x5008, 8, BLR);
+        b.split_key = None;
+        assert_eq!(plan_fallthrough_merge_runs(&[a, b]), vec![(0, 1)]);
+    }
 
     /// O(n^2) reference oracle: an interval overlaps if it half-open-intersects
     /// any *other* interval. Returns the sorted set of overlapping indices.
