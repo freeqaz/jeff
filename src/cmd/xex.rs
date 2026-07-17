@@ -1362,6 +1362,596 @@ fn merge_fallthrough_leaf_fragments(obj: &mut ObjInfo) {
     }
 }
 
+/// CLASS 1 CENSUS (env-gated, read-only). When `JEFF_CLASS1_CENSUS=1`, dump every
+/// persisted `Function` symbol in a code section whose `[addr, addr+size)` span
+/// contains NO hard flow terminator (`is_hard_flow_terminator`: blr/bctr/uncond-b/
+/// zero-padding). Runs AFTER the full repair pipeline (grow/clamp/leaf-synth/
+/// class2-merge/prune) so it reflects the final symbols.txt. Uses jeff's OWN
+/// post-`tracker.apply` reloc set + `obj.pdata_funcs` + split ranges — never
+/// Python/Ghidra. For each survivor: addr/size/name/last-insn, the next symbol's
+/// info, split unit, protected status, and a primary guard-class (a-e) explaining
+/// why the class-2 merge did not absorb its tail. Output to file at
+/// `JEFF_CLASS1_CENSUS_OUT` (else stderr).
+fn census_terminatorless_functions(obj: &ObjInfo) {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Write as _;
+
+    if std::env::var_os("JEFF_CLASS1_CENSUS").is_none() {
+        return;
+    }
+
+    let is_code = |sec: SectionIndex| -> bool {
+        matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code)
+    };
+
+    let protected_addrs: BTreeSet<u64> = load_merge_protect_addrs();
+
+    // pdata-anchored starts.
+    let mut pdata_anchored: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    for sa in &obj.pdata_funcs {
+        pdata_anchored.insert((sa.section, sa.address as u64));
+    }
+
+    // TRUE post-tracker.apply reloc-target xref counts (same as the merge pass).
+    let symbol_count = obj.symbols.count();
+    let mut xrefs: BTreeMap<(SectionIndex, u64), u32> = BTreeMap::new();
+    for (_src_sec, section) in obj.sections.iter() {
+        for (_src_addr, reloc) in section.relocations.iter() {
+            if reloc.target_symbol >= symbol_count {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            if !is_code(tsec) {
+                continue;
+            }
+            let tva = tsym.address as i64 + reloc.addend;
+            if tva < 0 {
+                continue;
+            }
+            *xrefs.entry((tsec, tva as u64)).or_insert(0) += 1;
+        }
+    }
+
+    // Symbol-at-address maps: function symbols and any-kind symbols.
+    let mut func_at: BTreeMap<(SectionIndex, u64), (String, u64, bool)> = BTreeMap::new();
+    let mut any_at: BTreeMap<(SectionIndex, u64), &'static str> = BTreeMap::new();
+    for (_idx, sym) in obj.symbols.iter() {
+        let Some(sec) = sym.section else { continue };
+        if !is_code(sec) {
+            continue;
+        }
+        let tag = match sym.kind {
+            ObjSymbolKind::Function => "FUNC",
+            ObjSymbolKind::Object => "OBJ",
+            _ => "OTHER",
+        };
+        let e = any_at.entry((sec, sym.address)).or_insert(tag);
+        if tag == "FUNC" {
+            *e = "FUNC";
+        }
+        if sym.kind == ObjSymbolKind::Function && sym.size > 0 {
+            let anon = sym.name.starts_with("fn_") || sym.name.starts_with("lbl_");
+            func_at.insert((sec, sym.address), (sym.name.clone(), sym.size, anon));
+        }
+    }
+
+    let mut out: Box<dyn std::io::Write> = match std::env::var_os("JEFF_CLASS1_CENSUS_OUT") {
+        Some(p) => match std::fs::File::create(&p) {
+            std::result::Result::Ok(f) => Box::new(std::io::BufWriter::new(f)),
+            std::result::Result::Err(e) => {
+                log::warn!("JEFF_CLASS1_CENSUS_OUT {:?} unwritable: {e:#}; using stderr", p);
+                Box::new(std::io::stderr())
+            }
+        },
+        None => Box::new(std::io::stderr()),
+    };
+
+    let (mut total, mut g_a, mut g_b, mut g_c, mut g_d, mut g_e, mut g_anom) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut pinned, mut gap) = (0u64, 0u64);
+    let (mut selfpdata_ct, mut nextprot_ct) = (0u64, 0u64);
+    let (mut last_bl, mut last_bcond, mut last_bctrl, mut last_other) = (0u64, 0u64, 0u64, 0u64);
+
+    for (_idx, sym) in obj.symbols.iter() {
+        let Some(sec) = sym.section else { continue };
+        if sym.kind != ObjSymbolKind::Function || sym.size == 0 || !is_code(sec) {
+            continue;
+        }
+        let Some(section) = obj.sections.get(sec) else { continue };
+        let addr = sym.address;
+        let size = sym.size;
+        let mut has_term = false;
+        let mut w = addr;
+        while w + 4 <= addr + size {
+            if let Some(word) = read_u32(section, w as u32) {
+                if is_hard_flow_terminator(word) {
+                    has_term = true;
+                    break;
+                }
+            }
+            w += 4;
+        }
+        if has_term {
+            continue;
+        }
+        total += 1;
+
+        let last_insn = read_u32(section, (addr + size - 4) as u32).unwrap_or(0);
+        let first_insn = read_u32(section, addr as u32).unwrap_or(0);
+        let op = last_insn >> 26;
+        let lasttag = if op == 18 && (last_insn & 1) == 1 {
+            last_bl += 1;
+            "BL"
+        } else if op == 16 {
+            last_bcond += 1;
+            "BCOND"
+        } else if matches!(last_insn, 0x4E80_0021 | 0x4E80_0421) {
+            last_bctrl += 1;
+            "BCTRL"
+        } else if op == 31 && ((last_insn >> 1) & 0x3ff) == 528 && (last_insn & 1) == 1 {
+            last_bctrl += 1;
+            "BCCTRL"
+        } else {
+            last_other += 1;
+            "OTHER"
+        };
+
+        let selfpdata = pdata_anchored.contains(&(sec, addr));
+        if selfpdata {
+            selfpdata_ct += 1;
+        }
+        let self_split = section.splits.for_address(addr as u32).map(|(s, sp)| (s, sp.unit.clone()));
+        let self_split_key = self_split.as_ref().map(|(s, _)| *s);
+        let self_split_name =
+            self_split.as_ref().map(|(_, u)| u.clone()).unwrap_or_else(|| "GAP".to_string());
+        if self_split_key.is_some() {
+            pinned += 1;
+        } else {
+            gap += 1;
+        }
+
+        let next_addr = addr + size;
+        let next_func = func_at.get(&(sec, next_addr));
+        let next_any = any_at.get(&(sec, next_addr)).copied();
+        let next_xref = xrefs.get(&(sec, next_addr)).copied().unwrap_or(0);
+        let next_pdata = pdata_anchored.contains(&(sec, next_addr));
+        let next_prot = protected_addrs.contains(&next_addr);
+        if next_prot {
+            nextprot_ct += 1;
+        }
+        let next_split_key = section.splits.for_address(next_addr as u32).map(|(s, _)| s);
+        let (next_name, next_size, next_anon, next_kind): (String, u64, bool, &str) =
+            match next_func {
+                Some((n, sz, anon)) => (n.clone(), *sz, *anon, "FUNC"),
+                None => ("-".to_string(), 0, false, next_any.unwrap_or("NONE")),
+            };
+
+        let guard: &str = if selfpdata {
+            "c"
+        } else if next_kind == "FUNC" {
+            if next_xref != 0 {
+                "a"
+            } else if !next_anon {
+                "b"
+            } else if next_pdata {
+                "c"
+            } else if next_split_key != self_split_key {
+                "d"
+            } else if next_prot {
+                "b"
+            } else {
+                "anomaly"
+            }
+        } else {
+            "e"
+        };
+        match guard {
+            "a" => g_a += 1,
+            "b" => g_b += 1,
+            "c" => g_c += 1,
+            "d" => g_d += 1,
+            "e" => g_e += 1,
+            _ => g_anom += 1,
+        }
+
+        let _ = writeln!(
+            out,
+            "CLASS1 addr={:#010x} size={:#x} name={} lastw={:#010x} lasttag={} firstw={:#010x} \
+             selfpdata={} selfsplit={} nextaddr={:#010x} nextkind={} nextname={} nextsize={:#x} \
+             nextxref={} nextpdata={} nextprot={} nextsplitdiff={} guard={}",
+            addr,
+            size,
+            sym.name,
+            last_insn,
+            lasttag,
+            first_insn,
+            selfpdata as u8,
+            self_split_name,
+            next_addr,
+            next_kind,
+            next_name,
+            next_size,
+            next_xref,
+            next_pdata as u8,
+            next_prot as u8,
+            (next_split_key != self_split_key) as u8,
+            guard,
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "CLASS1_SUMMARY total={total} guard_a={g_a} guard_b={g_b} guard_c={g_c} guard_d={g_d} \
+         guard_e={g_e} anomaly={g_anom} pinned={pinned} gap={gap} selfpdata={selfpdata_ct} \
+         nextprotected={nextprot_ct} last_bl={last_bl} last_bcond={last_bcond} \
+         last_bctrl={last_bctrl} last_other={last_other}"
+    );
+    let _ = out.flush();
+    log::info!(
+        "JEFF_CLASS1_CENSUS: {total} terminatorless function symbol(s) \
+         (a={g_a} b={g_b} c={g_c} d={g_d} e={g_e} anom={g_anom}; pinned={pinned} gap={gap})"
+    );
+}
+
+/// Compute the absolute branch target of a PPC `b`/`bc` instruction (opcode 18 or
+/// 16) at `pc`. Returns None for `bl`/`bcl` (LK=1, calls that fall through) and
+/// for register-form branches (bclr/bcctr). AA=1 → absolute target.
+fn ppc_branch_target(word: u32, pc: u64) -> Option<u64> {
+    let op = word >> 26;
+    if op == 18 {
+        // b/ba/bl/bla: skip LK=1 (call).
+        if word & 1 == 1 {
+            return None;
+        }
+        let aa = (word >> 1) & 1;
+        // LI = sign-extended 26-bit (bits 6..29, already *4).
+        let mut li = (word & 0x03FF_FFFC) as i64;
+        if li & 0x0200_0000 != 0 {
+            li -= 0x0400_0000;
+        }
+        Some(if aa == 1 { li as u64 } else { (pc as i64 + li) as u64 })
+    } else if op == 16 {
+        // bc/bca/bcl/bcla: skip LK=1.
+        if word & 1 == 1 {
+            return None;
+        }
+        let aa = (word >> 1) & 1;
+        // BD = sign-extended 16-bit (bits 16..29, already *4).
+        let bd = ((word & 0x0000_FFFC) as u16) as i16 as i64;
+        Some(if aa == 1 { bd as u64 } else { (pc as i64 + bd) as u64 })
+    } else {
+        None
+    }
+}
+
+/// CLASS 4 CENSUS (env-gated, read-only). When `JEFF_CLASS4_CENSUS=1`, dump the
+/// "post-blr/branch over-carve" family: a NAMED (map-identified, i.e. in
+/// JEFF_MERGE_PROTECT — rb3-xenon renames anon `fn_` to real names POST-split, so
+/// inside dtk the only "named" signal is protect-map membership) function head S1
+/// immediately followed by one or more CONTIGUOUS anonymous, zero-xref,
+/// non-pdata, same-split-unit `fn_` tails that are reached NOT by fall-through
+/// (Class-2's case) but by a NON-`bl` branch INSIDE the accumulated head span
+/// targeting at-or-past the first tail. The head typically ENDS in a hard flow
+/// terminator (early-return `blr` or unconditional `b`), which is exactly why
+/// objdiff pairs only the tiny head → a 0.3–1% reading. This is the COMPLEMENT of
+/// [`merge_fallthrough_leaf_fragments`]. Read-only: emits the structural
+/// candidates with a `branchproof` flag (the discriminant that separates a real
+/// over-carve from a genuinely-separate anon function a naive merge would wrongly
+/// eat). Output to `JEFF_CLASS4_CENSUS_OUT` (else stderr).
+fn census_class4_overcarve(obj: &ObjInfo) {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Write as _;
+
+    if std::env::var_os("JEFF_CLASS4_CENSUS").is_none() {
+        return;
+    }
+
+    let is_code = |sec: SectionIndex| -> bool {
+        matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code)
+    };
+
+    let protected_addrs: BTreeSet<u64> = load_merge_protect_addrs();
+
+    let mut pdata_anchored: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    for sa in &obj.pdata_funcs {
+        pdata_anchored.insert((sa.section, sa.address as u64));
+    }
+
+    // Reloc-target -> list of SOURCE VAs (code-section refs). Unlike the class-2
+    // zero-xref test, class-4 tails are reached by a BRANCH from the head, which
+    // dtk models as a relocation INTO the tail — so the tail is NOT zero-xref. We
+    // must distinguish an INTERNAL reference (source inside the reconstructed
+    // function span) from an EXTERNAL one (bl / vtable slot / data ptr / jumptable
+    // from outside). A tail with any external source is an independent function.
+    // src_va = None for a data-section source (always external for a code tail).
+    let symbol_count = obj.symbols.count();
+    let mut xref_src: BTreeMap<(SectionIndex, u64), Vec<Option<u64>>> = BTreeMap::new();
+    for (src_sec, section) in obj.sections.iter() {
+        let src_is_code = is_code(src_sec);
+        // NOTE: `ObjRelocations` is keyed by the ABSOLUTE source VA (the tracker
+        // inserts instruction VAs), so `src_addr` IS the source VA directly — do
+        // NOT add section.address (that would double-count and mark every
+        // referenced tail external).
+        for (src_addr, reloc) in section.relocations.iter() {
+            if reloc.target_symbol >= symbol_count {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            if !is_code(tsec) {
+                continue;
+            }
+            let tva = tsym.address as i64 + reloc.addend;
+            if tva < 0 {
+                continue;
+            }
+            let src_va = if src_is_code { Some(src_addr as u64) } else { None };
+            xref_src.entry((tsec, tva as u64)).or_default().push(src_va);
+        }
+    }
+    // Does target `a` have any reference sourced OUTSIDE [lo, hi)? (data sources
+    // and any code source outside the window count as external.)
+    let has_external_ref = |sec: SectionIndex, a: u64, lo: u64, hi: u64| -> bool {
+        match xref_src.get(&(sec, a)) {
+            None => false,
+            Some(srcs) => srcs.iter().any(|s| match s {
+                None => true,
+                Some(v) => *v < lo || *v >= hi,
+            }),
+        }
+    };
+
+    // Per code section: sorted (addr, size, anon, protected, name).
+    let mut by_section: BTreeMap<SectionIndex, Vec<(u64, u64, bool, bool, String)>> =
+        BTreeMap::new();
+    for (_idx, sym) in obj.symbols.iter() {
+        let Some(sec) = sym.section else { continue };
+        if sym.kind != ObjSymbolKind::Function || sym.size == 0 || !is_code(sec) {
+            continue;
+        }
+        let anon = sym.name.starts_with("fn_") || sym.name.starts_with("lbl_");
+        let prot = protected_addrs.contains(&sym.address);
+        by_section.entry(sec).or_default().push((
+            sym.address,
+            sym.size,
+            anon,
+            prot,
+            sym.name.clone(),
+        ));
+    }
+    for v in by_section.values_mut() {
+        v.sort_by_key(|&(a, _, _, _, _)| a);
+        v.dedup_by_key(|&mut (a, _, _, _, _)| a);
+    }
+
+    // Object symbols in code sections (except_data / padding / jump tables) keyed
+    // by start -> end. Used only under JEFF_CLASS4_RELAX to allow the head→tail
+    // adjacency to skip exactly one intervening data-in-text object (the MakeHSL
+    // case: an except_data record sits between the head and its first anon tail).
+    let relax = std::env::var_os("JEFF_CLASS4_RELAX").is_some();
+    let mut obj_span: BTreeMap<(SectionIndex, u64), u64> = BTreeMap::new();
+    if relax {
+        for (_idx, sym) in obj.symbols.iter() {
+            let Some(sec) = sym.section else { continue };
+            if sym.kind == ObjSymbolKind::Object && sym.size > 0 && is_code(sec) {
+                obj_span.insert((sec, sym.address), sym.address + sym.size);
+            }
+        }
+    }
+
+    let mut out: Box<dyn std::io::Write> = match std::env::var_os("JEFF_CLASS4_CENSUS_OUT") {
+        Some(p) => match std::fs::File::create(&p) {
+            std::result::Result::Ok(f) => Box::new(std::io::BufWriter::new(f)),
+            std::result::Result::Err(e) => {
+                log::warn!("JEFF_CLASS4_CENSUS_OUT {:?} unwritable: {e:#}; using stderr", p);
+                Box::new(std::io::stderr())
+            }
+        },
+        None => Box::new(std::io::stderr()),
+    };
+
+    let (mut total, mut proof_yes, mut proof_no) = (0u64, 0u64, 0u64);
+    let (mut pinned, mut gap) = (0u64, 0u64);
+    let (mut head_blr, mut head_b, mut head_bctr, mut head_cond, mut head_other) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut chain1, mut chain2, mut chain3plus) = (0u64, 0u64, 0u64);
+    let mut proof_yes_pinned = 0u64;
+    let (mut relaxed_groups, mut relaxed_proof) = (0u64, 0u64);
+
+    for (sec, funcs) in &by_section {
+        let Some(section) = obj.sections.get(*sec) else { continue };
+        let split_key = |a: u64| section.splits.for_address(a as u32).map(|(s, _)| s);
+        let split_name = |a: u64| {
+            section.splits.for_address(a as u32).map(|(_, sp)| sp.unit.clone())
+        };
+        let n = funcs.len();
+        let mut i = 0usize;
+        while i < n {
+            let (h_addr, h_size, h_anon, h_prot, h_name) = funcs[i].clone();
+            let head_named = !h_anon || h_prot;
+            let dbg = std::env::var_os("JEFF_CLASS4_DEBUG").is_some()
+                && (h_addr == 0x824F5480 || h_addr == 0x824F5368);
+            if dbg {
+                eprintln!(
+                    "[C4DBG] head 0x{:x} size 0x{:x} anon={} prot={} named={}; next func: {:x?}; \
+                     objspan@end={:x?}",
+                    h_addr,
+                    h_size,
+                    h_anon,
+                    h_prot,
+                    head_named,
+                    funcs.get(i + 1).map(|f| (f.0, f.1, f.2, f.3)),
+                    obj_span.get(&(*sec, h_addr + h_size)),
+                );
+            }
+            if !head_named {
+                i += 1;
+                continue;
+            }
+            // Phase 1: greedy maximal structural run (adjacency + anon +
+            // non-pdata + same-split + not-protected), IGNORING xref for now.
+            let h_split = split_key(h_addr);
+            let mut j = i;
+            let mut cur_end = h_addr + h_size;
+            let mut run: Vec<(u64, u64)> = Vec::new(); // (addr, size)
+            let mut relaxed_used = false;
+            while j + 1 < n {
+                let (a, sz, anon, prot, _) = funcs[j + 1].clone();
+                if a != cur_end {
+                    // P1 adjacency. Under JEFF_CLASS4_RELAX, tolerate exactly one
+                    // intervening data-in-text object (except_data/padding) that
+                    // fills [cur_end, a) — the MakeHSL over-carve shape.
+                    if relax && obj_span.get(&(*sec, cur_end)).copied() == Some(a) {
+                        relaxed_used = true;
+                    } else {
+                        break;
+                    }
+                }
+                if !anon {
+                    break; // tail must be anonymous
+                }
+                if pdata_anchored.contains(&(*sec, a)) {
+                    break; // P4 not pdata-anchored (authoritative boundary)
+                }
+                if split_key(a) != h_split {
+                    break; // P5 same split unit
+                }
+                if prot {
+                    break; // don't absorb a map-identified real function tail
+                }
+                run.push((a, sz));
+                cur_end = a + sz;
+                j += 1;
+            }
+            if dbg {
+                eprintln!("[C4DBG] run for 0x{:x}: {:x?}", h_addr, run);
+            }
+            if run.is_empty() {
+                i += 1;
+                continue;
+            }
+            let run_end = cur_end;
+            // Phase 2: cut the run at the first tail that has an EXTERNAL reference
+            // (sourced outside [h_addr, run_end)) — that tail is an independent
+            // function, not part of this head. A branch from the head into a tail
+            // is an INTERNAL ref (source inside the window) and is allowed.
+            let mut tail_addrs: Vec<u64> = Vec::new();
+            let mut chain_end = h_addr + h_size;
+            for &(a, sz) in &run {
+                if has_external_ref(*sec, a, h_addr, run_end) {
+                    break;
+                }
+                tail_addrs.push(a);
+                chain_end = a + sz;
+            }
+            if tail_addrs.is_empty() {
+                i += 1;
+                continue;
+            }
+            let first_tail = tail_addrs[0];
+            // Branch-target proof: any non-bl branch in the accumulated span whose
+            // target lands in [first_tail, chain_end).
+            let mut branchproof = false;
+            let mut w = h_addr;
+            while w + 4 <= chain_end {
+                if let Some(word) = read_u32(section, w as u32) {
+                    if let Some(t) = ppc_branch_target(word, w) {
+                        if t >= first_tail && t < chain_end {
+                            branchproof = true;
+                            break;
+                        }
+                    }
+                }
+                w += 4;
+            }
+            // Head terminating instruction class.
+            let last = read_u32(section, (h_addr + h_size - 4) as u32).unwrap_or(0);
+            let op = last >> 26;
+            let htag = if matches!(last, 0x4E80_0020 | 0x4E80_0021) {
+                head_blr += 1;
+                "BLR"
+            } else if op == 18 && (last & 1) == 0 {
+                head_b += 1;
+                "B"
+            } else if matches!(last, 0x4E80_0420 | 0x4E80_0421) {
+                head_bctr += 1;
+                "BCTR"
+            } else if op == 16 {
+                head_cond += 1;
+                "BCOND"
+            } else {
+                head_other += 1;
+                "OTHER"
+            };
+
+            total += 1;
+            if branchproof {
+                proof_yes += 1;
+            } else {
+                proof_no += 1;
+            }
+            let is_pinned = h_split.is_some();
+            if is_pinned {
+                pinned += 1;
+            } else {
+                gap += 1;
+            }
+            if branchproof && is_pinned {
+                proof_yes_pinned += 1;
+            }
+            match tail_addrs.len() {
+                1 => chain1 += 1,
+                2 => chain2 += 1,
+                _ => chain3plus += 1,
+            }
+            if relaxed_used {
+                relaxed_groups += 1;
+                if branchproof {
+                    relaxed_proof += 1;
+                }
+            }
+
+            let _ = writeln!(
+                out,
+                "CLASS4 head={:#010x} headsize={:#x} headname={} headprot={} headterm={} \
+                 ntails={} tails={:x?} chainend={:#010x} branchproof={} pinned={} relaxed={} split={}",
+                h_addr,
+                h_size,
+                h_name,
+                h_prot as u8,
+                htag,
+                tail_addrs.len(),
+                tail_addrs,
+                chain_end,
+                branchproof as u8,
+                is_pinned as u8,
+                relaxed_used as u8,
+                split_name(h_addr).unwrap_or_else(|| "GAP".to_string()),
+            );
+
+            // Advance past the head + the INCLUDED tails only (the run may have
+            // been cut short by an external ref; the cut tail restarts the scan).
+            let _ = j;
+            i += 1 + tail_addrs.len();
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "CLASS4_SUMMARY total={total} branchproof_yes={proof_yes} branchproof_no={proof_no} \
+         pinned={pinned} gap={gap} proof_yes_pinned={proof_yes_pinned} \
+         head_blr={head_blr} head_b={head_b} head_bctr={head_bctr} head_cond={head_cond} \
+         head_other={head_other} chain1={chain1} chain2={chain2} chain3plus={chain3plus} \
+         relaxed_groups={relaxed_groups} relaxed_proof={relaxed_proof}"
+    );
+    let _ = out.flush();
+    log::info!(
+        "JEFF_CLASS4_CENSUS: {total} named-head over-carve group(s) \
+         (branchproof yes={proof_yes} no={proof_no}; pinned={pinned}; proof_yes_pinned={proof_yes_pinned})"
+    );
+}
+
 fn prune_overlapping_phantom_functions(obj: &mut ObjInfo) {
     use std::collections::BTreeSet;
 
@@ -1562,6 +2152,12 @@ fn split_write_obj_exe(
     // real functions (P6).
     merge_fallthrough_leaf_fragments(&mut module.obj);
     prune_overlapping_phantom_functions(&mut module.obj);
+    // CLASS 1 CENSUS (env-gated, read-only): dump terminatorless survivors after
+    // the full repair pipeline. No-op unless JEFF_CLASS1_CENSUS is set.
+    census_terminatorless_functions(&module.obj);
+    // CLASS 4 CENSUS (env-gated, read-only): named-head post-blr/branch over-carve
+    // groups. No-op unless JEFF_CLASS4_CENSUS is set.
+    census_class4_overcarve(&module.obj);
 
     if !config.symbols_known && config.detect_objects {
         debug!("Detecting object boundaries");
