@@ -1703,6 +1703,7 @@ fn census_class4_overcarve(obj: &ObjInfo) {
     };
 
     // Per code section: sorted (addr, size, anon, protected, name).
+    #[allow(clippy::type_complexity)] // read-only census scratch; kept as a tuple
     let mut by_section: BTreeMap<SectionIndex, Vec<(u64, u64, bool, bool, String)>> =
         BTreeMap::new();
     for (_idx, sym) in obj.symbols.iter() {
@@ -1952,6 +1953,298 @@ fn census_class4_overcarve(obj: &ObjInfo) {
     );
 }
 
+/// Merge the CLASS-4 defect: post-`blr`/branch OVER-CARVE. jeff/dtk splits ONE
+/// real function into a NAMED (map-identified) head `S1` plus one or more
+/// CONTIGUOUS anonymous `fn_<addr>` tail fragments, triggered by an early-return
+/// `blr` and/or a forward conditional branch INSIDE the head. objdiff then pairs
+/// our full compiled body only against the tiny head (→ a 0.3–1.0% reading). The
+/// SOURCE and the VA→name map are already correct; the defect is purely the
+/// target carve. This pass grows `S1` to cover `[S1.addr, chain_end)` and strips
+/// the absorbed anon tails, so the target `.obj` contains the whole function.
+///
+/// ## Exact complement of [`merge_fallthrough_leaf_fragments`] (Class-2)
+///
+/// Class-2 required the head to NOT end in a hard-flow terminator (fall-through,
+/// its P2). Class-4 heads DO end in a terminator (`blr`/`b`/`bctr`) yet the body
+/// continues past it into a zero-EXTERNAL-ref anon tail reached by a *branch*
+/// inside the head. Class-2's P2 excludes them by design; this pass is the
+/// disjoint other half. It reuses Class-2's entire safety architecture (P4 pdata,
+/// P5 same-split-unit, P6 `JEFF_MERGE_PROTECT`, audit log, run AFTER leaf-synthesis
+/// and the Class-2 merge, BEFORE the prune).
+///
+/// ## Predicate (design.md §"Class 4", the census-validated ground truth)
+///   - **P1 adjacency (exact):** `cur_end == next.addr` — no intervening object.
+///     (The relaxed one-intervening-`except_data` variant is intentionally NOT
+///     implemented here; ship exact first.)
+///   - **P2′ POSITIVE BRANCH-TARGET PROOF (load-bearing, MANDATORY):** there is a
+///     non-`bl` branch inside `[S1.addr, chain_end)` whose computed target VA lands
+///     in `[first_tail, chain_end)`. This is what licenses merging *across* a `blr`
+///     (a `blr` legitimately ends most real functions, so adjacency alone is
+///     unsafe). Without it the pass over-fires by ≥10 (e.g. the
+///     `fn_822769A8`→`fn_82276A20` except_data phantom, which this proof FAILs).
+///   - **P3′ zero EXTERNAL refs:** the tail's only incoming references are sourced
+///     INSIDE the reconstructed span. NOT "zero incoming relocs" — the head's
+///     branch INTO the tail IS a reloc; we test only refs whose *source* VA lies
+///     outside the window. `ObjRelocations` is keyed by ABSOLUTE source VA (the
+///     tracker inserts instruction VAs), so `src_addr` is used directly — adding
+///     `section.address` would mark every referenced tail external and the pass
+///     would find nothing. Tail must also be anon (`fn_`/`lbl_`).
+///   - **P4 not-pdata-anchored (HARD):** neither the head nor any tail is a
+///     `.pdata`-anchored start. This correctly blocks MakeHSL (its tail is behind
+///     the pdata-anchored shared return block `fn_824F54D0`). Never relaxed.
+///   - **P5 same-split-unit:** all tails share the head's split unit (else dtk's
+///     "split ends within symbol" build failure).
+///   - **P6 `JEFF_MERGE_PROTECT`:** a protected address is never absorbed as a
+///     tail (tails are anon by construction, so this is belt-and-suspenders). The
+///     head is the chain HEAD and grows keeping its identity.
+///
+/// ## Idempotency / re-split byte-stability
+///
+/// Monotone (only grows named heads / strips anon tails), deterministic, and runs
+/// every split AFTER leaf-synthesis. In a PINNED unit the leaf pass never re-carves
+/// a code-only (branch-target) leaf out of a parent, so the merged head stays
+/// merged. Should a stale cache or a gap re-carve re-create a tail, this pass
+/// re-merges it on the same pass, and the prune is the belt-and-suspenders — the
+/// emitted `symbols.txt` converges to the merged extent across re-splits.
+fn merge_branch_reached_overcarve_tails(obj: &mut ObjInfo) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let is_code = |sec: SectionIndex| -> bool {
+        matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code)
+    };
+
+    // (0) Externally-identified real function starts to never absorb (P6).
+    let protected_addrs: BTreeSet<u64> = load_merge_protect_addrs();
+
+    // (1) pdata-anchored starts — genuine boundaries, never merged (P4).
+    let mut pdata_anchored: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
+    for sa in &obj.pdata_funcs {
+        pdata_anchored.insert((sa.section, sa.address as u64));
+    }
+
+    // (2) Reloc-target -> list of SOURCE VAs (code sources) / None (data source).
+    //     Class-4 tails ARE reached by a branch from the head (a reloc INTO the
+    //     tail), so they are never literally zero-xref; we distinguish an INTERNAL
+    //     ref (source inside the reconstructed span) from an EXTERNAL one. MUST-FIX:
+    //     `ObjRelocations` is keyed by the ABSOLUTE source VA — use `src_addr`
+    //     directly (do NOT add section.address).
+    let symbol_count = obj.symbols.count();
+    let mut xref_src: BTreeMap<(SectionIndex, u64), Vec<Option<u64>>> = BTreeMap::new();
+    for (src_sec, section) in obj.sections.iter() {
+        let src_is_code = is_code(src_sec);
+        for (src_addr, reloc) in section.relocations.iter() {
+            if reloc.target_symbol >= symbol_count {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            if !is_code(tsec) {
+                continue;
+            }
+            let tva = tsym.address as i64 + reloc.addend;
+            if tva < 0 {
+                continue;
+            }
+            let src_va = if src_is_code { Some(src_addr as u64) } else { None };
+            xref_src.entry((tsec, tva as u64)).or_default().push(src_va);
+        }
+    }
+    // Does target `a` have any reference sourced OUTSIDE [lo, hi)? (P3′)
+    let has_external_ref = |sec: SectionIndex, a: u64, lo: u64, hi: u64| -> bool {
+        match xref_src.get(&(sec, a)) {
+            None => false,
+            Some(srcs) => srcs.iter().any(|s| match s {
+                None => true,
+                Some(v) => *v < lo || *v >= hi,
+            }),
+        }
+    };
+
+    // (3) Per code section: function symbols sorted by address, with symbol index.
+    //     `protected` is recomputed inline from `protected_addrs` where needed
+    //     (keeps this tuple a 4-field one, matching the Class-2 pass).
+    let mut by_section: BTreeMap<SectionIndex, Vec<(SymbolIndex, u64, u64, bool)>> = BTreeMap::new();
+    for (idx, sym) in obj.symbols.iter() {
+        let Some(sec) = sym.section else { continue };
+        if sym.kind != ObjSymbolKind::Function || sym.size == 0 || !is_code(sec) {
+            continue;
+        }
+        let anon = sym.name.starts_with("fn_") || sym.name.starts_with("lbl_");
+        by_section.entry(sec).or_default().push((idx, sym.address, sym.size, anon));
+    }
+    for v in by_section.values_mut() {
+        v.sort_by_key(|&(_, a, _, _)| a);
+        v.dedup_by_key(|&mut (_, a, _, _)| a);
+    }
+
+    // (4) Plan merges (immutable borrow only), then apply. A plan is
+    //     (head_idx, new_size, head_addr, chain_end, [tail_idx..]).
+    struct Plan {
+        head_idx: SymbolIndex,
+        new_size: u64,
+        head_addr: u64,
+        chain_end: u64,
+        tail_idxs: Vec<SymbolIndex>,
+    }
+    let mut plans: Vec<Plan> = Vec::new();
+
+    for (sec, funcs) in &by_section {
+        let Some(section) = obj.sections.get(*sec) else { continue };
+        let split_key = |a: u64| section.splits.for_address(a as u32).map(|(s, _)| s);
+        let n = funcs.len();
+        let mut i = 0usize;
+        while i < n {
+            let (_h_idx, h_addr, h_size, h_anon) = funcs[i];
+            let h_prot = protected_addrs.contains(&h_addr);
+            // Head must be map-identified/named (protected or a real dtk name).
+            let head_named = !h_anon || h_prot;
+            if !head_named {
+                i += 1;
+                continue;
+            }
+            let h_split = split_key(h_addr);
+            // Phase 1: greedy maximal structural run (P1 exact adjacency + anon +
+            // P4 non-pdata + P5 same-split + P6 not-protected), ignoring xref.
+            let mut j = i;
+            let mut cur_end = h_addr + h_size;
+            let mut run: Vec<(SymbolIndex, u64, u64)> = Vec::new(); // (idx, addr, size)
+            while j + 1 < n {
+                let (a_idx, a, sz, anon) = funcs[j + 1];
+                if a != cur_end {
+                    break; // P1 exact adjacency (relaxed variant not implemented)
+                }
+                if !anon {
+                    break; // tail must be anonymous
+                }
+                if pdata_anchored.contains(&(*sec, a)) {
+                    break; // P4 not pdata-anchored (authoritative boundary)
+                }
+                if split_key(a) != h_split {
+                    break; // P5 same split unit
+                }
+                if protected_addrs.contains(&a) {
+                    break; // P6 never absorb a map-identified real function tail
+                }
+                run.push((a_idx, a, sz));
+                cur_end = a + sz;
+                j += 1;
+            }
+            if run.is_empty() {
+                i += 1;
+                continue;
+            }
+            let run_end = cur_end;
+            // Phase 2: cut the run at the first tail with an EXTERNAL reference
+            // (sourced outside [h_addr, run_end)) — that tail is an independent
+            // function. A branch from the head into a tail is an INTERNAL ref.
+            let mut tail_idxs: Vec<SymbolIndex> = Vec::new();
+            let mut tail_addrs: Vec<u64> = Vec::new();
+            let mut chain_end = h_addr + h_size;
+            for &(t_idx, a, sz) in &run {
+                if has_external_ref(*sec, a, h_addr, run_end) {
+                    break;
+                }
+                tail_idxs.push(t_idx);
+                tail_addrs.push(a);
+                chain_end = a + sz;
+            }
+            if tail_addrs.is_empty() {
+                i += 1;
+                continue;
+            }
+            let first_tail = tail_addrs[0];
+            // P2′ branch-target proof (MANDATORY): a non-bl branch in the
+            // accumulated span whose target lands in [first_tail, chain_end).
+            let mut branchproof = false;
+            let mut w = h_addr;
+            while w + 4 <= chain_end {
+                if let Some(word) = read_u32(section, w as u32) {
+                    if let Some(t) = ppc_branch_target(word, w) {
+                        if t >= first_tail && t < chain_end {
+                            branchproof = true;
+                            break;
+                        }
+                    }
+                }
+                w += 4;
+            }
+            let consumed = tail_addrs.len();
+            if branchproof {
+                plans.push(Plan {
+                    head_idx: funcs[i].0,
+                    new_size: chain_end - h_addr,
+                    head_addr: h_addr,
+                    chain_end,
+                    tail_idxs,
+                });
+            }
+            // Advance past the head + the included tails (mirrors the census: a
+            // branchproof-failing group's anon tails are never valid heads, so
+            // consuming them is safe and keeps the scan linear).
+            i += 1 + consumed;
+        }
+    }
+
+    // (5) Apply: grow each head to its chain end, strip the absorbed anon tails
+    //     (same symbol-removal convention as the Class-2 merge / the prune).
+    let mut merged_runs = 0usize;
+    let mut absorbed = 0usize;
+    for plan in &plans {
+        let existing = obj.symbols[plan.head_idx].clone();
+        let head_name = existing.name.clone();
+        let absorbed_addrs: Vec<u64> = plan
+            .tail_idxs
+            .iter()
+            .map(|&t| obj.symbols[t].address)
+            .collect();
+        log::info!(
+            "Merging branch-reached over-carve tails into {} @ {:#010x}: absorbing {:#x?} \
+             -> merged size {:#x} (end {:#010x}); reason=anon+internal-only+branch-proven, \
+             non-pdata (Class-4)",
+            head_name,
+            plan.head_addr,
+            absorbed_addrs,
+            plan.new_size,
+            plan.chain_end
+        );
+        let resized = ObjSymbol { size: plan.new_size, size_known: true, ..existing };
+        if let Err(e) = obj.symbols.replace(plan.head_idx, resized) {
+            log::warn!("Failed to grow branch-reached over-carve head #{}: {e:#}", plan.head_idx);
+            continue;
+        }
+        merged_runs += 1;
+        for &t_idx in &plan.tail_idxs {
+            let frag = obj.symbols[t_idx].clone();
+            let stripped = ObjSymbol {
+                name: format!("__MERGED_{}", frag.name),
+                kind: ObjSymbolKind::Unknown,
+                size: 0,
+                flags: ObjSymbolFlagSet(
+                    ObjSymbolFlags::RelocationIgnore
+                        | ObjSymbolFlags::NoWrite
+                        | ObjSymbolFlags::NoExport
+                        | ObjSymbolFlags::Stripped,
+                ),
+                ..frag
+            };
+            if let Err(e) = obj.symbols.replace(t_idx, stripped) {
+                log::warn!("Failed to strip absorbed over-carve tail #{t_idx}: {e:#}");
+                continue;
+            }
+            absorbed += 1;
+        }
+    }
+
+    if merged_runs > 0 {
+        log::info!(
+            "Merged {} branch-reached over-carve group(s), absorbing {} anon tail symbol(s) \
+             (Class-4 complement of the fall-through merge; pdata partition preserved)",
+            merged_runs,
+            absorbed
+        );
+    }
+}
+
 fn prune_overlapping_phantom_functions(obj: &mut ObjInfo) {
     use std::collections::BTreeSet;
 
@@ -2151,6 +2444,15 @@ fn split_write_obj_exe(
     // JEFF_MERGE_PROTECT identification map suppresses absorbing map-identified
     // real functions (P6).
     merge_fallthrough_leaf_fragments(&mut module.obj);
+    // Merge the CLASS-4 defect (the disjoint complement of the above): a NAMED
+    // (map-identified) head that ends in a hard terminator (`blr`/`b`) yet
+    // continues past it into contiguous anonymous, internal-only, branch-proven
+    // tails. Grows the head to cover the whole function so the target `.obj`
+    // pairs the full compiled body. Runs AFTER the Class-2 merge and BEFORE the
+    // prune (same slot/idempotency model); the mandatory branch-target proof (P2′)
+    // licenses merging across the head's `blr`. Always-on; JEFF_MERGE_PROTECT (P6)
+    // shields map-identified real functions from being absorbed as tails.
+    merge_branch_reached_overcarve_tails(&mut module.obj);
     prune_overlapping_phantom_functions(&mut module.obj);
     // CLASS 1 CENSUS (env-gated, read-only): dump terminatorless survivors after
     // the full repair pipeline. No-op unless JEFF_CLASS1_CENSUS is set.
@@ -3179,6 +3481,30 @@ mod tests {
         let mut b = frag(0x5008, 8, BLR);
         b.split_key = None;
         assert_eq!(plan_fallthrough_merge_runs(&[a, b]), vec![(0, 1)]);
+    }
+
+    /// The Class-4 branch-target proof (P2′) relies on decoding `b`/`bc` targets.
+    /// A `bl`/`bcl` (call) must return None (it falls through, does not license a
+    /// merge); a backward/forward `b` and a conditional `bc` must decode exactly.
+    #[test]
+    fn ppc_branch_target_decodes_and_skips_calls() {
+        use super::ppc_branch_target;
+        // `b +0x20` at 0x1000 (opcode 18, LI=0x20, AA=0, LK=0) -> 0x1020.
+        assert_eq!(ppc_branch_target(0x4800_0020, 0x1000), Some(0x1020));
+        // `bl +0x20` (LK=1) is a call — must be skipped (None).
+        assert_eq!(ppc_branch_target(0x4800_0021, 0x1000), None);
+        // Backward `b -0x10` at 0x1000 (LI = -0x10 = 0x03FF_FFF0) -> 0xFF0.
+        assert_eq!(ppc_branch_target(0x4BFF_FFF0, 0x1000), Some(0x0FF0));
+        // `bge +0x2C` (opcode 16, BD=0x2C, LK=0) at 0x1000 -> 0x102C. This is the
+        // MakeColor-class early forward branch that proves the over-carve.
+        assert_eq!(ppc_branch_target(0x4080_002C, 0x1000), Some(0x102C));
+        // `bcl` (conditional call, LK=1) -> None.
+        assert_eq!(ppc_branch_target(0x4080_002D, 0x1000), None);
+        // A non-branch instruction (`addi`) -> None.
+        assert_eq!(ppc_branch_target(0x396B_0001, 0x1000), None);
+        // `bctr`/`blr` are register-form (opcode 19) -> None (not a computed
+        // target the proof can use); the head terminator is classified elsewhere.
+        assert_eq!(ppc_branch_target(0x4E80_0020, 0x1000), None);
     }
 
     /// O(n^2) reference oracle: an interval overlaps if it half-open-intersects
