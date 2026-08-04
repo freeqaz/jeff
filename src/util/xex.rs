@@ -2940,6 +2940,231 @@ mod tests {
             "spurious except_data on live code (instruction word1) must be rejected"
         );
     }
+
+    /// Build a `.text`-only module for the `strip_spurious_except_data` tests.
+    /// `words` are big-endian instruction/data words starting at `base`.
+    fn eh_fixture(base: u32, words: &[u32]) -> ObjInfo {
+        let mut data = Vec::with_capacity(words.len() * 4);
+        for w in words {
+            data.extend_from_slice(&w.to_be_bytes());
+        }
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: base as u64,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            elf_index: 0,
+            relocations: ObjRelocations::default(),
+            virtual_address: Some(base as u64),
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test.exe".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
+    fn add_sym(obj: &mut ObjInfo, name: &str, addr: u32, size: u64, kind: ObjSymbolKind) {
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: name.into(),
+                address: addr as u64,
+                section: Some(0),
+                size,
+                size_known: size != 0,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    fn sym_named<'a>(obj: &'a ObjInfo, name: &str) -> Option<&'a ObjSymbol> {
+        obj.symbols.iter().find(|(_, s)| s.name == name).map(|(_, s)| s)
+    }
+
+    /// The core defect: a spurious `except_data_*` sitting exactly at a
+    /// PDATA-less function's declared end must be stripped AND the function must
+    /// re-grow over it, so the bytes reach `write_asm` as code rather than as an
+    /// `.obj` block of `.4byte`.
+    ///
+    /// Mirrors RB3 retail's `fn_827AF260` / `except_data_8278A2E0` exactly,
+    /// including the trap that made the naive fix wrong: the spurious blob's
+    /// DECLARED SIZE (0x18) runs through the GENUINE prefix of the next function,
+    /// so growing by the blob's size would swallow real EH data. Growth must stop
+    /// at the next surviving symbol (0x30, not 0x38).
+    #[test]
+    fn strip_spurious_except_data_regrows_truncated_extent() {
+        let base = 0x82000000u32;
+        // 0x00..0x20  fn_A body (8 instrs), 0x20..0x30 its stripped-off tail,
+        // 0x30..0x38 a GENUINE EH prefix, 0x38.. the next function.
+        let mut obj = eh_fixture(base, &[
+            0x89440050, 0x39600000, 0x280A0000, 0x40820014, // fn_A
+            0x39400006, 0x91630000, 0x91430004, 0x4E800020,
+            0x39400001, 0x91630004, 0x91430000, 0x4E800020, // the truncated tail
+            0x82000000, 0x82000004, // genuine EH prefix: word1 -> code section
+            0x7D8802A6, 0x4E800020, // next function
+        ]);
+        add_sym(&mut obj, "fn_A", base, 0x20, ObjSymbolKind::Function);
+        // Spurious: word1 at 0x20 is 0x39400001 (`li r10,1`), not a code VA.
+        // Its declared 0x18 deliberately overruns the genuine prefix.
+        add_sym(&mut obj, "except_data_SPUR", base + 0x20, 0x18, ObjSymbolKind::Object);
+        add_sym(&mut obj, "except_data_GEN", base + 0x30, 8, ObjSymbolKind::Object);
+        add_sym(&mut obj, "fn_B", base + 0x38, 8, ObjSymbolKind::Function);
+
+        let (stripped, regrown) = strip_spurious_except_data(&mut obj);
+        assert_eq!((stripped, regrown), (1, 1));
+
+        let a = sym_named(&obj, "fn_A").expect("fn_A must survive");
+        assert_eq!(
+            a.size, 0x30,
+            "fn_A must re-grow only to the next SURVIVING symbol (the genuine \
+             prefix at +0x30), NOT by the fossil's bogus 0x18 declared size"
+        );
+        assert!(
+            sym_named(&obj, "except_data_SPUR").is_none(),
+            "the spurious blob must be renamed away so it cannot be re-emitted"
+        );
+        let g = sym_named(&obj, "except_data_GEN").expect("genuine prefix must be untouched");
+        assert_eq!(g.size, 8);
+        assert_eq!(g.kind, ObjSymbolKind::Object);
+    }
+
+    /// A blob strictly INSIDE a body is stripped but triggers no re-growth (the
+    /// body already covers it), and `.pdata`-anchored functions are NEVER
+    /// extended -- `.pdata` is the authoritative boundary source.
+    #[test]
+    fn strip_spurious_except_data_respects_pdata_and_inside_blobs() {
+        let base = 0x82000000u32;
+        let mut obj = eh_fixture(base, &[
+            0x7D8802A6, 0x39400001, 0x91630004, 0x4E800020, // fn_P body (pdata-anchored)
+            0x39400002, 0x4E800020, 0x60000000, 0x60000000,
+        ]);
+        add_sym(&mut obj, "fn_P", base, 0x10, ObjSymbolKind::Function);
+        obj.pdata_funcs.push(SectionAddress::new(0, base));
+        // INSIDE fn_P's body.
+        add_sym(&mut obj, "except_data_INSIDE", base + 8, 8, ObjSymbolKind::Object);
+        // Exactly AT fn_P's end -- but fn_P is pdata-anchored, so no growth.
+        add_sym(&mut obj, "except_data_ATEND", base + 0x10, 8, ObjSymbolKind::Object);
+
+        let (stripped, regrown) = strip_spurious_except_data(&mut obj);
+        assert_eq!(stripped, 2, "both spurious blobs must be stripped");
+        assert_eq!(regrown, 0, "a .pdata-anchored function must never be extended");
+        assert_eq!(sym_named(&obj, "fn_P").unwrap().size, 0x10);
+    }
+
+    /// REGRESSION (found only by diffing the emitted `.s`): a genuine PDATA_EH
+    /// struct clipped to 4 bytes must be restored to 8 BEFORE its fossil partner
+    /// is stripped. Otherwise the prefix's tail word is left uncovered and
+    /// `write_asm` disassembles handler data as an instruction.
+    #[test]
+    fn strip_spurious_except_data_restores_clipped_prefix() {
+        let base = 0x82000000u32;
+        let mut obj = eh_fixture(base, &[
+            0x7D8802A6, 0x4E800020, // some function
+            0x82000000, 0x82100000, // EH prefix: word0 -> code, word1 -> .rdata-ish
+            0x7D8802A6, 0x4E800020, // the func_type==3 function at +0x10
+        ]);
+        // The genuine symbol was clipped to 4 bytes; a fossil covers word1.
+        add_sym(&mut obj, "except_data_GEN", base + 8, 4, ObjSymbolKind::Object);
+        add_sym(&mut obj, "except_data_FOSSIL", base + 0xC, 4, ObjSymbolKind::Object);
+        // The anchor that makes the 8-byte repair authoritative.
+        obj.pdata_funcs.push(SectionAddress::new(0, base + 0x10));
+
+        let (stripped, _) = strip_spurious_except_data(&mut obj);
+        assert_eq!(stripped, 1, "only the fossil at +0xC is spurious");
+        let g = sym_named(&obj, "except_data_GEN").expect("genuine must survive");
+        assert_eq!(
+            g.size, 8,
+            "a PDATA_EH struct is 8 bytes by definition; leaving it at 4 exposes \
+             the handler-data word as a disassembled instruction"
+        );
+        assert!(sym_named(&obj, "except_data_FOSSIL").is_none());
+    }
+
+    /// Without the `.pdata` anchor the 8-byte repair must NOT fire -- the anchor
+    /// is what makes it authoritative rather than a guess.
+    #[test]
+    fn clipped_prefix_repair_requires_a_pdata_anchor() {
+        let base = 0x82000000u32;
+        let mut obj = eh_fixture(base, &[
+            0x7D8802A6, 0x4E800020, 0x82000000, 0x82100000, 0x7D8802A6, 0x4E800020,
+        ]);
+        add_sym(&mut obj, "except_data_GEN", base + 8, 4, ObjSymbolKind::Object);
+        add_sym(&mut obj, "except_data_FOSSIL", base + 0xC, 4, ObjSymbolKind::Object);
+        // deliberately NO pdata_funcs entry
+        strip_spurious_except_data(&mut obj);
+        assert_eq!(
+            sym_named(&obj, "except_data_GEN").unwrap().size,
+            4,
+            "no .pdata anchor => no authority to resize"
+        );
+    }
+
+    /// A function body can never contain the NEXT function's EH prefix. CFA can
+    /// produce one after `strip_spurious_except_data` un-blocks the bytes.
+    #[test]
+    fn clamp_functions_over_except_data_trims_overcarved_body() {
+        let base = 0x82000000u32;
+        let mut obj = eh_fixture(base, &[
+            0x81630008, 0x556B06F7, 0x4D820020, 0x80630004, // real 6-instr leaf
+            0x4BB079E8, 0x4E800020,
+            0x82000000, 0x82100000, // genuine EH prefix at +0x18
+            0x7D8802A6, 0x4E800020, // the function it belongs to, at +0x20
+        ]);
+        // Over-carved: 0x20 runs to +0x20, swallowing the prefix at +0x18.
+        add_sym(&mut obj, "fn_over", base, 0x20, ObjSymbolKind::Function);
+        add_sym(&mut obj, "except_data_GEN", base + 0x18, 8, ObjSymbolKind::Object);
+        add_sym(&mut obj, "fn_next", base + 0x20, 8, ObjSymbolKind::Function);
+
+        assert_eq!(clamp_functions_over_except_data(&mut obj), 1);
+        assert_eq!(
+            sym_named(&obj, "fn_over").unwrap().size,
+            0x18,
+            "body must stop at the prefix that belongs to the next function"
+        );
+        // Idempotent: a second run has nothing to do.
+        assert_eq!(clamp_functions_over_except_data(&mut obj), 0);
+    }
+
+    /// The clamp must not touch a body that merely ENDS at a prefix, nor one
+    /// that contains a SPURIOUS blob (which is code, not data).
+    #[test]
+    fn clamp_functions_over_except_data_leaves_correct_bodies_alone() {
+        let base = 0x82000000u32;
+        let mut obj = eh_fixture(base, &[
+            0x7D8802A6, 0x39400001, 0x91630004, 0x4E800020,
+            0x82000000, 0x82100000, // genuine prefix at +0x10
+            0x7D8802A6, 0x4E800020,
+        ]);
+        add_sym(&mut obj, "fn_exact", base, 0x10, ObjSymbolKind::Function);
+        add_sym(&mut obj, "except_data_GEN", base + 0x10, 8, ObjSymbolKind::Object);
+        assert_eq!(
+            clamp_functions_over_except_data(&mut obj),
+            0,
+            "a body ENDING at a prefix is correct, not over-carved"
+        );
+
+        // A spurious blob inside a body is code; the clamp must ignore it.
+        let mut obj2 = eh_fixture(base, &[
+            0x7D8802A6, 0x39400001, 0x91630004, 0x4E800020,
+            0x39400002, 0x4E800020, 0x60000000, 0x60000000,
+        ]);
+        add_sym(&mut obj2, "fn_body", base, 0x20, ObjSymbolKind::Function);
+        add_sym(&mut obj2, "except_data_SPUR", base + 0x10, 8, ObjSymbolKind::Object);
+        assert_eq!(
+            clamp_functions_over_except_data(&mut obj2),
+            0,
+            "a SPURIOUS blob is code; only a GENUINE prefix may clamp a body"
+        );
+    }
 }
 
 // debug only, lists section bounds

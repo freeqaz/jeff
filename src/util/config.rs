@@ -70,6 +70,25 @@ pub fn apply_symbols_file(
                 // than dropping) lets apply_cfa's jump-table pass replace the
                 // entry and heal the size too, so a corrupted file converges
                 // back to a correct one instead of wedging the project.
+                //
+                // RELATIONSHIP TO `strip_spurious_except_data` (util/xex.rs): that
+                // pass is evidence-based (word1 must resolve to a code section) and
+                // runs immediately after this file is applied, so it is tempting to
+                // read this name-based rule as a weaker duplicate of it. It is NOT,
+                // and must NOT be removed:
+                //   * it also covers `jumptable_*` and `except_record_*`, for which
+                //     NO word1 evidence exists — and the jump-table case is the one
+                //     that actually wedged dc3 (`?LowerForearm` /
+                //     `jumptable_82B7291C`, dde965c);
+                //   * it answers a different question (what KIND is this entry) at a
+                //     different stage than "are these bytes really EH data".
+                // The only overlap is a spurious `except_data_*` arriving as
+                // `type:function`: this retypes it to Object and
+                // `strip_spurious_except_data` then strips it — correct either way.
+                // VERIFIED 2026-08-04: re-injecting the dde965c damage into dc3's
+                // symbols.txt recovers identically under the old and new binaries
+                // (exit 0, no overlap wedge, jumptable_82B7291C back to type:object
+                // size 0x58, ?LowerForearm still 0xB4).
                 if symbol.kind == ObjSymbolKind::Function
                     && (symbol.name.starts_with("jumptable_")
                         || symbol.name.starts_with("except_data_")
