@@ -521,7 +521,7 @@ where
                     write_symbol_entry(w, symbols, entry, section)?;
                 }
                 current_symbol_kind =
-                    find_symbol_kind(current_symbol_kind, symbols, vec, section.kind)?;
+                    find_symbol_kind(current_symbol_kind, symbols, vec, section.kind, section.address)?;
                 current_data_kind = find_data_kind(current_data_kind, symbols, vec)
                     .with_context(|| format!("At address {sym_addr:#010X}"))?;
                 entry = entry_iter.next();
@@ -538,7 +538,7 @@ where
                     write_symbol_entry(w, symbols, entry, section)?;
                 }
                 current_symbol_kind =
-                    find_symbol_kind(current_symbol_kind, symbols, vec, section.kind)?;
+                    find_symbol_kind(current_symbol_kind, symbols, vec, section.kind, section.address)?;
                 current_data_kind = find_data_kind(current_data_kind, symbols, vec)
                     .with_context(|| format!("At address {sym_addr:#010X}"))?;
                 entry = entry_iter.next();
@@ -625,6 +625,12 @@ fn find_symbol_kind(
     symbols: &[ObjSymbol],
     entries: &Vec<SymbolEntry>,
     section_kind: ObjSectionKind,
+    // Base address of the section being written, purely so the conflict log can
+    // report a real VA. Symbol addresses here are section-relative in the split
+    // object, so logging one bare produced lines like "Conflicting symbol kinds
+    // at 0x00001E7C" — an offset that matches no address in the binary and that
+    // nobody could act on. Tests pass 0.
+    section_address: u64,
 ) -> Result<ObjSymbolKind> {
     let mut kind = current;
     let mut found = false;
@@ -725,9 +731,17 @@ fn find_symbol_kind(
             .first()
             .map(|e| symbols[e.index as usize].address)
             .unwrap_or(0);
-        log::warn!(
+        // debug!, not warn!: this is a fully recovered condition with a
+        // dedicated regression test (see
+        // test_find_symbol_kind_conflict_prefers_section_default). It is also
+        // expected in bulk on an XEX — 332 sites on RB3 retail (45410914),
+        // 165 `except_data_*`, 151 `fn_*`, 16 `jumptable_*`, every one of them
+        // resolved to Function in a Code section, which is the correct answer.
+        // Warning about an outcome we are confident in trains readers to ignore
+        // warnings.
+        log::debug!(
             "Conflicting symbol kinds at {:#010X}; picked {:?} for section kind {:?}: {:?}",
-            address,
+            section_address + address,
             kind,
             section_kind,
             conflict_names,
@@ -1257,7 +1271,7 @@ mod tests {
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
 
         let result =
-            find_symbol_kind(ObjSymbolKind::Unknown, &symbols, &entries, ObjSectionKind::Data)
+            find_symbol_kind(ObjSymbolKind::Unknown, &symbols, &entries, ObjSectionKind::Data, 0)
                 .unwrap();
         assert_eq!(result, ObjSymbolKind::Object);
     }
@@ -1269,7 +1283,7 @@ mod tests {
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Label }];
 
         let result =
-            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Data)
+            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Data, 0)
                 .unwrap();
         // Label entries should not change the kind
         assert_eq!(result, ObjSymbolKind::Object);
@@ -1298,7 +1312,7 @@ mod tests {
 
         // FIXED behavior: End entry resets kind to Unknown
         let result =
-            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Code)
+            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Code, 0)
                 .unwrap();
 
         // Kind should reset to Unknown so write_data() can default to Function for Code sections
@@ -1327,7 +1341,7 @@ mod tests {
         ];
 
         let result =
-            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Code)
+            find_symbol_kind(ObjSymbolKind::Object, &symbols, &entries, ObjSectionKind::Code, 0)
                 .unwrap();
         // B's Start entry should set the kind to Function
         assert_eq!(result, ObjSymbolKind::Function);
@@ -1340,7 +1354,7 @@ mod tests {
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
 
         let result =
-            find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries, ObjSectionKind::Code)
+            find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries, ObjSectionKind::Code, 0)
                 .unwrap();
         // Unknown symbols shouldn't change the kind
         assert_eq!(result, ObjSymbolKind::Function);
@@ -1353,7 +1367,7 @@ mod tests {
         let entries = vec![SymbolEntry { index: 0, kind: SymbolEntryKind::Start }];
 
         let result =
-            find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries, ObjSectionKind::Code)
+            find_symbol_kind(ObjSymbolKind::Function, &symbols, &entries, ObjSectionKind::Code, 0)
                 .unwrap();
         // Section symbols shouldn't change the kind
         assert_eq!(result, ObjSymbolKind::Function);
@@ -1383,6 +1397,7 @@ mod tests {
             &symbols,
             &entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(code, ObjSymbolKind::Function);
@@ -1393,6 +1408,7 @@ mod tests {
             &symbols,
             &entries,
             ObjSectionKind::Data,
+         0,
         )
         .unwrap();
         assert_eq!(data, ObjSymbolKind::Object);
@@ -1403,6 +1419,7 @@ mod tests {
             &symbols,
             &entries,
             ObjSectionKind::ReadOnlyData,
+         0,
         )
         .unwrap();
         assert_eq!(rdata, ObjSymbolKind::Object);
@@ -1419,6 +1436,7 @@ mod tests {
             &symbols,
             &entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(result, ObjSymbolKind::Unknown);
@@ -1443,6 +1461,7 @@ mod tests {
             &symbols,
             &entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(result, ObjSymbolKind::Function);
@@ -1469,6 +1488,7 @@ mod tests {
             &symbols,
             &entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(result, ObjSymbolKind::Object);
@@ -1488,6 +1508,7 @@ mod tests {
             &symbols,
             &entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(result, ObjSymbolKind::Function);
@@ -1506,6 +1527,7 @@ mod tests {
             &symbols,
             &start_entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(kind, ObjSymbolKind::Object, "Jump table start should set Object");
@@ -1517,6 +1539,7 @@ mod tests {
             &symbols,
             &end_entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(kind, ObjSymbolKind::Unknown, "Jump table end should reset to Unknown");
@@ -1528,6 +1551,7 @@ mod tests {
             &symbols,
             &empty_entries,
             ObjSectionKind::Code,
+         0,
         )
         .unwrap();
         assert_eq!(kind, ObjSymbolKind::Unknown, "No entries should preserve Unknown");

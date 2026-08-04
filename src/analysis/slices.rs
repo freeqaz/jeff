@@ -382,7 +382,17 @@ impl FunctionSlices {
         }
         if let Some(fn_addr) = self.is_known_function(known_functions, ins_addr) {
             if fn_addr != function_start {
-                log::warn!(
+                // debug!, not warn!: this is a recovered condition on a path we
+                // take deliberately, and on an XEX it is overwhelmingly benign.
+                // Measured on RB3 retail (45410914): 8,564 sites, of which 8,563
+                // start at an 8-byte EH prefix (a .text + .rdata pointer pair
+                // MSVC emits ahead of a function) and 8,412 reach the real
+                // function exactly 8 bytes later. Walking two pointer-words and
+                // arriving at the function they precede is the expected outcome,
+                // not a warning — and at warn! it survived RUST_LOG=warn, so it
+                // was the single largest class a downstream project could not
+                // filter out without also hiding real warnings.
+                log::debug!(
                     "Control flow from {} hit known function {} (instruction: {})",
                     function_start,
                     fn_addr,

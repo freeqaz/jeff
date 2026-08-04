@@ -260,7 +260,33 @@ impl VM {
     pub fn step(&mut self, obj: &ObjInfo, ins_addr: SectionAddress, ins: Ins) -> StepResult {
         match ins.op {
             Opcode::Illegal => {
-                println!("Warning! Illegal inst found at 0x{:X}", ins_addr.address);
+                // Distinguish inter-function alignment padding from a real
+                // decoder gap. MSVC pads .text with a single 0x00000000 word to
+                // 8-align the next function, so a linear walk that steps past a
+                // hard terminator (b / blr / bctr) lands on one. Measured on RB3
+                // retail (45410914): all 265 sites are exactly 0x00000000, 262
+                // sit immediately after an unconditional terminator, 264 are at
+                // addr % 8 == 4, and all 265 fall in gaps between .pdata extents
+                // — i.e. none is inside any function. That is expected scan
+                // behaviour, not a finding, so it must not be reported as one.
+                //
+                // A NON-zero illegal word is a different animal: it means the
+                // disassembler could not decode a word that really is inside
+                // code (e.g. a VMX128 form we don't model). Keep that visible at
+                // debug and include the word so it is actionable.
+                //
+                // This was a bare println! that bypassed tracing entirely, so it
+                // could not be filtered by RUST_LOG at all — 311 unfilterable
+                // lines per split.
+                if ins.code == 0 {
+                    log::trace!("Alignment padding at {:#010X} (0x00000000)", ins_addr.address);
+                } else {
+                    log::debug!(
+                        "Undecodable instruction {:#010X} at {:#010X}",
+                        ins.code,
+                        ins_addr.address,
+                    );
+                }
                 return StepResult::Illegal;
             }
             // add rD, rA, rB

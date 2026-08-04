@@ -959,16 +959,28 @@ pub fn process_function_at(
         }
         true
     } else {
-        log::info!("Not a function @ {:#010X}", addr);
+        // debug!, not info!: on an XEX this is dominated by CFA correctly
+        // declining a data blob, which is routine and not worth a line each.
+        // Measured on RB3 retail (45410914): 8,610 sites, ALL of them in gaps
+        // between .pdata extents (none at a function start, none mid-body), and
+        // 8,353 (97.0%) have addr+8 as a real .pdata function start — they are
+        // the 8-byte EH prefixes MSVC emits ahead of a function, a .text pointer
+        // followed by an .rdata pointer. Declining them is the correct answer.
+        log::debug!("Not a function @ {:#010X}", addr);
         let info = functions.entry(addr).or_default();
         info.analyzed = true;
         // Don't clobber a pre-seeded end. discover_seeds populates info.end
         // from pdata (Xbox 360 unwind table) and from symbols.txt entries
-        // whose sizes are known. Those bounds are authoritative even when
-        // CFA can't trace through the body — RB3 contains VMX128 (Xbox 360
-        // SIMD) opcodes that the disassembler doesn't decode, which makes
-        // slices.analyze bail with `false`. Preserving info.end lets
-        // apply_cfa still emit a properly-sized symbol.
+        // whose sizes are known. Those bounds are authoritative even when CFA
+        // can't trace through the body.
+        //
+        // NB: this comment used to attribute the whole class to undecodable
+        // VMX128 opcodes. That is NOT what dominates it — the census above
+        // found 0 of 8,610 sites at a .pdata function start, so essentially
+        // none is a real function whose body failed to decode. Preserving
+        // info.end still matters for the cases that are, but do not use this
+        // log line as evidence of a decoder gap; the vm.rs Illegal arm reports
+        // that directly, and only for non-zero words.
         false
     })
 }
@@ -1047,7 +1059,12 @@ fn merge_tail_blocks(
                 ObjSymbolKind::Function,
             ) {
                 if !sym.flags.is_no_write() && !sym.flags.is_stripped() {
-                    log::info!(
+                    // debug!, not info!: respecting a committed split boundary is
+                    // the COMMON CASE, not an event. Every persisted function
+                    // symbol adjacent to its predecessor lands here — 43,113 times
+                    // on RB3 retail (45410914), i.e. 70% of the entire build log,
+                    // drowning the handful of INFO lines that do report an action.
+                    log::debug!(
                         "Skipping tail block merge of {:#010X} (persisted function symbol '{}', scope {:?})",
                         func_addr,
                         sym.name,
