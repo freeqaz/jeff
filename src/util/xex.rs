@@ -1376,6 +1376,69 @@ pub fn strip_spurious_except_data(obj: &mut ObjInfo) -> (usize, usize) {
     let doomed: std::collections::BTreeSet<ObjSymbolIndex> =
         spurious.iter().map(|&(idx, ..)| idx).collect();
 
+    let pdata_anchored: std::collections::BTreeSet<(ObjSectionIndex, u64)> =
+        obj.pdata_funcs.iter().map(|sa| (sa.section, sa.address as u64)).collect();
+
+    // (1b) A genuine PDATA_EH struct is EIGHT BYTES BY DEFINITION — restore any
+    // that a previous generation clipped.
+    //
+    // ⚠ THIS STEP IS LOAD-BEARING FOR CORRECTNESS OF STEP (5), and it was found
+    // only by diffing the emitted `.s`, not by reasoning about the classifier.
+    // On RB3 TU5 exactly 5 of the 9,142 genuine blobs carry `size:0x4`, because
+    // an earlier split split the 8-byte prefix into TWO 4-byte objects: the
+    // genuine symbol kept word0 and a fossil `except_data_*` covered word1. If
+    // we strip that fossil while its partner is still 4 bytes wide, word1 — an
+    // `.rdata` handler-data pointer — is left uncovered and `write_asm`
+    // disassembles it as an instruction (measured: `0x82047484` came out as
+    // `lwz r16, 0x7484(r4)` in CharClipGroup.s). That is a REGRESSION: leg A had
+    // both words as data, split across two `.obj` blocks.
+    //
+    // The invariant is authoritative, not heuristic: every one of the 9,142
+    // genuine blobs has `address + 8` equal to a `.pdata` function start, so the
+    // struct provably occupies `[F-8, F)`. Requiring that anchor keeps this from
+    // resizing anything that is not a real EH prefix. Verified: the only symbol
+    // strictly inside each clipped blob's `(addr, addr+8)` is the fossil being
+    // stripped, so widening collides with nothing.
+    //
+    // Fixing the size here — rather than refusing to strip the 5 fossils — is
+    // what keeps the classifier honest. The obvious alternative guard ("do not
+    // strip a blob that overlaps a genuine EH prefix") uses the FOSSIL'S OWN
+    // DECLARED SIZE, which is untrustworthy: it fires on 9 blobs, reclaiming 3
+    // TRUE positives including `except_data_8278A2E0`, whose bogus 0x18 size
+    // makes it "overlap" the next function's genuine prefix. Widening the real
+    // struct fixes the real defect and costs no true positive.
+    let mut clipped: Vec<(ObjSymbolIndex, u64, u64)> = Vec::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if doomed.contains(&idx) || !sym.name.starts_with("except_data_") || sym.size == 8 {
+            continue;
+        }
+        let Some(sec) = sym.section else { continue };
+        if !matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code) {
+            continue;
+        }
+        if !except_data_is_genuine(obj, sym) {
+            continue;
+        }
+        if !pdata_anchored.contains(&(sec, sym.address + 8)) {
+            continue;
+        }
+        clipped.push((idx, sym.address, sym.size));
+    }
+    for &(idx, addr, old) in &clipped {
+        let existing = obj.symbols[idx].clone();
+        log::info!(
+            "Restoring clipped PDATA_EH struct {} @ {:#010x}: size {:#x} -> 0x8 \
+             (an EH prefix is 8 bytes; the tail was covered by a fossil symbol)",
+            existing.name,
+            addr,
+            old,
+        );
+        let fixed = ObjSymbol { size: 8, size_known: true, ..existing };
+        if let Err(e) = obj.symbols.replace(idx, fixed) {
+            log::warn!("Failed to restore clipped PDATA_EH struct #{idx}: {e:#}");
+        }
+    }
+
     // (2) Surviving symbol addresses per section — the ceiling for any re-growth.
     let mut survivors: BTreeMap<ObjSectionIndex, Vec<u64>> = BTreeMap::new();
     for (idx, sym) in obj.symbols.iter() {
@@ -1392,8 +1455,6 @@ pub fn strip_spurious_except_data(obj: &mut ObjInfo) -> (usize, usize) {
     }
 
     // (3) Functions per section, for finding the one a blob truncated.
-    let pdata_anchored: std::collections::BTreeSet<(ObjSectionIndex, u64)> =
-        obj.pdata_funcs.iter().map(|sa| (sa.section, sa.address as u64)).collect();
     let mut funcs: BTreeMap<ObjSectionIndex, Vec<(ObjSymbolIndex, u64, u64)>> = BTreeMap::new();
     for (idx, sym) in obj.symbols.iter() {
         if doomed.contains(&idx) || sym.kind != ObjSymbolKind::Function || sym.size == 0 {
@@ -1467,8 +1528,16 @@ pub fn strip_spurious_except_data(obj: &mut ObjInfo) -> (usize, usize) {
             addr,
             size,
         );
+        // Rename to dtk's ordinary internal-code-label form rather than
+        // `prune_overlapping_phantom_functions`' `__DELETED_` prefix. These
+        // addresses are BRANCH TARGETS (that is the proof they are code), so the
+        // name is not merely bookkeeping — it is printed as the operand of a live
+        // branch in the emitted `.s`. `bne lbl_827AF280` reads as what it is;
+        // `bne __DELETED_except_data_8278A2E0` reads like a bug. The symbol stays
+        // Stripped/NoWrite, so it never returns to symbols.txt to truncate the
+        // extent again.
         let stripped = ObjSymbol {
-            name: format!("__DELETED_{}", existing.name),
+            name: format!("lbl_{:08X}", existing.address as u32),
             kind: ObjSymbolKind::Unknown,
             size: 0,
             flags: ObjSymbolFlagSet(
@@ -1489,6 +1558,84 @@ pub fn strip_spurious_except_data(obj: &mut ObjInfo) -> (usize, usize) {
         grow.len(),
     );
     (spurious.len(), grow.len())
+}
+
+/// Clamp any function extent that runs into a genuine PDATA_EH struct.
+///
+/// A genuine EH prefix occupies `[F-8, F)` for a `func_type == 3` function `F`,
+/// so it belongs to the function that FOLLOWS it and can never legitimately sit
+/// inside another function's body. Anything claiming otherwise has over-carved.
+///
+/// This exists because `strip_spurious_except_data` runs BEFORE control-flow
+/// analysis, by necessity — the whole point is that the fossil must not be
+/// present while extents are being decided. But removing it also un-blocks the
+/// bytes it was sitting on, and CFA will legitimately discover a real function
+/// there and then size it by running to the next known function start, absorbing
+/// that function's 8-byte EH prefix on the way.
+///
+/// MEASURED: exactly one site on RB3 TU5 — `fn_82768B18` (a real 6-instruction
+/// leaf ending in a tail call) came back sized 0x20 instead of 0x18, swallowing
+/// `except_data_82768B38` @ 0x82768B30 so its two words disassembled as `lwz`.
+/// Found only by diffing the emitted `.s` against the pre-change tree; no
+/// classifier or count would have shown it.
+///
+/// Runs LATE (after the merge/prune repair passes, before symbols/splits are
+/// written) so it sees final extents. Returns the number of clamped functions.
+pub fn clamp_functions_over_except_data(obj: &mut ObjInfo) -> usize {
+    // Genuine EH prefix starts, per code section.
+    let mut prefixes: BTreeMap<ObjSectionIndex, Vec<u64>> = BTreeMap::new();
+    for (_idx, sym) in obj.symbols.iter() {
+        if !sym.name.starts_with("except_data_") || sym.flags.is_stripped() {
+            continue;
+        }
+        let Some(sec) = sym.section else { continue };
+        if !matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code) {
+            continue;
+        }
+        if except_data_is_genuine(obj, sym) {
+            prefixes.entry(sec).or_default().push(sym.address);
+        }
+    }
+    for v in prefixes.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+
+    let mut plan: Vec<(ObjSymbolIndex, u64, u64, u64, u64)> = Vec::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if sym.kind != ObjSymbolKind::Function || sym.size == 0 || sym.flags.is_stripped() {
+            continue;
+        }
+        let Some(sec) = sym.section else { continue };
+        let Some(list) = prefixes.get(&sec) else { continue };
+        // First prefix strictly inside (address, address + size).
+        let i = list.partition_point(|&p| p <= sym.address);
+        if let Some(&p) = list.get(i) {
+            if p < sym.address + sym.size {
+                plan.push((idx, sym.address, sym.size, p - sym.address, p));
+            }
+        }
+    }
+    for &(idx, addr, old, new, p) in &plan {
+        let existing = obj.symbols[idx].clone();
+        log::info!(
+            "Clamping {} @ {:#010x}: size {:#x} -> {:#x} (body ran into the genuine \
+             PDATA_EH prefix at {:#010x}, which belongs to the NEXT function)",
+            existing.name,
+            addr,
+            old,
+            new,
+            p,
+        );
+        let clamped = ObjSymbol { size: new, size_known: true, ..existing };
+        if let Err(e) = obj.symbols.replace(idx, clamped) {
+            log::warn!("Failed to clamp over-carved function #{idx}: {e:#}");
+        }
+    }
+    if !plan.is_empty() {
+        log::info!("Clamped {} function(s) over-carved into a PDATA_EH prefix", plan.len());
+    }
+    plan.len()
 }
 
 pub fn write_coff(

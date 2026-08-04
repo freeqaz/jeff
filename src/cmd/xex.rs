@@ -51,7 +51,7 @@ use crate::{
         split::{split_obj, update_splits},
         xex::{
             coff_path_for_unit, extract_exe, genuine_except_data_set, list_exe_sections,
-            strip_spurious_except_data,
+            clamp_functions_over_except_data, strip_spurious_except_data,
             process_xex, write_coff, XexCompression, XexEncryption, XexInfo,
         },
         xpdb::try_parse_pdb,
@@ -2503,6 +2503,12 @@ fn split_write_obj_exe(
     // shields map-identified real functions from being absorbed as tails.
     merge_branch_reached_overcarve_tails(&mut module.obj);
     prune_overlapping_phantom_functions(&mut module.obj);
+    // A function body can never contain the NEXT function's 8-byte EH prefix.
+    // Runs here, after the repair passes, because CFA can legitimately discover a
+    // real function in the bytes `strip_spurious_except_data` un-blocked and then
+    // size it by running to the next known function start. See
+    // `clamp_functions_over_except_data`.
+    clamp_functions_over_except_data(&mut module.obj);
     // CLASS 1 CENSUS (env-gated, read-only): dump terminatorless survivors after
     // the full repair pipeline. No-op unless JEFF_CLASS1_CENSUS is set.
     census_terminatorless_functions(&module.obj);
