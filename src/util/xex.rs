@@ -1269,25 +1269,226 @@ pub fn genuine_except_data_set(obj: &ObjInfo) -> std::collections::BTreeSet<Stri
     let mut set = std::collections::BTreeSet::new();
     for (_idx, sym) in obj.symbols.iter() {
         let Some(suffix) = sym.name.strip_prefix("except_data_") else { continue };
-        let Some(section_idx) = sym.section else { continue };
-        let Some(sect) = obj.sections.get(section_idx) else { continue };
-        let offset = (sym.address - sect.address) as usize;
-        let handler_va = if offset + 4 <= sect.data.len() {
-            u32::from_be_bytes(sect.data[offset..offset + 4].try_into().unwrap())
-        } else {
-            0
-        };
-        let handler_is_code = handler_va != 0
-            && obj
-                .sections
-                .at_address(handler_va)
-                .map(|(_, s)| s.kind == ObjSectionKind::Code)
-                .unwrap_or(false);
-        if handler_is_code {
+        if except_data_is_genuine(obj, sym) {
             set.insert(suffix.to_string());
         }
     }
     set
+}
+
+/// THE evidence test for "is this `except_data_*` symbol a real PDATA_EH
+/// struct?", factored out so every consumer asks the same question. A genuine
+/// struct's word1 is the C++ frame handler VA and therefore resolves to a code
+/// section; a spurious one's word1 is an instruction encoding (or zero) that
+/// does not.
+///
+/// Must be evaluated against the FULL (un-split) module — the retail XEX shares
+/// one `__CxxFrameHandler` living in a different unit than most EH structs, so a
+/// per-split-object lookup would reject every cross-unit handler.
+///
+/// Deliberately keyed on the symbol's ADDRESS, never on its name: on RB3 TU5,
+/// 8,862 of 9,348 `except_data_*` symbols carry a NAME whose hex suffix does not
+/// equal `address + 8` (stale text preserved across the TU0 -> TU5 rebase), so
+/// any name-derived test here would be reading a fossil.
+pub fn except_data_is_genuine(obj: &ObjInfo, sym: &ObjSymbol) -> bool {
+    let Some(section_idx) = sym.section else { return false };
+    let Some(sect) = obj.sections.get(section_idx) else { return false };
+    let offset = (sym.address - sect.address) as usize;
+    let handler_va = if offset + 4 <= sect.data.len() {
+        u32::from_be_bytes(sect.data[offset..offset + 4].try_into().unwrap())
+    } else {
+        0
+    };
+    handler_va != 0
+        && obj
+            .sections
+            .at_address(handler_va)
+            .map(|(_, s)| s.kind == ObjSectionKind::Code)
+            .unwrap_or(false)
+}
+
+/// Strip `except_data_*` Object symbols that sit on LIVE CODE, and re-grow any
+/// function extent one of them truncated.
+///
+/// `write_coff` has skipped these since `b1bc97c` ("treating bytes as code"),
+/// but that decision was made too late to matter anywhere else: the symbol had
+/// already terminated the preceding function's extent and had already reached
+/// `write_asm`, which emits it as an `.obj` block of `.4byte` directives. So
+/// the human-readable `.s` — the artifact people and agents actually read to
+/// write matching source — showed real instructions as opaque data words, and
+/// the truncated function's tail was missing from its own body. This pass moves
+/// that one decision UPSTREAM of the extent/symbol/asm paths, so there is ONE
+/// classifier (`except_data_is_genuine`) rather than two.
+///
+/// Must run AFTER `apply_symbols_file` (the offenders come from the symbols
+/// file) and BEFORE any CFA/extent analysis or symbol/split writing.
+///
+/// MEASURED on RB3 retail TU5 (45410914), against the committed symbols.txt:
+/// 9,348 `except_data_*` in `.text`, 9,142 genuine and 206 spurious. Every one
+/// of the 9,142 genuine blobs sits exactly at a `.pdata` `func_type == 3`
+/// record's `start - 8`, and NONE of the 206 spurious ones does — i.e. on this
+/// target the offenders are 100% STALE SYMBOLS-FILE FOSSILS carried across the
+/// TU0 -> TU5 rebase, not live `.pdata` mis-decodes. (`b1bc97c`'s premise, that
+/// LTCG `.pdata` emits `func_type == 3` records pointing into the middle of real
+/// functions, does not hold on TU5 — its `.pdata` is clean.) Because nothing
+/// regenerates them, stripping is a PERMANENT heal and the split's fixed point
+/// is reached in one pass.
+///
+/// Of the 206: 121 sit strictly inside a function body, 64 sit exactly at a
+/// PDATA-less function's declared end (truncating it; 552 bytes of real code
+/// emitted as `.4byte`), 18 sit in unclaimed gaps, and 3 sit at the end of a
+/// correctly-sized `.pdata`-anchored function.
+///
+/// Re-growth rules, both deliberately conservative:
+///   * `.pdata`-anchored functions are NEVER extended — `.pdata` is the
+///     authoritative boundary source on Xbox 360, and all 3 such cases already
+///     have `declared size == .pdata size`, so growing them would corrupt a
+///     correct extent.
+///   * A function grows only up to the next SURVIVING symbol. The spurious
+///     blob's own declared size is untrustworthy (it is fossil data): e.g.
+///     `except_data_8278A2E0` @ 0x827AF280 claims 0x18, which would run through
+///     the GENUINE EH struct at 0x827AF290 that belongs to the next function.
+///     Stopping at the next survivor yields the correct 0x30 extent instead.
+///
+/// Returns (stripped, extended).
+pub fn strip_spurious_except_data(obj: &mut ObjInfo) -> (usize, usize) {
+    // (1) Classify. Address-keyed, never name-keyed (see `except_data_is_genuine`).
+    let mut spurious: Vec<(ObjSymbolIndex, ObjSectionIndex, u64, u64)> = Vec::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if !sym.name.starts_with("except_data_") {
+            continue;
+        }
+        let Some(sec) = sym.section else { continue };
+        // Only code sections: an `except_data_*` in .rdata/.data is not the
+        // failure mode this pass exists for, and stripping it could lose a real
+        // data label.
+        if !matches!(obj.sections.get(sec), Some(s) if s.kind == ObjSectionKind::Code) {
+            continue;
+        }
+        if except_data_is_genuine(obj, sym) {
+            continue;
+        }
+        spurious.push((idx, sec, sym.address, sym.size));
+    }
+    if spurious.is_empty() {
+        return (0, 0);
+    }
+    let doomed: std::collections::BTreeSet<ObjSymbolIndex> =
+        spurious.iter().map(|&(idx, ..)| idx).collect();
+
+    // (2) Surviving symbol addresses per section — the ceiling for any re-growth.
+    let mut survivors: BTreeMap<ObjSectionIndex, Vec<u64>> = BTreeMap::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if doomed.contains(&idx) || sym.flags.is_stripped() {
+            continue;
+        }
+        if let Some(sec) = sym.section {
+            survivors.entry(sec).or_default().push(sym.address);
+        }
+    }
+    for v in survivors.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+
+    // (3) Functions per section, for finding the one a blob truncated.
+    let pdata_anchored: std::collections::BTreeSet<(ObjSectionIndex, u64)> =
+        obj.pdata_funcs.iter().map(|sa| (sa.section, sa.address as u64)).collect();
+    let mut funcs: BTreeMap<ObjSectionIndex, Vec<(ObjSymbolIndex, u64, u64)>> = BTreeMap::new();
+    for (idx, sym) in obj.symbols.iter() {
+        if doomed.contains(&idx) || sym.kind != ObjSymbolKind::Function || sym.size == 0 {
+            continue;
+        }
+        if let Some(sec) = sym.section {
+            funcs.entry(sec).or_default().push((idx, sym.address, sym.size));
+        }
+    }
+    for v in funcs.values_mut() {
+        v.sort_by_key(|&(_, a, _)| a);
+    }
+
+    // (4) Plan re-growth under an immutable borrow, then apply.
+    let mut grow: Vec<(ObjSymbolIndex, u64, u64, u64)> = Vec::new(); // idx, addr, old, new
+    for &(_, sec, addr, bsize) in &spurious {
+        let Some(list) = funcs.get(&sec) else { continue };
+        let i = match list.binary_search_by_key(&addr, |&(_, a, _)| a) {
+            Ok(i) => i,
+            Err(0) => continue,
+            Err(i) => i - 1,
+        };
+        let (fidx, faddr, fsize) = list[i];
+        // Only the AT_END case: the blob is exactly what stopped the function.
+        // A blob strictly INSIDE a body did not truncate anything (the body
+        // already covers it) — stripping alone is the whole fix there.
+        if faddr + fsize != addr {
+            continue;
+        }
+        if pdata_anchored.contains(&(sec, faddr)) {
+            continue; // .pdata is authoritative; never override a correct extent
+        }
+        let Some(surv) = survivors.get(&sec) else { continue };
+        let ceiling = match surv.partition_point(|&a| a <= addr) {
+            p if p < surv.len() => surv[p],
+            // No surviving symbol after it: fall back to the blob's own claimed
+            // extent rather than guessing at the section end.
+            _ => addr + bsize.max(4),
+        };
+        let new_size = ceiling - faddr;
+        if new_size > fsize {
+            grow.push((fidx, faddr, fsize, new_size));
+        }
+    }
+
+    for &(idx, addr, old, new) in &grow {
+        let existing = obj.symbols[idx].clone();
+        log::info!(
+            "Re-growing {} @ {:#010x}: size {:#x} -> {:#x} (was truncated by a \
+             spurious except_data blob sitting on live code)",
+            existing.name,
+            addr,
+            old,
+            new,
+        );
+        let grown = ObjSymbol { size: new, size_known: true, ..existing };
+        if let Err(e) = obj.symbols.replace(idx, grown) {
+            log::warn!("Failed to re-grow truncated function #{idx}: {e:#}");
+        }
+    }
+
+    // (5) Strip the offenders. Mirrors `prune_overlapping_phantom_functions`:
+    // symbol indexes are referenced by relocations, so retire in place rather
+    // than removing.
+    for &(idx, _, addr, size) in &spurious {
+        let existing = obj.symbols[idx].clone();
+        log::info!(
+            "Stripping spurious except_data symbol {} @ {:#010x} (size {:#x}): \
+             word1 is not a code-section handler VA, so these bytes are code",
+            existing.name,
+            addr,
+            size,
+        );
+        let stripped = ObjSymbol {
+            name: format!("__DELETED_{}", existing.name),
+            kind: ObjSymbolKind::Unknown,
+            size: 0,
+            flags: ObjSymbolFlagSet(
+                ObjSymbolFlags::RelocationIgnore
+                    | ObjSymbolFlags::NoWrite
+                    | ObjSymbolFlags::NoExport
+                    | ObjSymbolFlags::Stripped,
+            ),
+            ..existing
+        };
+        if let Err(e) = obj.symbols.replace(idx, stripped) {
+            log::warn!("Failed to strip spurious except_data symbol #{idx}: {e:#}");
+        }
+    }
+    log::info!(
+        "Stripped {} spurious except_data symbol(s) on live code; re-grew {} truncated function(s)",
+        spurious.len(),
+        grow.len(),
+    );
+    (spurious.len(), grow.len())
 }
 
 pub fn write_coff(

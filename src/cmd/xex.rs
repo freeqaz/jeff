@@ -51,6 +51,7 @@ use crate::{
         split::{split_obj, update_splits},
         xex::{
             coff_path_for_unit, extract_exe, genuine_except_data_set, list_exe_sections,
+            strip_spurious_except_data,
             process_xex, write_coff, XexCompression, XexEncryption, XexInfo,
         },
         xpdb::try_parse_pdb,
@@ -2844,6 +2845,21 @@ fn load_analyze_xex(config: &ProjectConfig) -> Result<ExeAnalyzeResult> {
     } else {
         None
     };
+
+    // Strip `except_data_*` symbols that sit on live code, using the SAME
+    // word1-resolves-to-a-code-section evidence `write_coff` has used since
+    // `b1bc97c`. This has to happen HERE — after the symbols file is applied
+    // (that is where the offenders come from) and before ANY extent analysis or
+    // symbol/split writing — because `write_coff`'s decision came far too late
+    // to stop the symbol terminating a function's extent or reaching `write_asm`
+    // as an `.obj` block of `.4byte`. See `strip_spurious_except_data`.
+    let (stripped, regrown) = strip_spurious_except_data(&mut obj);
+    if stripped > 0 {
+        log::info!(
+            "Stripped {stripped} spurious except_data symbol(s) on live code \
+             ({regrown} truncated function extent(s) re-grown)"
+        );
+    }
 
     // Apply block relocations from config
     apply_block_relocations(&mut obj, &config.base.block_relocations)?;
