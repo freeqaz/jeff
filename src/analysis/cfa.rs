@@ -497,6 +497,29 @@ fn discover_seeds(
     // Apply known functions from symbols
     for (_, symbol) in obj.symbols.by_kind(ObjSymbolKind::Function) {
         let Some(section_index) = symbol.section else { continue };
+        // Self-heal a symbols.txt that types data-in-code as a function.
+        // `jumptable_*` / `except_data_*` / `except_record_*` are dtk-generated
+        // names for blobs that live inside .text but hold absolute addresses,
+        // not instructions. If such a name ever reaches us as `type:function`
+        // (a previous dtk emitted it, and the emitted file was committed), the
+        // seed asserts a function start in the middle of the dispatching
+        // function. The jump-table pass then re-derives the true parent extent
+        // and `detect_new_functions` aborts the whole split with
+        //   "Overlapping functions 4:0x82B728F8-4:0x82B72974 -> 4:0x82B7291C"
+        // leaving the project unable to re-split at all. The name is
+        // authoritative about the blob being data, so demote the seed.
+        if symbol.name.starts_with("jumptable_")
+            || symbol.name.starts_with("except_data_")
+            || symbol.name.starts_with("except_record_")
+        {
+            log::warn!(
+                "Dropping data-in-code function symbol seed {} @ {:#010X}: \
+                 name denotes data, not a function entry",
+                symbol.name,
+                symbol.address,
+            );
+            continue;
+        }
         let addr_ref = SectionAddress::new(section_index, symbol.address as u32);
         let Some(section) = obj.sections.get(section_index) else { continue };
         if section.kind != ObjSectionKind::Code || !section.contains(addr_ref.address) {
