@@ -57,7 +57,33 @@ pub fn apply_symbols_file(
                 Ok(line) => line,
                 Err(e) => bail!("Failed to process symbols file: {e:?}"),
             };
-            if let Some(symbol) = parse_symbol_line(&line, obj)? {
+            if let Some(mut symbol) = parse_symbol_line(&line, obj)? {
+                // Normalize data-in-code blobs that a previous dtk mis-emitted
+                // as `type:function`. `jumptable_*` / `except_data_*` /
+                // `except_record_*` are dtk-generated names for data that lives
+                // inside .text (absolute case addresses, EH records) — they are
+                // never function entries. A committed symbols.txt carrying one
+                // as a function seeds a function start in the middle of the
+                // dispatching function, and the next split aborts with
+                // "Overlapping functions ... -> 0x82B7291C" once the jump-table
+                // pass re-derives the real parent extent. Retyping here (rather
+                // than dropping) lets apply_cfa's jump-table pass replace the
+                // entry and heal the size too, so a corrupted file converges
+                // back to a correct one instead of wedging the project.
+                if symbol.kind == ObjSymbolKind::Function
+                    && (symbol.name.starts_with("jumptable_")
+                        || symbol.name.starts_with("except_data_")
+                        || symbol.name.starts_with("except_record_"))
+                {
+                    log::warn!(
+                        "Retyping {} @ {:#010X} from function to object: \
+                         name denotes data-in-code, not a function entry",
+                        symbol.name,
+                        symbol.address,
+                    );
+                    symbol.kind = ObjSymbolKind::Object;
+                }
+                let symbol = symbol;
                 // If the same name already exists from an earlier loader
                 // (e.g., XEX pdata adds except_record_<func> /
                 // except_data_<func> at the binary's real addresses

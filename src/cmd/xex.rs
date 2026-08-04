@@ -673,9 +673,12 @@ fn synthesize_reloc_targeted_leaf_functions_once(obj: &mut ObjInfo) -> usize {
         pdata_anchored.insert((sa.section, sa.address as u64));
     }
 
-    // (2) Reloc-source ranges to EXCLUDE: jump tables (entries point to internal
-    //     case blocks) and exception data/records (point to EH funclets).
-    let mut excluded_source_ranges: BTreeMap<SectionIndex, Vec<(u64, u64)>> = BTreeMap::new();
+    // (2) Data-in-code ranges: jump tables (entries point to internal case
+    //     blocks) and exception data/records (point to EH funclets). These are
+    //     excluded BOTH as a reloc source (their entries are internal edges, not
+    //     calls) AND as a reloc target (the blob itself is data — it must never
+    //     be promoted to a function; see the `jumptable_` regression below).
+    let mut excluded_ranges: BTreeMap<SectionIndex, Vec<(u64, u64)>> = BTreeMap::new();
     // (2b) Existing Function symbols, per section, sorted by start: (start, end).
     //      Plus a set of exact function starts for O(log n) membership.
     let mut func_starts: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
@@ -688,10 +691,7 @@ fn synthesize_reloc_targeted_leaf_functions_once(obj: &mut ObjInfo) -> usize {
             || name.starts_with("except_record_"))
             && sym.size > 0
         {
-            excluded_source_ranges
-                .entry(sec)
-                .or_default()
-                .push((sym.address, sym.address + sym.size));
+            excluded_ranges.entry(sec).or_default().push((sym.address, sym.address + sym.size));
         }
         if sym.kind == ObjSymbolKind::Function && sym.size > 0 && is_code(sec) {
             func_starts.insert((sec, sym.address));
@@ -702,21 +702,41 @@ fn synthesize_reloc_targeted_leaf_functions_once(obj: &mut ObjInfo) -> usize {
         v.sort_by_key(|&(_, a, _)| a);
     }
 
+    // Range of the existing function that strictly contains `addr`, if any.
+    let containing_func = |sec: SectionIndex, addr: u64| -> Option<(u64, u64)> {
+        let funcs = funcs_by_sec.get(&sec)?;
+        let pos = funcs.partition_point(|&(_, s, _)| s <= addr);
+        if pos == 0 {
+            return None;
+        }
+        let (_, pstart, pend) = funcs[pos - 1];
+        (pstart < addr && addr < pend).then_some((pstart, pend))
+    };
+
     // (3) Collect candidate entry VAs = effective reloc targets that land in a
     //     code section, whose reloc source is not excluded.
     let symbol_count = obj.symbols.count();
-    // candidate -> data_sourced (true if referenced by at least one DATA-section
-    // reloc, i.e. a vtable / function-pointer table entry). data_sourced
-    // candidates are safe to split out of an absorbing parent (a data pointer
-    // proves the leaf is reached only indirectly — no control-flow back-edge).
-    // Code-only candidates (`bl`/branch targets) are handled ONLY in gaps: a
-    // `bl` target CFA merged as a tail block is a shared-loop multi-entry helper
-    // that would be re-merged on the next re-split, so clamping its parent here
-    // would break split idempotency.
+    // candidate -> externally_referenced: true when at least one reloc reaches the
+    // candidate from OUTSIDE the function body that already contains it. This
+    // is the discriminator between a real leaf function that CFA accidentally
+    // absorbed into a neighbour, and an address INTERNAL to its own function:
+    //
+    //   * `lis r12, X@ha / addi r12, r12, X@l / add / mtctr / bctr` — the
+    //     computed-goto case-table base of a switch. Both the reloc sources and
+    //     `X` live in the same function. Promoting `X` cuts the function in half
+    //     at its own dispatch and (when `X` names the jump-table blob) types
+    //     table DATA as code.
+    //   * a backward `bdnz`/`bc` edge to a loop head reached by an earlier
+    //     forward `b` (e.g. `memset`'s `b .L_8299EDDC` / `bdnzf eq, 0x8299EDD0`).
+    //
+    // Neither is a function entry, yet both sit immediately after a hard flow
+    // terminator, so the terminator heuristic alone cannot reject them. A
+    // reference from outside the containing body cannot be an internal edge, so
+    // requiring one keeps the genuine absorbed-leaf case working.
     let mut candidates: BTreeMap<(SectionIndex, u64), bool> = BTreeMap::new();
     for (src_sec, section) in obj.sections.iter() {
         let src_is_data = !is_code(src_sec);
-        let excl = excluded_source_ranges.get(&src_sec);
+        let excl = excluded_ranges.get(&src_sec);
         for (src_addr, reloc) in section.relocations.iter() {
             if let Some(ranges) = excl {
                 let sa = src_addr as u64;
@@ -736,16 +756,46 @@ fn synthesize_reloc_targeted_leaf_functions_once(obj: &mut ObjInfo) -> usize {
             if tva < 0 {
                 continue;
             }
-            let entry = candidates.entry((tsec, tva as u64)).or_insert(false);
-            *entry = *entry || src_is_data;
+            let tva = tva as u64;
+            // Is this reference internal to the body that already contains the
+            // target? (Only meaningful when the source is code in the same
+            // section; a data-section pointer is external by construction.)
+            let internal = !src_is_data
+                && src_sec == tsec
+                && containing_func(tsec, tva).is_some_and(|(pstart, pend)| {
+                    let sa = src_addr as u64;
+                    sa >= pstart && sa < pend
+                });
+            let entry = candidates.entry((tsec, tva)).or_default();
+            *entry |= !internal;
         }
     }
 
     // (4) Filter candidates to genuine new leaf-function entries.
     let mut genuine: BTreeSet<(SectionIndex, u64)> = BTreeSet::new();
-    for &(sec, addr) in candidates.keys() {
+    for (&(sec, addr), &externally_referenced) in candidates.iter() {
         if func_starts.contains(&(sec, addr)) {
             continue; // already a function start
+        }
+        // Never promote data that happens to live in a code section. A
+        // `jumptable_*` blob is reached by `lis/addi <table>@ha/@l` from the
+        // dispatching function, so it looks exactly like a reloc-targeted entry
+        // sitting after the `bctr` hard terminator — but its words are absolute
+        // case addresses, not instructions.
+        if excluded_ranges
+            .get(&sec)
+            .is_some_and(|ranges| ranges.iter().any(|&(s, e)| addr >= s && addr < e))
+        {
+            continue;
+        }
+        // Same guard by symbol kind, for data-in-code blobs the naming heuristic
+        // above does not cover.
+        if obj
+            .symbols
+            .at_section_address(sec, addr as u32)
+            .any(|(_, s)| s.kind == ObjSymbolKind::Object)
+        {
+            continue;
         }
         let Some(section) = obj.sections.get(sec) else { continue };
         if addr < section.address + 4 {
@@ -759,31 +809,29 @@ fn synthesize_reloc_targeted_leaf_functions_once(obj: &mut ObjInfo) -> usize {
             continue;
         }
         // Is T strictly inside an existing function P?
-        if let Some(funcs) = funcs_by_sec.get(&sec) {
-            let pos = funcs.partition_point(|&(_, s, _)| s <= addr);
-            if pos > 0 {
-                let (_, pstart, pend) = funcs[pos - 1];
-                if pstart < addr && addr < pend {
-                    // pdata-anchored parents are an authoritative partition — never
-                    // split one.
-                    if pdata_anchored.contains(&(sec, pstart)) {
-                        continue;
-                    }
-                    // Splitting a leaf OUT of a non-pdata parent is now safe for
-                    // BOTH data-sourced (vtable) AND code-`bl` targets. A `bl`
-                    // target inside a function is often a shared-loop
-                    // multi-entry helper CFA merged as a tail block; splitting
-                    // it clamps the parent to an Unknown-scope stub that, on the
-                    // next re-split, would be a fresh merge_tail_blocks
-                    // candidate. That re-merge is now prevented at the source:
-                    // merge_tail_blocks respects any *persisted* function symbol
-                    // (symbols.txt boundary) regardless of scope (see
-                    // src/analysis/cfa.rs). Both the Global-flagged leaf we
-                    // synthesize below and the clamped parent are persisted, so
-                    // neither is re-merged — keeping the split idempotent while
-                    // unlocking the bl-referenced leaves the DATA-only gate left
-                    // on the table.
-                }
+        if let Some((pstart, _pend)) = containing_func(sec, addr) {
+            // pdata-anchored parents are an authoritative partition — never
+            // split one.
+            if pdata_anchored.contains(&(sec, pstart)) {
+                continue;
+            }
+            // Splitting a leaf OUT of a non-pdata parent is safe for BOTH
+            // data-sourced (vtable) AND code-`bl` targets — but ONLY when some
+            // reference reaches it from outside P. Every reference coming from
+            // inside P means the address is P's own internal control flow (a
+            // switch case-table base, or a loop head re-entered by a backward
+            // branch), and carving it out bisects P at its own dispatch.
+            //
+            // Regression: `?LowerForearm@ST@@YAHKPAK@Z` @ 0x82B728F8 is a
+            // 22-case switch. Its only reference to `jumptable_82B7291C` is the
+            // `lis/addi` pair three instructions earlier, inside itself. Without
+            // this gate the parent is clamped 0xB4 -> 0x24, the jump table is
+            // retyped Object -> Function, and the next `dtk xex split` aborts on
+            // the boundary the jump-table pass re-derives:
+            //   "Overlapping functions 4:0x82B728F8-4:0x82B72974 -> 4:0x82B7291C"
+            // i.e. the splitter's output was not a fixed point of its own input.
+            if !externally_referenced {
+                continue;
             }
         }
         genuine.insert((sec, addr));
@@ -3315,7 +3363,15 @@ fn info(args: InfoArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{overlapping_function_intervals, plan_fallthrough_merge_runs, LeafFrag};
+    use super::{
+        overlapping_function_intervals, plan_fallthrough_merge_runs,
+        synthesize_reloc_targeted_leaf_functions, LeafFrag,
+    };
+    use crate::obj::{
+        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind,
+        ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
+    };
+
 
     // Instruction words for the merge predicate tests.
     const BLR: u32 = 0x4E80_0020; // hard flow terminator
@@ -3334,6 +3390,152 @@ mod tests {
             split_key: Some(1),
             protected: false,
         }
+    }
+
+    // ---- reloc-targeted leaf synthesis: internal-reference gates -------------
+    //
+    // Fixture reproducing `?LowerForearm@ST@@YAHKPAK@Z` @ 0x82B728F8 from DC3
+    // (build/373307D9/asm/xdk/ST/modelfittingstage.s), a switch whose jump table
+    // lives inside its own body:
+    //
+    //   0x1000  bgt    cr6, .Ldefault      ; range check
+    //   0x1004  lis    r12, jumptable@ha   <- reloc, source INSIDE the function
+    //   0x1008  addi   r12, r12, jumptable@l <- reloc, source INSIDE the function
+    //   0x100C  bctr                       ; hard flow terminator
+    //   0x1010  jumptable_00001010 (Object, 8 bytes of absolute case addresses)
+    //   0x1018  blr                        ; case body, still the parent's code
+    const BCTR: u32 = 0x4E80_0420;
+
+    fn leaf_test_obj() -> ObjInfo {
+        let words: [u32; 8] = [
+            0x4199_0014, // 0x1000 bgt cr6, 0x1014
+            0x3D80_0000, // 0x1004 lis r12, jumptable@ha
+            0x398C_1010, // 0x1008 addi r12, r12, jumptable@l
+            BCTR,        // 0x100C
+            0x0000_1018, // 0x1010 jump table entry 0 (data)
+            0x0000_1018, // 0x1014 jump table entry 1 (data)
+            BLR,         // 0x1018 case body
+            BLR,         // 0x101C case body
+        ];
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0x1000,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "leaf-synth-test".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
+    fn add_sym(obj: &mut ObjInfo, name: &str, addr: u64, size: u64, kind: ObjSymbolKind) -> u32 {
+        obj.add_symbol(
+            ObjSymbol {
+                name: name.into(),
+                address: addr,
+                section: Some(0),
+                size,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("add_symbol")
+    }
+
+    fn add_reloc(obj: &mut ObjInfo, src: u32, target: u32) {
+        obj.sections[0].relocations.insert(src, ObjReloc {
+            kind: ObjRelocKind::PpcAddr16Ha,
+            target_symbol: target,
+            addend: 0,
+            module: None,
+        })
+        .expect("insert reloc");
+    }
+
+    /// The jump table must stay an Object and the parent must keep its full
+    /// extent. Before the fix the pass clamped the parent to prologue+dispatch
+    /// and retyped the table as a Function, so the NEXT `dtk xex split` aborted
+    /// with "Overlapping functions 4:0x82B728F8-4:0x82B72974 -> 4:0x82B7291C".
+    #[test]
+    fn jump_table_is_not_promoted_to_a_leaf_function() {
+        let mut obj = leaf_test_obj();
+        let parent = add_sym(&mut obj, "parent", 0x1000, 0x20, ObjSymbolKind::Function);
+        let jt = add_sym(&mut obj, "jumptable_00001010", 0x1010, 0x8, ObjSymbolKind::Object);
+        // The only references to the table are the lis/addi pair inside `parent`.
+        add_reloc(&mut obj, 0x1004, jt);
+        add_reloc(&mut obj, 0x1008, jt);
+
+        synthesize_reloc_targeted_leaf_functions(&mut obj);
+
+        assert_eq!(obj.symbols[jt].kind, ObjSymbolKind::Object, "jump table must stay data");
+        assert_eq!(obj.symbols[jt].size, 0x8, "jump table size must not grow into the case bodies");
+        assert_eq!(obj.symbols[parent].size, 0x20, "parent must not be clamped at its own dispatch");
+    }
+
+    /// Same shape, but the case-table base is an unnamed address inside the
+    /// parent rather than a `jumptable_*` symbol (DC3's `Curl_raw_toupper`
+    /// @ 0x82585A30 uses `lbzx` offsets added to an in-body base). Only the
+    /// internal-reference gate can reject this one.
+    #[test]
+    fn internally_referenced_address_is_not_promoted_to_a_leaf_function() {
+        let mut obj = leaf_test_obj();
+        let parent = add_sym(&mut obj, "parent", 0x1000, 0x20, ObjSymbolKind::Function);
+        // Reference the case-block base at 0x1010 via parent+0x10, from inside parent.
+        obj.sections[0].relocations.insert(0x1004, ObjReloc {
+            kind: ObjRelocKind::PpcAddr16Ha,
+            target_symbol: parent,
+            addend: 0x10,
+            module: None,
+        })
+        .expect("insert reloc");
+
+        synthesize_reloc_targeted_leaf_functions(&mut obj);
+
+        assert_eq!(obj.symbols[parent].size, 0x20, "parent must not be clamped");
+        assert!(
+            obj.symbols.at_section_address(0, 0x1010).all(|(_, s)| s.kind != ObjSymbolKind::Function),
+            "an address referenced only from inside its own function is not a function entry"
+        );
+    }
+
+    /// The gate must not disable the pass's real job: a leaf that CFA absorbed
+    /// into a neighbour, but which something OUTSIDE that neighbour references,
+    /// is still carved out.
+    #[test]
+    fn externally_referenced_leaf_is_still_synthesized() {
+        let mut obj = leaf_test_obj();
+        // Append a separate function at 0x1020 that references parent+0x10.
+        obj.sections[0].data.extend_from_slice(&BLR.to_be_bytes());
+        obj.sections[0].data.extend_from_slice(&BLR.to_be_bytes());
+        obj.sections[0].size = obj.sections[0].data.len() as u64;
+        let parent = add_sym(&mut obj, "parent", 0x1000, 0x20, ObjSymbolKind::Function);
+        add_sym(&mut obj, "caller", 0x1020, 0x8, ObjSymbolKind::Function);
+        obj.sections[0].relocations.insert(0x1020, ObjReloc {
+            kind: ObjRelocKind::PpcAddr16Ha,
+            target_symbol: parent,
+            addend: 0x10,
+            module: None,
+        })
+        .expect("insert reloc");
+
+        synthesize_reloc_targeted_leaf_functions(&mut obj);
+
+        assert!(
+            obj.symbols.at_section_address(0, 0x1010).any(|(_, s)| s.kind == ObjSymbolKind::Function),
+            "an externally referenced absorbed leaf must still be split out"
+        );
+        assert_eq!(obj.symbols[parent].size, 0x10, "parent clamps to its first real split point");
     }
 
     #[test]
