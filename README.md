@@ -47,6 +47,8 @@ The canonical push target for this fork is [freeqaz/jeff](https://github.com/fre
 - `scripts/cfa_cutover_gate.sh`: consolidated legacy/default/native-VM2/candidate-strict `cfa_tests` gates plus default/strict DC3 parity runs.
   - Current default telemetry gate is strict zero-delta (`total_diffs=0`, `bridged_steps=0`) on sampled shadow runs.
 - `scripts/xex_info_mode_matrix.sh`: real-XEX parser compatibility matrix across `legacy`/`shadow`/`candidate` modes.
+- `scripts/xex_split_ab_compare.sh`: A/B a change against a real project's split output — runs `xex split` with two dtk binaries and reports units / objects byte-identical / objects changed, so "does this move output?" is measured rather than argued. Stages an isolated copy of the project config so a `symbols:` key is rewritten in the copy and never in the project tree, and takes both binaries as arguments so a shared `target/release/dtk` other work depends on is never overwritten.
+  - Note: `scripts/xex_split_mode_matrix.sh` currently exits 2 on this checkout because `scripts/dc3_cfa_parity_smoke.sh` and `scripts/cfa_cutover_gate.sh` (documented above) are not present in the tree.
 
 **Upstream sync** — Includes all upstream decomp-toolkit changes through v1.8.0 (DWARF dump improvements, `skip_cfa_ranges` config option, relocation fixes, and more).
 
