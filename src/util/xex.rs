@@ -248,6 +248,78 @@ pub struct StaticLibrary {
 }
 
 // ----------------------------------------------------------------------
+// TLSINFO
+// ----------------------------------------------------------------------
+
+/// `XEX_HEADER_TLS_INFO` (0x20104). Describes the thread-local storage
+/// template the loader copies per thread.
+///
+/// This is *descriptive only* as far as splitting goes: the `.tls` section is a
+/// normal PE section with its own data, so it is carved and emitted like any
+/// other section, and `raw_data_address` here just points at it. Nothing in the
+/// split pipeline consumes these numbers - they are parsed so `xex info` can
+/// report them (as XexTool does) and so a future re-link has the slot count.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct TlsInfo {
+    pub slot_count: u32,
+    /// Virtual address of the TLS data template (matches the `.tls` section).
+    pub raw_data_address: u32,
+    pub data_size: u32,
+    pub raw_data_size: u32,
+}
+
+impl TlsInfo {
+    fn parse(data: &Vec<u8>) -> Result<Self> {
+        ensure!(data.len() >= 16, "TLSInfo header too short ({} bytes, expected 16)", data.len());
+        return Ok(Self {
+            slot_count: read_word(data, 0),
+            raw_data_address: read_word(data, 4),
+            data_size: read_word(data, 8),
+            raw_data_size: read_word(data, 12),
+        });
+    }
+}
+
+// ----------------------------------------------------------------------
+// EXECUTIONID
+// ----------------------------------------------------------------------
+
+/// `XEX_HEADER_EXECUTION_ID` (0x40006). Pure metadata (title/media identity).
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct ExecutionId {
+    pub media_id: u32,
+    pub version: u32,
+    pub base_version: u32,
+    pub title_id: u32,
+    pub platform: u8,
+    pub executable_type: u8,
+    pub disc_number: u8,
+    pub disc_count: u8,
+    pub savegame_id: u32,
+}
+
+impl ExecutionId {
+    fn parse(data: &Vec<u8>) -> Result<Self> {
+        ensure!(
+            data.len() >= 24,
+            "ExecutionID header too short ({} bytes, expected 24)",
+            data.len()
+        );
+        return Ok(Self {
+            media_id: read_word(data, 0),
+            version: read_word(data, 4),
+            base_version: read_word(data, 8),
+            title_id: read_word(data, 12),
+            platform: data[16],
+            executable_type: data[17],
+            disc_number: data[18],
+            disc_count: data[19],
+            savegame_id: read_word(data, 20),
+        });
+    }
+}
+
+// ----------------------------------------------------------------------
 // XEXOPTIONALHEADERDATA
 // ----------------------------------------------------------------------
 
@@ -256,12 +328,25 @@ pub struct XexOptionalHeaderData {
     pub original_name: String,
     pub entry_point: u32,
     pub image_base: u32,
+    /// First dword of `XEX_HEADER_CHECKSUM_TIMESTAMP` (0x18002).
+    pub file_checksum: u32,
     pub file_timestamp: u32,
     pub resource_info: Option<ResourceInfos>,
     pub base_file_format: Option<BaseFileFormat>,
     // PatchDescriptor
     pub static_libs: Vec<StaticLibrary>,
     pub import_libs: Option<ImportLibraries>,
+    // Metadata-only headers below: parsed so they stop being logged as
+    // "unhandled", and so `xex info` can report them. None of them feed the
+    // split pipeline - see the TlsInfo doc comment.
+    pub tls_info: Option<TlsInfo>,
+    /// `XEX_HEADER_DEFAULT_STACK_SIZE` (0x20200), in bytes. Only meaningful to
+    /// a linker (`/STACK`), which is why splitting ignores it.
+    pub default_stack_size: Option<u32>,
+    pub system_flags: Option<u32>,
+    pub execution_id: Option<ExecutionId>,
+    pub lan_key: Option<[u8; 16]>,
+    pub alternate_title_ids: Vec<u32>,
 }
 
 impl XexOptionalHeaderData {
@@ -276,11 +361,18 @@ impl XexOptionalHeaderData {
         let mut original_name = String::new();
         let mut entry_point = 0;
         let mut image_base = 0;
+        let mut file_checksum = 0;
         let mut file_timestamp = 0;
         let mut import_libs = None;
         let mut resource_info = None;
         let mut base_file_format = None;
         let mut static_libs: Vec<StaticLibrary> = vec![];
+        let mut tls_info = None;
+        let mut default_stack_size = None;
+        let mut system_flags = None;
+        let mut execution_id = None;
+        let mut lan_key = None;
+        let mut alternate_title_ids: Vec<u32> = vec![];
 
         // and now, process them
         for header in opt_headers {
@@ -317,7 +409,11 @@ impl XexOptionalHeaderData {
                     original_name = String::from_utf8(name)?;
                 }
                 XexOptionalHeaderID::ChecksumTimestamp => {
-                    file_timestamp = read_word(&header.data, 0);
+                    // { u32 checksum; u32 filetime; } - see the note in
+                    // XexOptionalHeader::new about the old off-by-one-dword
+                    // read that made `file_timestamp` land on offset 0.
+                    file_checksum = read_word(&header.data, 0);
+                    file_timestamp = read_word(&header.data, 4);
                 }
                 XexOptionalHeaderID::StaticLibraries => {
                     let num_libs = header.data.len() / 16;
@@ -335,6 +431,31 @@ impl XexOptionalHeaderData {
                         });
                     }
                 }
+                XexOptionalHeaderID::TLSInfo => {
+                    tls_info = Some(TlsInfo::parse(&header.data)?);
+                }
+                XexOptionalHeaderID::DefaultStackSize => {
+                    default_stack_size = Some(read_word(&header.data, 0));
+                }
+                XexOptionalHeaderID::SystemFlags => {
+                    system_flags = Some(read_word(&header.data, 0));
+                }
+                XexOptionalHeaderID::ExecutionID => {
+                    execution_id = Some(ExecutionId::parse(&header.data)?);
+                }
+                XexOptionalHeaderID::LANKey => {
+                    ensure!(
+                        header.data.len() >= 16,
+                        "LANKey header too short ({} bytes, expected 16)",
+                        header.data.len()
+                    );
+                    lan_key = Some(<[u8; 16]>::try_from(&header.data[0..16])?);
+                }
+                XexOptionalHeaderID::AlternateTitleIDs => {
+                    for chunk in header.data.chunks_exact(4) {
+                        alternate_title_ids.push(u32::from_be_bytes(chunk.try_into()?));
+                    }
+                }
                 _ => {
                     log::warn!("unhandled header ID {:?}", header.id);
                 }
@@ -346,11 +467,18 @@ impl XexOptionalHeaderData {
             original_name,
             entry_point,
             image_base,
+            file_checksum,
             file_timestamp,
             resource_info,
             base_file_format,
             static_libs,
             import_libs,
+            tls_info,
+            default_stack_size,
+            system_flags,
+            execution_id,
+            lan_key,
+            alternate_title_ids,
         });
     }
 }
@@ -419,9 +547,21 @@ impl XexOptionalHeader {
             // println!("for ID 0x{:X}, value = 0x{:X}", id_as_u32, hdr.value);
             hdr.data = data[index + 4..index + 8].to_vec();
         } else {
-            let len = mask * 4;
-            let start: usize = (hdr.value + 4) as usize;
-            let end: usize = (hdr.value + len) as usize;
+            // Fixed-size header: the low byte is the size in dwords and the
+            // payload starts AT hdr.value (there is no length prefix - only the
+            // 0xFF form has one).
+            //
+            // This used to read `hdr.value + 4 .. hdr.value + mask * 4`, i.e. it
+            // dropped the first dword and returned one dword less than the
+            // header actually holds. That was invisible because the only
+            // consumer was ChecksumTimestamp (0x18002), whose `read_word(data,
+            // 0)` then happened to land on the *second* dword - the file time -
+            // which is what it wanted. That call site now reads offset 4, so
+            // this and it were fixed together; `xex info`'s "File time" line is
+            // unchanged.
+            let len = (mask * 4) as usize;
+            let start: usize = hdr.value as usize;
+            let end: usize = min(start + len, data.len());
             hdr.data = data[start..end].to_vec();
         }
         return hdr;
@@ -3164,6 +3304,127 @@ mod tests {
             0,
             "a SPURIOUS blob is code; only a GENUINE prefix may clamp a body"
         );
+    }
+
+    // ---- XEX2 optional header parsing ---------------------------------------
+    //
+    // Fixtures below are the real bytes from cea-decomp's
+    // orig/2011-07-28/HCEX.xex (Halo CEA, Saber Interactive, devkit,
+    // ImageBase 0x82000000), which is what surfaced these headers as
+    // "unhandled header ID ..." warnings.
+
+    /// Assemble a synthetic XEX2 header area: `entries` are (id, value) pairs
+    /// written at 24 + n*8, `payloads` are (offset, bytes) blobs.
+    fn synth_headers(entries: &[(u32, u32)], payloads: &[(usize, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = vec![0u8; 0x100];
+        buf[0..4].copy_from_slice(b"XEX2");
+        buf[20..24].copy_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (n, (id, value)) in entries.iter().enumerate() {
+            let off = 24 + n * 8;
+            buf[off..off + 4].copy_from_slice(&id.to_be_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&value.to_be_bytes());
+        }
+        for (off, bytes) in payloads {
+            buf[*off..*off + bytes.len()].copy_from_slice(bytes);
+        }
+        buf
+    }
+
+    /// A fixed-size (low byte = size in dwords, no length prefix) optional
+    /// header's payload starts AT `value`. Regression: it used to start at
+    /// `value + 4`, silently dropping the first dword and returning one dword
+    /// less than the header holds.
+    #[test]
+    fn fixed_size_optional_header_starts_at_value() {
+        // TLSInfo: low byte 0x04 -> 16 bytes at `value`.
+        let tls = vec![
+            0x00, 0x00, 0x00, 0x40, // slot count
+            0x83, 0x9A, 0x50, 0x00, // raw data address (.tls VA)
+            0x00, 0x00, 0x02, 0xB0, // data size
+            0x00, 0x00, 0x02, 0xB0, // raw data size
+        ];
+        let buf = synth_headers(&[(0x20104, 0x80)], &[(0x80, tls.clone())]);
+        let hdr = XexOptionalHeader::new(&buf, 24);
+        assert_eq!(hdr.id, XexOptionalHeaderID::TLSInfo);
+        assert_eq!(hdr.data, tls, "fixed-size payload must be all 16 bytes from `value`");
+    }
+
+    #[test]
+    fn tls_info_parses_hcex_bytes() {
+        let tls = TlsInfo::parse(&vec![
+            0x00, 0x00, 0x00, 0x40, 0x83, 0x9A, 0x50, 0x00, 0x00, 0x00, 0x02, 0xB0, 0x00, 0x00,
+            0x02, 0xB0,
+        ])
+        .unwrap();
+        assert_eq!(
+            tls,
+            TlsInfo {
+                slot_count: 64,
+                // == .tls section VA 0x019A5000 + ImageBase 0x82000000
+                raw_data_address: 0x839A5000,
+                data_size: 0x2B0,
+                raw_data_size: 0x2B0,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_id_parses_hcex_bytes() {
+        let exec = ExecutionId::parse(&vec![
+            0x00, 0x00, 0x00, 0x00, // media id
+            0x00, 0x00, 0x00, 0x00, // version
+            0x00, 0x00, 0x00, 0x00, // base version
+            0x4D, 0x53, 0x09, 0xB1, // title id
+            0x00, 0x00, 0x00, 0x00, // platform / exe type / disc n / disc count
+            0x00, 0x00, 0x00, 0x00, // savegame id
+        ])
+        .unwrap();
+        assert_eq!(exec.title_id, 0x4D5309B1);
+        assert_eq!(exec.media_id, 0);
+        assert_eq!(exec.disc_count, 0);
+    }
+
+    #[test]
+    fn short_fixed_size_headers_error_instead_of_panicking() {
+        assert!(TlsInfo::parse(&vec![0u8; 8]).is_err());
+        assert!(ExecutionId::parse(&vec![0u8; 12]).is_err());
+    }
+
+    /// ChecksumTimestamp (0x18002) is `{ u32 checksum; u32 filetime; }`. The old
+    /// off-by-one-dword slice made `read_word(data, 0)` land on the filetime, so
+    /// fixing the slice and this offset had to happen together - "File time"
+    /// must still report 0x4E314B15 for HCEX, and the checksum is now available
+    /// too.
+    #[test]
+    fn checksum_timestamp_and_metadata_headers_round_trip() {
+        // BaseFileFormat: size dword (incl. prefix), then encryption = No (0)
+        // and compression = None (0), which the remaining zeros already give.
+        let mut bff = vec![0u8; 8];
+        bff[0..4].copy_from_slice(&8u32.to_be_bytes());
+        let buf = synth_headers(
+            &[
+                (0x3FF, 0x40),      // BaseFileFormat (required)
+                (0x18002, 0x50),    // ChecksumTimestamp
+                (0x20104, 0x60),    // TLSInfo
+                (0x20200, 0x40000), // DefaultStackSize (inline value)
+            ],
+            &[
+                (0x40, bff),
+                (0x50, vec![0x01, 0x69, 0x80, 0xCF, 0x4E, 0x31, 0x4B, 0x15]),
+                (
+                    0x60,
+                    vec![
+                        0x00, 0x00, 0x00, 0x40, 0x83, 0x9A, 0x50, 0x00, 0x00, 0x00, 0x02, 0xB0,
+                        0x00, 0x00, 0x02, 0xB0,
+                    ],
+                ),
+            ],
+        );
+        let parsed = XexOptionalHeaderData::parse(&buf).unwrap();
+        assert_eq!(parsed.file_checksum, 0x016980CF);
+        assert_eq!(parsed.file_timestamp, 0x4E314B15, "HCEX file time must not move");
+        assert_eq!(parsed.default_stack_size, Some(0x40000));
+        assert_eq!(parsed.tls_info.map(|t| t.slot_count), Some(64));
     }
 }
 

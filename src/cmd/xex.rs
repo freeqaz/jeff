@@ -3367,7 +3367,46 @@ fn info(args: InfoArgs) -> Result<()> {
     let pst = FixedOffset::west_opt(8 * 3600).unwrap();
     let dt_pst = datetime.with_timezone(&pst);
     println!("{}", dt_pst.format("%a %b %d %H:%M:%S %Y"));
+    println!("  File checksum: 0x{:08X}", xex.opt_header_data.file_checksum);
+    if let Some(stack) = xex.opt_header_data.default_stack_size {
+        println!("  Default stack size: 0x{:X} ({} KiB)", stack, stack / 1024);
+    }
+    if let Some(flags) = xex.opt_header_data.system_flags {
+        println!("  System flags: 0x{:08X}", flags);
+    }
     println!("");
+
+    if let Some(tls) = xex.opt_header_data.tls_info {
+        println!("TLS Info:");
+        println!("  Slot count: {}", tls.slot_count);
+        println!("  Raw data address: 0x{:08X}", tls.raw_data_address);
+        println!("  Data size: 0x{:X}", tls.data_size);
+        println!("  Raw data size: 0x{:X}", tls.raw_data_size);
+        println!("");
+    }
+
+    if let Some(exec) = xex.opt_header_data.execution_id {
+        println!("Execution ID:");
+        println!("  Title ID: 0x{:08X}", exec.title_id);
+        println!("  Media ID: 0x{:08X}", exec.media_id);
+        println!("  Version: 0x{:08X} (base 0x{:08X})", exec.version, exec.base_version);
+        println!("  Platform: {} Executable type: {}", exec.platform, exec.executable_type);
+        println!("  Disc {} of {}", exec.disc_number, exec.disc_count);
+        println!("  Savegame ID: 0x{:08X}", exec.savegame_id);
+        println!("");
+    }
+
+    if !xex.opt_header_data.alternate_title_ids.is_empty() {
+        println!("Alternate Title IDs:");
+        for id in &xex.opt_header_data.alternate_title_ids {
+            println!("  0x{:08X}", id);
+        }
+        println!("");
+    }
+
+    if let Some(key) = xex.opt_header_data.lan_key {
+        println!("LAN Key: {}\n", hex::encode(key));
+    }
 
     println!("Static Libraries:");
     let mut idx = 1;
