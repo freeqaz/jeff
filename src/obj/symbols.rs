@@ -632,9 +632,29 @@ pub fn best_match_for_reloc(
         let mut rank = match symbol.kind {
             ObjSymbolKind::Function | ObjSymbolKind::Object => {
                 // HACK: These are generally not referenced directly, so reduce their rank
+                //
+                // The second row is the Xbox 360 XDK CRT's spelling of the same
+                // thing. Both halves matter for the same reason: the family
+                // symbol and the first per-register entry share an address
+                // (`__savegprlr` and `__savegprlr_14` are both 0x82E541F0 in
+                // Halo CEA), and a compiler saving r14..r31 emits
+                // `bl __savegprlr_14`. Without this the sized function symbol
+                // outranks the label and the split names the call after the
+                // family, which no object file ever references.
                 if matches!(
                     symbol.name.as_str(),
-                    "__save_gpr" | "__restore_gpr" | "__save_fpr" | "__restore_fpr"
+                    "__save_gpr"
+                        | "__restore_gpr"
+                        | "__save_fpr"
+                        | "__restore_fpr"
+                        | "__savegprlr"
+                        | "__restgprlr"
+                        | "__savefpr"
+                        | "__restfpr"
+                        | "__savevmx"
+                        | "__restvmx"
+                        | "__savevmx_upper"
+                        | "__restvmx_upper"
                 ) {
                     return 0;
                 }

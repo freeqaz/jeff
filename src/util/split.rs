@@ -1685,6 +1685,8 @@ pub fn split_obj(
                 && !sym.name.starts_with("__restgprlr")
                 && !sym.name.starts_with("__savefpr")
                 && !sym.name.starts_with("__restfpr")
+                && !sym.name.starts_with("__savevmx")
+                && !sym.name.starts_with("__restvmx")
             {
                 comdat_symbols.insert(sym.name.clone());
             }
