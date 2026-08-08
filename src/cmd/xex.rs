@@ -3642,8 +3642,9 @@ fn info(args: InfoArgs) -> Result<()> {
 mod tests {
     use super::{
         overlapping_function_intervals, plan_fallthrough_merge_runs,
-        synthesize_reloc_targeted_leaf_functions, LeafFrag,
+        retrack_unanalyzed_functions, synthesize_reloc_targeted_leaf_functions, LeafFrag,
     };
+    use crate::analysis::tracker::Tracker;
     use crate::obj::{
         ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind,
         ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
@@ -4095,5 +4096,101 @@ mod tests {
                 assert!(ok, "reported overlap addr {oa:#x} for index {i} is bogus: {funcs:?}");
             }
         }
+    }
+
+    // ---- post-repair relocation pass ----------------------------------------
+    //
+    // The defect: `Tracker::process_code` only ever sees the function symbols
+    // that exist when it runs, and the whole symbol-repair pipeline (leaf
+    // synthesis and friends) creates more of them afterwards. Those bodies then
+    // split with no relocations at all -- 1,770 functions and every `bl` in them
+    // on Halo CEA.
+
+    /// Two adjacent leaf functions that call each other:
+    ///
+    /// ```text
+    ///   0x1000 A: bl 0x1010   ; -> B
+    ///   0x1004    blr
+    ///   0x1008 B: bl  <arg>   ; target chosen by the caller
+    ///   0x100C    blr
+    /// ```
+    fn retrack_test_obj(b_branch: u32) -> ObjInfo {
+        let words: [u32; 4] = [
+            0x4800_0009, // 0x1000 bl 0x1008
+            BLR,         // 0x1004
+            b_branch,    // 0x1008
+            BLR,         // 0x100C
+        ];
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0x1000,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "retrack-test".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
+    #[test]
+    fn function_created_after_the_tracker_ran_still_gets_its_relocations() {
+        // B's `bl` goes back to A @ 0x1000: 0x1008 + (-8).
+        let mut obj = retrack_test_obj(0x4BFF_FFF9);
+        add_sym(&mut obj, "A", 0x1000, 8, ObjSymbolKind::Function);
+        add_sym(&mut obj, "B", 0x1008, 8, ObjSymbolKind::Function);
+
+        // First pass: walk A only, exactly as if B had not existed yet.
+        let mut first = Tracker::new(&obj);
+        let a = obj.symbols.by_name("A").unwrap().unwrap().1.clone();
+        first.process_function(&obj, &a).unwrap();
+        first.apply_relocations(&mut obj, false).unwrap();
+        assert!(obj.sections[0].relocations.at(0x1000).is_some(), "A's call should be tracked");
+        assert!(
+            obj.sections[0].relocations.at(0x1008).is_none(),
+            "B was never walked, so it must start out with no relocations"
+        );
+
+        // Second pass: B is unanalyzed, so it gets picked up.
+        let added = retrack_unanalyzed_functions(&mut obj, &first).unwrap();
+        assert_eq!(added, 1);
+        let reloc =
+            obj.sections[0].relocations.at(0x1008).expect("B's call must now be relocated");
+        assert_eq!(reloc.kind, ObjRelocKind::PpcRel24);
+        assert_eq!(obj.symbols[reloc.target_symbol].name, "A");
+        assert_eq!(reloc.addend, 0);
+
+        // A was already walked at these exact bounds, so it is not re-walked and
+        // its existing relocation is untouched.
+        let a_reloc = obj.sections[0].relocations.at(0x1000).unwrap();
+        assert_eq!(obj.symbols[a_reloc.target_symbol].name, "B");
+    }
+
+    #[test]
+    fn interior_targets_are_dropped_rather_than_emitted_at_the_symbol_start() {
+        // B branches into the MIDDLE of A (0x1004), which needs a relocation
+        // with addend 4 -- and `write_coff` overwrites a REL24's displacement
+        // with -(section offset), discarding the addend, so the emitted
+        // relocation would resolve to A+0 and point at an instruction the
+        // branch demonstrably does not target. Better to leave the site bare.
+        let mut obj = retrack_test_obj(0x4BFF_FFFC); // b 0x1004
+        add_sym(&mut obj, "A", 0x1000, 8, ObjSymbolKind::Function);
+        add_sym(&mut obj, "B", 0x1008, 8, ObjSymbolKind::Function);
+
+        let mut first = Tracker::new(&obj);
+        let a = obj.symbols.by_name("A").unwrap().unwrap().1.clone();
+        first.process_function(&obj, &a).unwrap();
+        first.apply_relocations(&mut obj, false).unwrap();
+
+        let added = retrack_unanalyzed_functions(&mut obj, &first).unwrap();
+        assert_eq!(added, 0, "an unrepresentable interior target must not be emitted");
+        assert!(obj.sections[0].relocations.at(0x1008).is_none());
     }
 }
