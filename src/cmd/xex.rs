@@ -24,7 +24,10 @@ use crate::{
     analysis::{
         cfa::{CfaConfig, SectionAddress, run_cfa, apply_cfa},
         objects::{detect_objects, detect_strings},
-        pass::{AnalysisPass, FindSaveRestSledsXbox, FindXboxVtables, VtableCandidate},
+        pass::{
+            apply_save_rest_sleds_xbox, AnalysisPass, FindSaveRestSledsXbox, FindXboxVtables,
+            VtableCandidate,
+        },
         read_u32,
         tracker::Tracker,
     },
@@ -3067,6 +3070,21 @@ fn load_analyze_xex(config: &ProjectConfig) -> Result<ExeAnalyzeResult> {
     } else {
         None
     };
+
+    // Name the XDK CRT register save/restore sleds from their instruction
+    // bodies. This is deliberately NOT inside the `symbols_known` guard below:
+    // `load_analyze_xex` throws the PDB's and the map's own `__savegprlr_*`
+    // publics away (`is_reg_intrinsic`) on the understanding that
+    // `FindSaveRestSledsXbox` re-derives them, but that pass only feeds
+    // `CfaConfig` and CFA is exactly what `symbols_known` turns off. Every
+    // project that has a PDB therefore got no names at all, and 68,006 call
+    // relocations across 2,545 of Halo CEA's 3,675 objects split as
+    // `bl lbl_82E5421C` instead of `bl __savegprlr_25`.
+    //
+    // It runs after the symbols file so a stale `lbl_` entry cannot win, and
+    // before extent analysis, the relocation tracker and leaf synthesis, all of
+    // which read these symbols.
+    apply_save_rest_sleds_xbox(&mut obj)?;
 
     // Strip `except_data_*` symbols that sit on live code, using the SAME
     // word1-resolves-to-a-code-section evidence `write_coff` has used since

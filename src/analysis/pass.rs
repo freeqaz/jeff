@@ -8,7 +8,7 @@ use memchr::memmem;
 use crate::{
     analysis::cfa::{CfaConfig, FunctionInfo, SectionAddress},
     obj::{
-        ObjInfo, ObjKind, ObjRelocKind, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet,
+        ObjInfo, ObjKind, ObjRelocKind, ObjSection, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet,
         ObjSymbolFlags, ObjSymbolKind, SectionIndex,
     },
 };
@@ -122,59 +122,387 @@ impl AnalysisPass for FindSaveRestSleds {
 
 pub struct FindSaveRestSledsXbox {}
 
-#[allow(clippy::type_complexity)]
-const SLEDS_XBOX: [([u8; 8], &str, &str, u32, u32, u32); 8] = [
-    ([0xf9, 0xc1, 0xff, 0x68, 0xf9, 0xe1, 0xff, 0x70], "__savegprlr", "__savegprlr_", 14, 32, 4),
-    ([0xe9, 0xc1, 0xff, 0x68, 0xe9, 0xe1, 0xff, 0x70], "__restgprlr", "__restgprlr_", 14, 32, 4),
-    ([0xd9, 0xcc, 0xff, 0x70, 0xd9, 0xec, 0xff, 0x78], "__savefpr", "__savefpr_", 14, 32, 4),
-    ([0xc9, 0xcc, 0xff, 0x70, 0xc9, 0xec, 0xff, 0x78], "__restfpr", "__restfpr_", 14, 32, 4),
-    ([0x39, 0x60, 0xfe, 0xe0, 0x7d, 0xcb, 0x61, 0xce], "__savevmx", "__savevmx_", 14, 32, 8),
-    ([0x39, 0x60, 0xfc, 0x00, 0x10, 0x0b, 0x61, 0xcb], "__savevmx_upper", "__savevmx_", 64, 128, 8),
-    ([0x39, 0x60, 0xfe, 0xe0, 0x7d, 0xcb, 0x60, 0xce], "__restvmx", "__restvmx_", 14, 32, 8),
-    ([0x39, 0x60, 0xfc, 0x00, 0x10, 0x0b, 0x60, 0xcb], "__restvmx_upper", "__restvmx_", 64, 128, 8),
+/// How one entry of an Xbox 360 CRT save/restore sled is encoded, so the body
+/// can be decoded and checked rather than trusted from an 8-byte needle.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SledEncoding {
+    /// One word per entry: `std`/`ld` (GPR, base r1) or `stfd`/`lfd` (FPR, base
+    /// r12). Entry k is entry 0 with the register field (bits 6..10, i.e.
+    /// `<< 21`) advanced by k and the signed displacement advanced by 8k.
+    Scalar,
+    /// Two words per entry: `li r11, disp` followed by a `stvx`/`lvx`-form
+    /// store. Entry k advances `disp` by 0x10 and the vector register by one.
+    /// The register field is `(k & 0x1F) << 21`; the VMX128 form used by the
+    /// v64..v127 half carries bit 5 of the register number in bit 2 of the
+    /// word, which is why the `& 0x1F` and the `>> 5` term are separate.
+    Vector,
+}
+
+struct SledSpec {
+    /// First two words of the sled, as bytes — the anchor `memmem` searches for.
+    needle: [u8; 8],
+    /// Name the XDK CRT gives the whole thunk (`__savegprlr`).
+    func: &'static str,
+    /// Prefix of the per-register entry names (`__savegprlr_`).
+    label: &'static str,
+    /// Inclusive-exclusive register range, so `14..32` yields `_14` … `_31`.
+    reg_start: u32,
+    reg_end: u32,
+    enc: SledEncoding,
+    /// Exact words expected after the last entry. Verified, and used to size
+    /// the thunk when the image has no `.pdata` entry for it.
+    tail: &'static [u32],
+}
+
+impl SledSpec {
+    /// Bytes per register entry.
+    fn step(&self) -> u32 {
+        match self.enc {
+            SledEncoding::Scalar => 4,
+            SledEncoding::Vector => 8,
+        }
+    }
+
+    fn entry_count(&self) -> u32 { self.reg_end - self.reg_start }
+
+    /// Length of the verified body: every entry plus the tail.
+    fn body_size(&self) -> u32 { self.entry_count() * self.step() + 4 * self.tail.len() as u32 }
+}
+
+const SLEDS_XBOX: [SledSpec; 8] = [
+    SledSpec {
+        needle: [0xf9, 0xc1, 0xff, 0x68, 0xf9, 0xe1, 0xff, 0x70],
+        func: "__savegprlr",
+        label: "__savegprlr_",
+        reg_start: 14,
+        reg_end: 32,
+        enc: SledEncoding::Scalar,
+        // stw r12, -8(r1) ; blr   — the caller left LR in r12.
+        tail: &[0x9181fff8, 0x4e800020],
+    },
+    SledSpec {
+        needle: [0xe9, 0xc1, 0xff, 0x68, 0xe9, 0xe1, 0xff, 0x70],
+        func: "__restgprlr",
+        label: "__restgprlr_",
+        reg_start: 14,
+        reg_end: 32,
+        enc: SledEncoding::Scalar,
+        // lwz r12, -8(r1) ; mtlr r12 ; blr
+        tail: &[0x8181fff8, 0x7d8803a6, 0x4e800020],
+    },
+    SledSpec {
+        needle: [0xd9, 0xcc, 0xff, 0x70, 0xd9, 0xec, 0xff, 0x78],
+        func: "__savefpr",
+        label: "__savefpr_",
+        reg_start: 14,
+        reg_end: 32,
+        enc: SledEncoding::Scalar,
+        tail: &[0x4e800020],
+    },
+    SledSpec {
+        needle: [0xc9, 0xcc, 0xff, 0x70, 0xc9, 0xec, 0xff, 0x78],
+        func: "__restfpr",
+        label: "__restfpr_",
+        reg_start: 14,
+        reg_end: 32,
+        enc: SledEncoding::Scalar,
+        tail: &[0x4e800020],
+    },
+    SledSpec {
+        needle: [0x39, 0x60, 0xfe, 0xe0, 0x7d, 0xcb, 0x61, 0xce],
+        func: "__savevmx",
+        label: "__savevmx_",
+        reg_start: 14,
+        reg_end: 32,
+        enc: SledEncoding::Vector,
+        tail: &[0x4e800020],
+    },
+    SledSpec {
+        needle: [0x39, 0x60, 0xfc, 0x00, 0x10, 0x0b, 0x61, 0xcb],
+        func: "__savevmx_upper",
+        label: "__savevmx_",
+        reg_start: 64,
+        reg_end: 128,
+        enc: SledEncoding::Vector,
+        tail: &[0x4e800020],
+    },
+    SledSpec {
+        needle: [0x39, 0x60, 0xfe, 0xe0, 0x7d, 0xcb, 0x60, 0xce],
+        func: "__restvmx",
+        label: "__restvmx_",
+        reg_start: 14,
+        reg_end: 32,
+        enc: SledEncoding::Vector,
+        tail: &[0x4e800020],
+    },
+    SledSpec {
+        needle: [0x39, 0x60, 0xfc, 0x00, 0x10, 0x0b, 0x60, 0xcb],
+        func: "__restvmx_upper",
+        label: "__restvmx_",
+        reg_start: 64,
+        reg_end: 128,
+        enc: SledEncoding::Vector,
+        tail: &[0x4e800020],
+    },
 ];
+
+/// One save/restore sled located in a code section, with every per-register
+/// entry address already checked against the instruction at that address.
+#[derive(Clone, Debug)]
+pub struct SledMatch {
+    /// Family name (`__savegprlr`). Not a per-register entry name.
+    pub func: &'static str,
+    pub start: SectionAddress,
+    /// Length of the verified body (entries + tail). Note this is NOT always
+    /// the `.pdata` extent: the v14..v31 and v64..v127 VMX halves are two sleds
+    /// inside one `.pdata` function.
+    pub size: u32,
+    /// `(address, name)` per register, in register order. Entry 0 is at `start`.
+    pub entries: Vec<(SectionAddress, String)>,
+}
+
+fn read_u32_be(data: &[u8], offset: usize) -> Option<u32> {
+    data.get(offset..offset + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The word (or word pair) entry `k` must contain, derived from entry 0 as it
+/// actually appears in the image. Nothing about the stack frame layout is
+/// hardcoded — only the shape of the progression, which is the CRT's ABI.
+fn sled_expected_words(enc: SledEncoding, first: &[u32], k: u32) -> [u32; 2] {
+    match enc {
+        SledEncoding::Scalar => [first[0].wrapping_add(k << 21).wrapping_add(k * 8), 0],
+        SledEncoding::Vector => [
+            first[0].wrapping_add(k * 0x10),
+            first[1].wrapping_add((k & 0x1f) << 21).wrapping_add(((k >> 5) & 1) << 2),
+        ],
+    }
+}
+
+/// Locate the Xbox 360 CRT register save/restore sleds by their instruction
+/// bodies.
+///
+/// The 8-byte needle only anchors the search; every remaining entry is then
+/// required to be exactly the word the progression predicts, and the tail
+/// (`blr`, plus the LR shuffle for the GPR pair) is required to be present. A
+/// sled that does not decode is dropped rather than named, since a wrong name
+/// here is worse than no name: it would be compared against the decompiled
+/// object's `bl __savegprlr_25` and reported as a mismatch that looks
+/// authoritative.
+///
+/// Every occurrence of the needle is tried and the first that decodes wins, so
+/// an ordinary instruction pair that happens to collide with the anchor cannot
+/// mask the real sled behind it.
+pub fn find_save_rest_sleds_xbox(obj: &ObjInfo) -> Vec<SledMatch> {
+    let mut out = Vec::new();
+    for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
+        for spec in &SLEDS_XBOX {
+            let mut rejected = 0usize;
+            let mut found = false;
+            for pos in memmem::find_iter(&section.data, &spec.needle) {
+                if pos % 4 != 0 {
+                    continue; // not on an instruction boundary
+                }
+                let start =
+                    SectionAddress::new(section_index, section.address as u32 + pos as u32);
+                match decode_sled_at(spec, section_index, section, pos) {
+                    Some(sled) => {
+                        log::debug!(
+                            "Found {} @ {:#010X} ({} entries, body {:#x})",
+                            spec.func,
+                            start,
+                            spec.entry_count(),
+                            spec.body_size()
+                        );
+                        out.push(sled);
+                        found = true;
+                        break;
+                    }
+                    None => rejected += 1,
+                }
+            }
+            if rejected > 0 {
+                // Not necessarily an error — a needle can collide with ordinary
+                // code — but if nothing decoded, this title's sleds go unnamed
+                // and every call to them will split as `lbl_<addr>`.
+                let level = if found { log::Level::Debug } else { log::Level::Warn };
+                log::log!(
+                    level,
+                    "{}: {} needle match(es) in {} did not decode as a sled{}",
+                    spec.func,
+                    rejected,
+                    section.name,
+                    if found { ", a later one did" } else { " and none did" },
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Decode one candidate sled at `pos`, or `None` if the body is not the CRT's.
+fn decode_sled_at(
+    spec: &SledSpec,
+    section_index: SectionIndex,
+    section: &ObjSection,
+    pos: usize,
+) -> Option<SledMatch> {
+    let start = SectionAddress::new(section_index, section.address as u32 + pos as u32);
+    let first = [read_u32_be(&section.data, pos)?, read_u32_be(&section.data, pos + 4)?];
+    let words_per_entry = (spec.step() / 4) as usize;
+
+    // Every entry must be exactly the word the progression predicts.
+    for k in 0..spec.entry_count() {
+        let expected = sled_expected_words(spec.enc, &first, k);
+        for w in 0..words_per_entry {
+            let off = pos + (k as usize * words_per_entry + w) * 4;
+            if read_u32_be(&section.data, off) != Some(expected[w]) {
+                log::debug!(
+                    "{} candidate @ {:#010X} rejected: entry {}{} word {} != {:#010X}",
+                    spec.func,
+                    start,
+                    spec.label,
+                    spec.reg_start + k,
+                    w,
+                    expected[w],
+                );
+                return None;
+            }
+        }
+    }
+
+    // …and the thunk must end the way the CRT's thunks end.
+    let tail_off = pos + (spec.entry_count() * spec.step()) as usize;
+    for (i, &expected) in spec.tail.iter().enumerate() {
+        if read_u32_be(&section.data, tail_off + i * 4) != Some(expected) {
+            log::debug!(
+                "{} candidate @ {:#010X} rejected: tail word {} != {:#010X}",
+                spec.func,
+                start,
+                i,
+                expected
+            );
+            return None;
+        }
+    }
+
+    let entries = (0..spec.entry_count())
+        .map(|k| (start + k * spec.step(), format!("{}{}", spec.label, spec.reg_start + k)))
+        .collect();
+    Some(SledMatch { func: spec.func, start, size: spec.body_size(), entries })
+}
+
+/// Write the sled names straight into the object.
+///
+/// `FindSaveRestSledsXbox` only seeds `CfaConfig`, which means its names reach
+/// the object exclusively through `apply_cfa` — and CFA is skipped entirely
+/// when a project sets `symbols_known` (any title with a PDB or a map). On Halo
+/// CEA that left all 236 entries unnamed: `load_analyze_xex` drops the PDB's
+/// own `__savegprlr_*` publics via `is_reg_intrinsic` precisely because this
+/// pass is supposed to re-derive them, so with CFA off nothing named them at
+/// all. The relocation tracker then invented `lbl_<addr>` for each, and 68,006
+/// call relocations across 2,545 of 3,675 split objects — ~37.8% of every
+/// function in the image — could never match a decompiled `bl __savegprlr_25`
+/// under objdiff's `name_only` relocation comparison.
+///
+/// Returns the number of symbols added.
+pub fn apply_save_rest_sleds_xbox(obj: &mut ObjInfo) -> Result<usize> {
+    let sleds = find_save_rest_sleds_xbox(obj);
+    let mut added = 0usize;
+    for sled in &sleds {
+        // The family symbol names the whole thunk, and only exists as a
+        // function when the image says one starts here. The VMX v64..v127 half
+        // deliberately gets none: it is the back half of one `.pdata` function,
+        // not a function of its own, and `__savevmx_upper` is dtk's label for
+        // the search, not a name any linker ever emitted.
+        if let Some(&Some(pdata_size)) = obj.known_functions.get(&sled.start) {
+            if pdata_size < sled.size {
+                log::warn!(
+                    "{} @ {:#010X}: .pdata says {:#x} bytes but the body needs {:#x}",
+                    sled.func,
+                    sled.start,
+                    pdata_size,
+                    sled.size
+                );
+            }
+            obj.add_symbol(
+                ObjSymbol {
+                    name: sled.func.to_string(),
+                    address: sled.start.address as u64,
+                    section: Some(sled.start.section),
+                    size: pdata_size as u64,
+                    size_known: true,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    kind: ObjSymbolKind::Function,
+                    ..Default::default()
+                },
+                true,
+            )?;
+            added += 1;
+        }
+        for (addr, name) in &sled.entries {
+            // Labels, not functions: each entry falls through into the next, so
+            // they are 18 (or 64) entry points into one body, and typing them as
+            // functions would make every one of them truncate the extent of the
+            // thunk that contains it.
+            obj.add_symbol(
+                ObjSymbol {
+                    name: name.clone(),
+                    address: addr.address as u64,
+                    section: Some(addr.section),
+                    size_known: true,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    ..Default::default()
+                },
+                true,
+            )?;
+            added += 1;
+        }
+    }
+    if added > 0 {
+        log::info!(
+            "Named {} Xbox CRT save/restore sled symbol(s) across {} sled(s)",
+            added,
+            sleds.len()
+        );
+    }
+    Ok(added)
+}
 
 // Runtime.PPCEABI.H.a runtime.c
 impl AnalysisPass for FindSaveRestSledsXbox {
     fn execute(config: &mut CfaConfig, obj: &ObjInfo) -> Result<()> {
-        for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
-            for (needle, func, label, reg_start, reg_end, step_size) in SLEDS_XBOX {
-                let Some(pos) = memmem::find(&section.data, &needle) else {
-                    continue;
-                };
-                let start = SectionAddress::new(section_index, section.address as u32 + pos as u32);
-                log::debug!("Found {} @ {:#010X}", func, start);
-
-                // save/restore gpr/fpr/vmx should've been found in pdata
-                if !func.contains("_upper") {
-                    assert!(obj.known_functions.contains_key(&start),
-                        "Could not find reg intrinsic from pdata. Is that even possible for an xex?");
-                }
-                // add known symbols for them
-                if obj.known_functions.contains_key(&start) {
-                    let known_func_size = obj.known_functions.get(&start).unwrap().unwrap();
-                    config.known_symbols.entry(start).or_default().push(ObjSymbol {
-                        name: func.to_string(),
-                        address: start.address as u64,
-                        section: Some(start.section),
-                        size: known_func_size as u64,
-                        size_known: true,
-                        flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
-                        kind: ObjSymbolKind::Function,
-                        ..Default::default()
-                    });
-                }
-                for i in reg_start..reg_end {
-                    let addr = start + (i - reg_start) * step_size;
-                    config.known_symbols.entry(addr).or_default().push(ObjSymbol {
-                        name: format!("{label}{i}"),
-                        address: addr.address as u64,
-                        section: Some(start.section),
-                        size_known: true,
-                        flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
-                        ..Default::default()
-                    });
-                }
+        for sled in find_save_rest_sleds_xbox(obj) {
+            // add known symbols for them
+            if let Some(&Some(known_func_size)) = obj.known_functions.get(&sled.start) {
+                config.known_symbols.entry(sled.start).or_default().push(ObjSymbol {
+                    name: sled.func.to_string(),
+                    address: sled.start.address as u64,
+                    section: Some(sled.start.section),
+                    size: known_func_size as u64,
+                    size_known: true,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    kind: ObjSymbolKind::Function,
+                    ..Default::default()
+                });
+            } else if !sled.func.contains("_upper") {
+                // Previously an `assert!`, which turned an unfamiliar image into
+                // a panic in the middle of a 40 s split. The sled is still named
+                // from its entries; only the family function symbol is lost.
+                log::warn!(
+                    "{} @ {:#010X} has no .pdata entry; naming its entries anyway",
+                    sled.func,
+                    sled.start
+                );
+            }
+            for (addr, name) in sled.entries {
+                config.known_symbols.entry(addr).or_default().push(ObjSymbol {
+                    name,
+                    address: addr.address as u64,
+                    section: Some(addr.section),
+                    size_known: true,
+                    flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                    ..Default::default()
+                });
             }
         }
         Ok(())
@@ -914,5 +1242,136 @@ mod tests {
         let candidates =
             FindXboxVtables::execute_collect(&mut config, &obj).expect("execute_collect");
         assert_eq!(candidates.len(), 1, "zero-size label should not block emission");
+    }
+
+    // =========================================================================
+    // Xbox 360 CRT save/restore sleds
+    //
+    // Every literal word below was read out of Halo CEA's HCEX.exe at the
+    // address named in the comment, and cross-checked against HCEX.pdb's own
+    // `__savegprlr_*` publics (236 entries, zero disagreements). They are here
+    // as measured data, not as re-derivations of the code under test.
+    // =========================================================================
+
+    /// `__savegprlr` @ 0x82E541F0, verbatim. std r14..r31 at -0x98..-0x08(r1),
+    /// then `stw r12, -8(r1)` (the caller's LR) and `blr`.
+    const HCEX_SAVEGPRLR: [u32; 20] = [
+        0xf9c1ff68, 0xf9e1ff70, 0xfa01ff78, 0xfa21ff80, 0xfa41ff88, 0xfa61ff90, 0xfa81ff98,
+        0xfaa1ffa0, 0xfac1ffa8, 0xfae1ffb0, 0xfb01ffb8, 0xfb21ffc0, 0xfb41ffc8, 0xfb61ffd0,
+        0xfb81ffd8, 0xfba1ffe0, 0xfbc1ffe8, 0xfbe1fff0, 0x9181fff8, 0x4e800020,
+    ];
+
+    fn make_code_obj(base_addr: u32, words: &[u32]) -> ObjInfo {
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "sled-test".into(),
+            vec![],
+            vec![ObjSection {
+                name: ".text".into(),
+                kind: ObjSectionKind::Code,
+                address: base_addr as u64,
+                size: data.len() as u64,
+                data,
+                align: 4,
+                ..Default::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn savegprlr_sled_entries_are_named_by_register() {
+        let obj = make_code_obj(0x82e541f0, &HCEX_SAVEGPRLR);
+        let sleds = find_save_rest_sleds_xbox(&obj);
+        assert_eq!(sleds.len(), 1, "exactly one sled in this image");
+        let sled = &sleds[0];
+        assert_eq!(sled.func, "__savegprlr");
+        assert_eq!(sled.start.address, 0x82e541f0);
+        assert_eq!(sled.size, 0x50, "18 entries + stw + blr");
+        assert_eq!(sled.entries.len(), 18);
+        assert_eq!(sled.entries[0], (SectionAddress::new(0, 0x82e541f0), "__savegprlr_14".into()));
+        // The case this whole change exists for: `bl lbl_82E5421C` should have
+        // read `bl __savegprlr_25` all along.
+        assert_eq!(sled.entries[11], (SectionAddress::new(0, 0x82e5421c), "__savegprlr_25".into()));
+        assert_eq!(sled.entries[17], (SectionAddress::new(0, 0x82e54234), "__savegprlr_31".into()));
+    }
+
+    #[test]
+    fn a_sled_whose_body_does_not_decode_is_not_named() {
+        // The needle (first two words) still matches, so only the full-body
+        // check can reject this. A wrong name is worse than no name: it would
+        // be compared against a real `bl __savegprlr_25` and reported as a
+        // mismatch that looks authoritative.
+        let mut words = HCEX_SAVEGPRLR;
+        words[11] = 0x60000000; // nop where `std r25, -0x40(r1)` belongs
+        let obj = make_code_obj(0x82e541f0, &words);
+        assert!(find_save_rest_sleds_xbox(&obj).is_empty());
+
+        // Same for the tail: a sled that does not end the way the CRT ends is
+        // not the CRT's sled.
+        let mut words = HCEX_SAVEGPRLR;
+        words[19] = 0x60000000; // nop instead of blr
+        let obj = make_code_obj(0x82e541f0, &words);
+        assert!(find_save_rest_sleds_xbox(&obj).is_empty());
+    }
+
+    #[test]
+    fn vmx_upper_half_register_numbers_survive_the_encoding_split() {
+        // The v64..v127 half is the one place the register number is not a
+        // plain field: VMX128 carries its low five bits at bit 21 and bit 5 of
+        // the number in bit 2 of the word, so entry 32 wraps back to the base
+        // register field with bit 2 newly set. These five pairs are read out of
+        // HCEX.exe at 0x82E57DF4 + 8k and pin that rule to measured bytes.
+        let first = [0x3960fc00u32, 0x100b61cb];
+        for (k, expected) in [
+            (0u32, [0x3960fc00u32, 0x100b61cb]),  // __savevmx_64  @ 0x82E57DF4
+            (1, [0x3960fc10, 0x102b61cb]),        // __savevmx_65  @ 0x82E57DFC
+            (31, [0x3960fdf0, 0x13eb61cb]),       // __savevmx_95  @ 0x82E57EEC
+            (32, [0x3960fe00, 0x100b61cf]),       // __savevmx_96  @ 0x82E57EF4
+            (63, [0x3960fff0, 0x13eb61cf]),       // __savevmx_127 @ 0x82E57FEC
+        ] {
+            assert_eq!(
+                sled_expected_words(SledEncoding::Vector, &first, k),
+                expected,
+                "VMX upper entry {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_writes_labels_for_entries_and_a_function_only_where_pdata_says_so() {
+        let mut obj = make_code_obj(0x82e541f0, &HCEX_SAVEGPRLR);
+        obj.known_functions.insert(SectionAddress::new(0, 0x82e541f0), Some(0x50));
+
+        let added = apply_save_rest_sleds_xbox(&mut obj).expect("apply");
+        assert_eq!(added, 19, "18 entries + the family function symbol");
+
+        // The family symbol is the function; the per-register entries are
+        // labels. Typing an entry as a function would end the thunk's extent
+        // 4 bytes into its own body.
+        let at_start = |name: &str| {
+            obj.symbols
+                .at_section_address(0, 0x82e541f0)
+                .find(|(_, s)| s.name == name)
+                .map(|(_, s)| s.kind)
+        };
+        assert_eq!(at_start("__savegprlr"), Some(ObjSymbolKind::Function));
+        assert_eq!(at_start("__savegprlr_14"), Some(ObjSymbolKind::Unknown));
+        assert_eq!(
+            obj.symbols
+                .at_section_address(0, 0x82e5421c)
+                .map(|(_, s)| (s.name.clone(), s.kind))
+                .collect::<Vec<_>>(),
+            vec![("__savegprlr_25".to_string(), ObjSymbolKind::Unknown)]
+        );
+
+        // No .pdata entry: the entries are still named, the family symbol is
+        // simply absent rather than invented at a guessed size.
+        let mut obj = make_code_obj(0x82e541f0, &HCEX_SAVEGPRLR);
+        let added = apply_save_rest_sleds_xbox(&mut obj).expect("apply");
+        assert_eq!(added, 18);
+        assert!(obj.symbols.by_name("__savegprlr").expect("lookup").is_none());
+        assert!(obj.symbols.by_name("__savegprlr_25").expect("lookup").is_some());
     }
 }

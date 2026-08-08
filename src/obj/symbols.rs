@@ -632,9 +632,29 @@ pub fn best_match_for_reloc(
         let mut rank = match symbol.kind {
             ObjSymbolKind::Function | ObjSymbolKind::Object => {
                 // HACK: These are generally not referenced directly, so reduce their rank
+                //
+                // The second row is the Xbox 360 XDK CRT's spelling of the same
+                // thing. Both halves matter for the same reason: the family
+                // symbol and the first per-register entry share an address
+                // (`__savegprlr` and `__savegprlr_14` are both 0x82E541F0 in
+                // Halo CEA), and a compiler saving r14..r31 emits
+                // `bl __savegprlr_14`. Without this the sized function symbol
+                // outranks the label and the split names the call after the
+                // family, which no object file ever references.
                 if matches!(
                     symbol.name.as_str(),
-                    "__save_gpr" | "__restore_gpr" | "__save_fpr" | "__restore_fpr"
+                    "__save_gpr"
+                        | "__restore_gpr"
+                        | "__save_fpr"
+                        | "__restore_fpr"
+                        | "__savegprlr"
+                        | "__restgprlr"
+                        | "__savefpr"
+                        | "__restfpr"
+                        | "__savevmx"
+                        | "__restvmx"
+                        | "__savevmx_upper"
+                        | "__restvmx_upper"
                 ) {
                     return 0;
                 }
@@ -667,4 +687,70 @@ pub fn best_match_for_reloc(
         -rank
     });
     symbols.into_iter().next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `__savegprlr` (the whole thunk, sized, from `.pdata`) and
+    /// `__savegprlr_14` (the first per-register entry) share address
+    /// 0x82E541F0 in Halo CEA. A compiler saving r14..r31 emits
+    /// `bl __savegprlr_14`, so a `bl` landing there must be named after the
+    /// entry — otherwise the split's name and every real object's name differ
+    /// and objdiff's `name_only` relocation comparison scores a mismatch on a
+    /// byte-identical function.
+    #[test]
+    fn rel24_to_a_sled_start_names_the_register_entry_not_the_family() {
+        let family = ObjSymbol {
+            name: "__savegprlr".into(),
+            address: 0x82e541f0,
+            section: Some(0),
+            size: 0x50,
+            size_known: true,
+            kind: ObjSymbolKind::Function,
+            ..Default::default()
+        };
+        let entry = ObjSymbol {
+            name: "__savegprlr_14".into(),
+            address: 0x82e541f0,
+            section: Some(0),
+            size_known: true,
+            kind: ObjSymbolKind::Unknown,
+            ..Default::default()
+        };
+
+        // Both orderings, so the result is the ranking and not the input order.
+        for symbols in [vec![(0, &family), (1, &entry)], vec![(0, &entry), (1, &family)]] {
+            let (_, best) = best_match_for_reloc(symbols, ObjRelocKind::PpcRel24)
+                .expect("a symbol is chosen");
+            assert_eq!(best.name, "__savegprlr_14");
+        }
+    }
+
+    /// The de-rank must not swallow ordinary functions: an unrelated sized
+    /// function still outranks a bare label at its own address.
+    #[test]
+    fn rel24_still_prefers_an_ordinary_function_over_a_label() {
+        let func = ObjSymbol {
+            name: "memcpy".into(),
+            address: 0x82e54610,
+            section: Some(0),
+            size: 0x488,
+            size_known: true,
+            kind: ObjSymbolKind::Function,
+            ..Default::default()
+        };
+        let label = ObjSymbol {
+            name: "lbl_82E54610".into(),
+            address: 0x82e54610,
+            section: Some(0),
+            kind: ObjSymbolKind::Unknown,
+            ..Default::default()
+        };
+        let (_, best) =
+            best_match_for_reloc(vec![(0, &label), (1, &func)], ObjRelocKind::PpcRel24)
+                .expect("a symbol is chosen");
+        assert_eq!(best.name, "memcpy");
+    }
 }
