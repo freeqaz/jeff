@@ -2445,6 +2445,167 @@ fn overlapping_function_intervals(funcs: &[(SymbolIndex, u64, u64)]) -> Vec<(usi
     out
 }
 
+/// Re-run relocation analysis over every function body that the first tracker
+/// pass never walked, and commit only the relocations that are genuinely new.
+///
+/// ## The bug this fixes
+///
+/// `Tracker::process_code` analyses the function symbols that exist *when it
+/// runs*. In `split_write_obj_exe` that is before the whole symbol-repair
+/// pipeline — `grow_undersized_function_symbols`, `clamp_oversized_function_symbols`,
+/// [`synthesize_reloc_targeted_leaf_functions`], [`merge_fallthrough_leaf_fragments`],
+/// [`merge_branch_reached_overcarve_tails`] — which is where a large number of
+/// function symbols are created (synthesized/promoted PDATA-less leaves) or
+/// resized. On Halo CEA that is 1,770 functions, and measured over the emitted
+/// COFFs **every single one of them split with zero relocations**, against
+/// 59,636 real functions that had them: 1,414 unrelocated `bl` across 858
+/// functions (1,375 landing exactly on a known function start) plus most of the
+/// residual unrelocated `lis`/`addi` hi-lo pairs.
+///
+/// The ordering can't simply be inverted: leaf synthesis is *reloc-targeted*,
+/// i.e. it consumes the post-`tracker.apply` relocation set to decide what is a
+/// leaf, so it cannot run before the tracker. Hence a second, incremental pass.
+///
+/// ## Why this shape
+///
+/// * **It runs last** — after every repair pass, so those passes still see
+///   exactly the relocation set they saw before, and this change can only ever
+///   *add* relocations. That keeps an A/B of the split output interpretable.
+/// * **It re-analyses only bodies nobody walked at their current bounds.** The
+///   first tracker records `start -> size` for each body it walked; a symbol
+///   that is new, grown, merged or clamped fails that comparison and is
+///   re-analysed. The ~60k untouched functions are skipped, so the pass costs a
+///   few percent of a split rather than doubling the tracker.
+/// * **It never overwrites an existing relocation.** Any tracked relocation
+///   whose source address already carries one is dropped before `apply`. A
+///   synthesized leaf carved out of an absorbing parent shares addresses with
+///   that parent's (already committed) analysis, and the parent was walked with
+///   full entry-register context while the leaf is walked from its own start
+///   with none — so where the two disagree the first pass is the better
+///   informed one. Dropping instead of replacing also means `apply` can never
+///   hit its "Conflicting relocations" bail.
+/// * **Stripped symbols are excluded.** `prune_overlapping_phantom_functions`
+///   and CFA both retire symbols by renaming to `__DELETED_*` with
+///   `ObjSymbolFlags::Stripped` and `kind: Unknown`; walking a phantom's bogus
+///   range from a bogus entry state is exactly how a wrong relocation would get
+///   invented.
+///
+/// Returns the number of relocations added.
+fn retrack_unanalyzed_functions(obj: &mut ObjInfo, first: &Tracker) -> Result<usize> {
+    let mut pending: Vec<ObjSymbol> = Vec::new();
+    for (section_index, _) in obj.sections.by_kind(ObjSectionKind::Code) {
+        for (_, symbol) in obj.symbols.for_section(section_index) {
+            if symbol.kind != ObjSymbolKind::Function
+                || !symbol.size_known
+                || symbol.size == 0
+                || symbol.flags.is_stripped()
+                || symbol.name.contains("__imp")
+            {
+                continue;
+            }
+            let addr = SectionAddress::new(section_index, symbol.address as u32);
+            if first.analyzed_function_size(addr) == Some(symbol.size as u32) {
+                // Already walked at exactly these bounds by the first pass.
+                continue;
+            }
+            pending.push(symbol.clone());
+        }
+    }
+    if pending.is_empty() {
+        log::info!("Post-repair relocation pass: no unanalyzed function bodies");
+        return Result::Ok(0);
+    }
+
+    let mut tracker = Tracker::new(obj);
+    let mut failed = 0usize;
+    for symbol in &pending {
+        if let Err(e) = tracker.process_function(obj, symbol) {
+            log::warn!(
+                "Post-repair relocation analysis failed for {} @ {:#010x}: {e:#}",
+                symbol.name,
+                symbol.address
+            );
+            failed += 1;
+        }
+    }
+
+    // Keep only relocations at source addresses that don't already have one.
+    let mut existing = 0usize;
+    let candidates = std::mem::take(&mut tracker.relocations);
+    let total = candidates.len();
+    tracker.relocations = candidates
+        .into_iter()
+        .filter(|(addr, _)| {
+            if obj.sections[addr.section].relocations.at(addr.address).is_some() {
+                existing += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let added_addrs: Vec<SectionAddress> = tracker.relocations.keys().copied().collect();
+    let added = added_addrs.len();
+
+    tracker.apply_relocations(obj, false)?;
+
+    // Drop anything that resolved to the INTERIOR of a symbol.
+    //
+    // `write_coff` cannot represent a non-zero addend on a code relocation: for
+    // REL24 it overwrites the displacement with -(offset in section) and for
+    // REFHI/REFLO it zeroes the 16-bit immediate, so in both cases the addend
+    // is discarded and the linker resolves the site to the symbol's START. A
+    // relocation whose target is `sym + delta` would therefore be emitted
+    // pointing at something the instruction demonstrably does not reference —
+    // strictly worse than leaving the site unrelocated, because objdiff scores
+    // a wrong relocation as wrong code.
+    //
+    // On Halo CEA this is 54 of 2,474 checkable sites: tail `b`/`bl` into the
+    // middle of a neighbouring function and jump-table bases at `fn + 52`.
+    // Emitting "nearest preceding symbol + delta" is well-defined but is not
+    // necessarily the reference the original compiler wrote, and where the
+    // delta crosses into an unnamed blob there is no principled base symbol at
+    // all — so these are deliberately left as residue rather than guessed.
+    let mut interior = 0usize;
+    for addr in added_addrs {
+        let section = &mut obj.sections[addr.section];
+        let Some(reloc) = section.relocations.at(addr.address) else { continue };
+        if reloc.addend != 0
+            && matches!(
+                reloc.kind,
+                ObjRelocKind::PpcRel24
+                    | ObjRelocKind::PpcRel14
+                    | ObjRelocKind::PpcAddr16Ha
+                    | ObjRelocKind::PpcAddr16Lo
+            )
+        {
+            let (kind, target, addend) = (reloc.kind, reloc.target_symbol, reloc.addend);
+            log::debug!(
+                "Dropping unrepresentable {:?} @ {:#010x} -> {}+{:#x} (interior target)",
+                kind,
+                addr.address,
+                obj.symbols[target].name,
+                addend
+            );
+            obj.sections[addr.section].relocations.remove(addr.address);
+            interior += 1;
+        }
+    }
+
+    log::info!(
+        "Post-repair relocation pass: re-analyzed {} function body(ies) never walked by the \
+         initial tracker, adding {} relocation(s) ({} already present, {} dropped as \
+         interior-of-symbol targets write_coff cannot encode, {} failed)",
+        pending.len(),
+        added - interior,
+        existing,
+        interior,
+        failed
+    );
+    debug_assert_eq!(total, added + existing);
+    Result::Ok(added - interior)
+}
+
 fn split_write_obj_exe(
     module: &mut ExeModuleInfo,
     config: &ProjectConfig,
@@ -2564,6 +2725,12 @@ fn split_write_obj_exe(
     // CLASS 4 CENSUS (env-gated, read-only): named-head post-blr/branch over-carve
     // groups. No-op unless JEFF_CLASS4_CENSUS is set.
     census_class4_overcarve(&module.obj);
+    // Every pass above can create or resize function symbols, and the tracker
+    // only ever analysed the bodies that existed when IT ran. Walk the bodies
+    // nobody has walked yet and add the relocations they need. Runs LAST of the
+    // repair passes so none of them sees a changed relocation set, and before
+    // write_symbols_file / split_obj so the new relocations reach the objects.
+    retrack_unanalyzed_functions(&mut module.obj, &tracker)?;
 
     if !config.symbols_known && config.detect_objects {
         debug!("Detecting object boundaries");
@@ -3475,8 +3642,9 @@ fn info(args: InfoArgs) -> Result<()> {
 mod tests {
     use super::{
         overlapping_function_intervals, plan_fallthrough_merge_runs,
-        synthesize_reloc_targeted_leaf_functions, LeafFrag,
+        retrack_unanalyzed_functions, synthesize_reloc_targeted_leaf_functions, LeafFrag,
     };
+    use crate::analysis::tracker::Tracker;
     use crate::obj::{
         ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind,
         ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
@@ -3928,5 +4096,101 @@ mod tests {
                 assert!(ok, "reported overlap addr {oa:#x} for index {i} is bogus: {funcs:?}");
             }
         }
+    }
+
+    // ---- post-repair relocation pass ----------------------------------------
+    //
+    // The defect: `Tracker::process_code` only ever sees the function symbols
+    // that exist when it runs, and the whole symbol-repair pipeline (leaf
+    // synthesis and friends) creates more of them afterwards. Those bodies then
+    // split with no relocations at all -- 1,770 functions and every `bl` in them
+    // on Halo CEA.
+
+    /// Two adjacent leaf functions that call each other:
+    ///
+    /// ```text
+    ///   0x1000 A: bl 0x1010   ; -> B
+    ///   0x1004    blr
+    ///   0x1008 B: bl  <arg>   ; target chosen by the caller
+    ///   0x100C    blr
+    /// ```
+    fn retrack_test_obj(b_branch: u32) -> ObjInfo {
+        let words: [u32; 4] = [
+            0x4800_0009, // 0x1000 bl 0x1008
+            BLR,         // 0x1004
+            b_branch,    // 0x1008
+            BLR,         // 0x100C
+        ];
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0x1000,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            ..Default::default()
+        };
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "retrack-test".into(),
+            vec![],
+            vec![section],
+        )
+    }
+
+    #[test]
+    fn function_created_after_the_tracker_ran_still_gets_its_relocations() {
+        // B's `bl` goes back to A @ 0x1000: 0x1008 + (-8).
+        let mut obj = retrack_test_obj(0x4BFF_FFF9);
+        add_sym(&mut obj, "A", 0x1000, 8, ObjSymbolKind::Function);
+        add_sym(&mut obj, "B", 0x1008, 8, ObjSymbolKind::Function);
+
+        // First pass: walk A only, exactly as if B had not existed yet.
+        let mut first = Tracker::new(&obj);
+        let a = obj.symbols.by_name("A").unwrap().unwrap().1.clone();
+        first.process_function(&obj, &a).unwrap();
+        first.apply_relocations(&mut obj, false).unwrap();
+        assert!(obj.sections[0].relocations.at(0x1000).is_some(), "A's call should be tracked");
+        assert!(
+            obj.sections[0].relocations.at(0x1008).is_none(),
+            "B was never walked, so it must start out with no relocations"
+        );
+
+        // Second pass: B is unanalyzed, so it gets picked up.
+        let added = retrack_unanalyzed_functions(&mut obj, &first).unwrap();
+        assert_eq!(added, 1);
+        let reloc =
+            obj.sections[0].relocations.at(0x1008).expect("B's call must now be relocated");
+        assert_eq!(reloc.kind, ObjRelocKind::PpcRel24);
+        assert_eq!(obj.symbols[reloc.target_symbol].name, "A");
+        assert_eq!(reloc.addend, 0);
+
+        // A was already walked at these exact bounds, so it is not re-walked and
+        // its existing relocation is untouched.
+        let a_reloc = obj.sections[0].relocations.at(0x1000).unwrap();
+        assert_eq!(obj.symbols[a_reloc.target_symbol].name, "B");
+    }
+
+    #[test]
+    fn interior_targets_are_dropped_rather_than_emitted_at_the_symbol_start() {
+        // B branches into the MIDDLE of A (0x1004), which needs a relocation
+        // with addend 4 -- and `write_coff` overwrites a REL24's displacement
+        // with -(section offset), discarding the addend, so the emitted
+        // relocation would resolve to A+0 and point at an instruction the
+        // branch demonstrably does not target. Better to leave the site bare.
+        let mut obj = retrack_test_obj(0x4BFF_FFFC); // b 0x1004
+        add_sym(&mut obj, "A", 0x1000, 8, ObjSymbolKind::Function);
+        add_sym(&mut obj, "B", 0x1008, 8, ObjSymbolKind::Function);
+
+        let mut first = Tracker::new(&obj);
+        let a = obj.symbols.by_name("A").unwrap().unwrap().1.clone();
+        first.process_function(&obj, &a).unwrap();
+        first.apply_relocations(&mut obj, false).unwrap();
+
+        let added = retrack_unanalyzed_functions(&mut obj, &first).unwrap();
+        assert_eq!(added, 0, "an unrepresentable interior target must not be emitted");
+        assert!(obj.sections[0].relocations.at(0x1008).is_none());
     }
 }

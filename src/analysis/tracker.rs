@@ -67,6 +67,15 @@ pub enum DataKind {
 
 pub struct Tracker {
     processed_functions: BTreeSet<SectionAddress>,
+    /// Every function body this tracker actually walked, as `start -> size`.
+    ///
+    /// Used by the second, post-repair tracker pass in `cmd::xex` to answer
+    /// "which function bodies has nobody analysed yet?" — a function that was
+    /// synthesized, promoted, grown or merged after the first pass either is
+    /// absent from this map or is present with a different size, and is exactly
+    /// the set whose instruction stream would otherwise split with no
+    /// relocations. See `retrack_unanalyzed_functions`.
+    analyzed_functions: BTreeMap<SectionAddress, u32>,
     sda2_base: Option<u32>, // r2
     sda_base: Option<u32>,  // r13
     pub relocations: BTreeMap<SectionAddress, Relocation>,
@@ -87,6 +96,7 @@ impl Tracker {
     pub fn new(obj: &ObjInfo) -> Tracker {
         Self {
             processed_functions: Default::default(),
+            analyzed_functions: Default::default(),
             sda2_base: obj.sda2_base,
             sda_base: obj.sda_base,
             relocations: Default::default(),
@@ -532,6 +542,7 @@ impl Tracker {
         };
         let function_start = SectionAddress::new(section_index, symbol.address as u32);
         let function_end = function_start + symbol.size as u32;
+        self.analyzed_functions.insert(function_start, symbol.size as u32);
         let _span =
             info_span!("fn", name = %symbol.name, start = %function_start, end = %function_end)
                 .entered();
@@ -745,6 +756,43 @@ impl Tracker {
             }
         }
 
+        self.apply_relocations(obj, replace)?;
+
+        // Rename all discovered extab dtors from extab relocations
+        if let Some((_, extab_section)) = obj.sections.by_name("extab")? {
+            for (_, reloc) in extab_section.relocations.iter() {
+                let symbol = &obj.symbols[reloc.target_symbol];
+                // Only rename auto symbols
+                if is_auto_symbol(symbol) {
+                    let mut new_symbol = symbol.clone();
+                    let name =
+                        create_auto_symbol_name("dtor", obj.module_id, symbol.address as u32);
+
+                    new_symbol.name = name;
+                    obj.symbols.replace(reloc.target_symbol, new_symbol)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The size of the function body this tracker walked starting at `addr`, if any.
+    pub fn analyzed_function_size(&self, addr: SectionAddress) -> Option<u32> {
+        self.analyzed_functions.get(&addr).copied()
+    }
+
+    /// Commit only the tracked relocations to `obj`, without the section
+    /// classification/renaming or extab dtor renaming that [`Self::apply`] also
+    /// performs.
+    ///
+    /// A second, incremental tracker pass must NOT re-run those: its
+    /// `sda_to`/`stores_to`/`hal_to` sets are derived from a small subset of the
+    /// module's functions, so feeding them to the section classifier could flip
+    /// a section named `.data` by the full first pass to `.rodata` purely
+    /// because the handful of functions in the second pass happen not to store
+    /// to it. Relocation insertion has no such whole-module dependency.
+    pub fn apply_relocations(&self, obj: &mut ObjInfo, replace: bool) -> Result<()> {
         for (&addr, reloc) in &self.relocations {
             let Some((reloc_kind, target)) = reloc.kind_and_address() else {
                 // Skip external relocations, they already exist
@@ -853,22 +901,6 @@ impl Tracker {
                             reloc_symbol.address as i64 + addend,
                         );
                     }
-                }
-            }
-        }
-
-        // Rename all discovered extab dtors from extab relocations
-        if let Some((_, extab_section)) = obj.sections.by_name("extab")? {
-            for (_, reloc) in extab_section.relocations.iter() {
-                let symbol = &obj.symbols[reloc.target_symbol];
-                // Only rename auto symbols
-                if is_auto_symbol(symbol) {
-                    let mut new_symbol = symbol.clone();
-                    let name =
-                        create_auto_symbol_name("dtor", obj.module_id, symbol.address as u32);
-
-                    new_symbol.name = name;
-                    obj.symbols.replace(reloc.target_symbol, new_symbol)?;
                 }
             }
         }

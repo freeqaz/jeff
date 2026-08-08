@@ -177,6 +177,9 @@ impl ObjRelocations {
 
     pub fn at(&self, address: u32) -> Option<&ObjReloc> { self.relocations.get(&address) }
 
+    /// Remove the relocation at `address`, returning it if there was one.
+    pub fn remove(&mut self, address: u32) -> Option<ObjReloc> { self.relocations.remove(&address) }
+
     pub fn at_mut(&mut self, address: u32) -> Option<&mut ObjReloc> {
         self.relocations.get_mut(&address)
     }
