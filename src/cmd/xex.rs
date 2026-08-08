@@ -2544,20 +2544,66 @@ fn retrack_unanalyzed_functions(obj: &mut ObjInfo, first: &Tracker) -> Result<us
             }
         })
         .collect();
-    let added = tracker.relocations.len();
+    let added_addrs: Vec<SectionAddress> = tracker.relocations.keys().copied().collect();
+    let added = added_addrs.len();
 
     tracker.apply_relocations(obj, false)?;
 
+    // Drop anything that resolved to the INTERIOR of a symbol.
+    //
+    // `write_coff` cannot represent a non-zero addend on a code relocation: for
+    // REL24 it overwrites the displacement with -(offset in section) and for
+    // REFHI/REFLO it zeroes the 16-bit immediate, so in both cases the addend
+    // is discarded and the linker resolves the site to the symbol's START. A
+    // relocation whose target is `sym + delta` would therefore be emitted
+    // pointing at something the instruction demonstrably does not reference —
+    // strictly worse than leaving the site unrelocated, because objdiff scores
+    // a wrong relocation as wrong code.
+    //
+    // On Halo CEA this is 54 of 2,474 checkable sites: tail `b`/`bl` into the
+    // middle of a neighbouring function and jump-table bases at `fn + 52`.
+    // Emitting "nearest preceding symbol + delta" is well-defined but is not
+    // necessarily the reference the original compiler wrote, and where the
+    // delta crosses into an unnamed blob there is no principled base symbol at
+    // all — so these are deliberately left as residue rather than guessed.
+    let mut interior = 0usize;
+    for addr in added_addrs {
+        let section = &mut obj.sections[addr.section];
+        let Some(reloc) = section.relocations.at(addr.address) else { continue };
+        if reloc.addend != 0
+            && matches!(
+                reloc.kind,
+                ObjRelocKind::PpcRel24
+                    | ObjRelocKind::PpcRel14
+                    | ObjRelocKind::PpcAddr16Ha
+                    | ObjRelocKind::PpcAddr16Lo
+            )
+        {
+            let (kind, target, addend) = (reloc.kind, reloc.target_symbol, reloc.addend);
+            log::debug!(
+                "Dropping unrepresentable {:?} @ {:#010x} -> {}+{:#x} (interior target)",
+                kind,
+                addr.address,
+                obj.symbols[target].name,
+                addend
+            );
+            obj.sections[addr.section].relocations.remove(addr.address);
+            interior += 1;
+        }
+    }
+
     log::info!(
         "Post-repair relocation pass: re-analyzed {} function body(ies) never walked by the \
-         initial tracker, adding {} relocation(s) ({} already present, {} failed)",
+         initial tracker, adding {} relocation(s) ({} already present, {} dropped as \
+         interior-of-symbol targets write_coff cannot encode, {} failed)",
         pending.len(),
-        added,
+        added - interior,
         existing,
+        interior,
         failed
     );
     debug_assert_eq!(total, added + existing);
-    Result::Ok(added)
+    Result::Ok(added - interior)
 }
 
 fn split_write_obj_exe(
