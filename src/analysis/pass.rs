@@ -8,7 +8,7 @@ use memchr::memmem;
 use crate::{
     analysis::cfa::{CfaConfig, FunctionInfo, SectionAddress},
     obj::{
-        ObjInfo, ObjKind, ObjRelocKind, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet,
+        ObjInfo, ObjKind, ObjRelocKind, ObjSection, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet,
         ObjSymbolFlags, ObjSymbolKind, SectionIndex,
     },
 };
@@ -284,100 +284,111 @@ fn sled_expected_words(enc: SledEncoding, first: &[u32], k: u32) -> [u32; 2] {
 /// The 8-byte needle only anchors the search; every remaining entry is then
 /// required to be exactly the word the progression predicts, and the tail
 /// (`blr`, plus the LR shuffle for the GPR pair) is required to be present. A
-/// sled that does not decode is dropped with a warning rather than named, since
-/// a wrong name here is worse than no name: it would be compared against the
-/// decompiled object's `bl __savegprlr_25` and reported as a mismatch.
+/// sled that does not decode is dropped rather than named, since a wrong name
+/// here is worse than no name: it would be compared against the decompiled
+/// object's `bl __savegprlr_25` and reported as a mismatch that looks
+/// authoritative.
+///
+/// Every occurrence of the needle is tried and the first that decodes wins, so
+/// an ordinary instruction pair that happens to collide with the anchor cannot
+/// mask the real sled behind it.
 pub fn find_save_rest_sleds_xbox(obj: &ObjInfo) -> Vec<SledMatch> {
     let mut out = Vec::new();
     for (section_index, section) in obj.sections.by_kind(ObjSectionKind::Code) {
         for spec in &SLEDS_XBOX {
-            let Some(pos) = memmem::find(&section.data, &spec.needle) else {
-                continue;
-            };
-            let start = SectionAddress::new(section_index, section.address as u32 + pos as u32);
-
-            let first = [
-                read_u32_be(&section.data, pos).unwrap_or(0),
-                read_u32_be(&section.data, pos + 4).unwrap_or(0),
-            ];
-            let words_per_entry = (spec.step() / 4) as usize;
-
-            // Verify every entry body.
-            let mut ok = true;
-            for k in 0..spec.entry_count() {
-                let expected = sled_expected_words(spec.enc, &first, k);
-                for w in 0..words_per_entry {
-                    let off = pos + (k as usize * words_per_entry + w) * 4;
-                    match read_u32_be(&section.data, off) {
-                        Some(actual) if actual == expected[w] => {}
-                        actual => {
-                            log::warn!(
-                                "{} @ {:#010X}: entry {}{} word {} is {:?}, expected {:#010X} — \
-                                 not naming this sled",
-                                spec.func,
-                                start,
-                                spec.label,
-                                spec.reg_start + k,
-                                w,
-                                actual.map(|a| format!("{a:#010X}")),
-                                expected[w],
-                            );
-                            ok = false;
-                            break;
-                        }
+            let mut rejected = 0usize;
+            let mut found = false;
+            for pos in memmem::find_iter(&section.data, &spec.needle) {
+                if pos % 4 != 0 {
+                    continue; // not on an instruction boundary
+                }
+                let start =
+                    SectionAddress::new(section_index, section.address as u32 + pos as u32);
+                match decode_sled_at(spec, section_index, section, pos) {
+                    Some(sled) => {
+                        log::debug!(
+                            "Found {} @ {:#010X} ({} entries, body {:#x})",
+                            spec.func,
+                            start,
+                            spec.entry_count(),
+                            spec.body_size()
+                        );
+                        out.push(sled);
+                        found = true;
+                        break;
                     }
-                }
-                if !ok {
-                    break;
+                    None => rejected += 1,
                 }
             }
-            if !ok {
-                continue;
+            if rejected > 0 {
+                // Not necessarily an error — a needle can collide with ordinary
+                // code — but if nothing decoded, this title's sleds go unnamed
+                // and every call to them will split as `lbl_<addr>`.
+                let level = if found { log::Level::Debug } else { log::Level::Warn };
+                log::log!(
+                    level,
+                    "{}: {} needle match(es) in {} did not decode as a sled{}",
+                    spec.func,
+                    rejected,
+                    section.name,
+                    if found { ", a later one did" } else { " and none did" },
+                );
             }
-
-            // Verify the tail.
-            let tail_off = pos + (spec.entry_count() * spec.step()) as usize;
-            for (i, &expected) in spec.tail.iter().enumerate() {
-                let actual = read_u32_be(&section.data, tail_off + i * 4);
-                if actual != Some(expected) {
-                    log::warn!(
-                        "{} @ {:#010X}: tail word {} is {:?}, expected {:#010X} — not naming \
-                         this sled",
-                        spec.func,
-                        start,
-                        i,
-                        actual.map(|a| format!("{a:#010X}")),
-                        expected,
-                    );
-                    ok = false;
-                    break;
-                }
-            }
-            if !ok {
-                continue;
-            }
-
-            let entries = (0..spec.entry_count())
-                .map(|k| {
-                    (start + k * spec.step(), format!("{}{}", spec.label, spec.reg_start + k))
-                })
-                .collect();
-            log::debug!(
-                "Found {} @ {:#010X} ({} entries, body {:#x})",
-                spec.func,
-                start,
-                spec.entry_count(),
-                spec.body_size()
-            );
-            out.push(SledMatch {
-                func: spec.func,
-                start,
-                size: spec.body_size(),
-                entries,
-            });
         }
     }
     out
+}
+
+/// Decode one candidate sled at `pos`, or `None` if the body is not the CRT's.
+fn decode_sled_at(
+    spec: &SledSpec,
+    section_index: SectionIndex,
+    section: &ObjSection,
+    pos: usize,
+) -> Option<SledMatch> {
+    let start = SectionAddress::new(section_index, section.address as u32 + pos as u32);
+    let first = [read_u32_be(&section.data, pos)?, read_u32_be(&section.data, pos + 4)?];
+    let words_per_entry = (spec.step() / 4) as usize;
+
+    // Every entry must be exactly the word the progression predicts.
+    for k in 0..spec.entry_count() {
+        let expected = sled_expected_words(spec.enc, &first, k);
+        for w in 0..words_per_entry {
+            let off = pos + (k as usize * words_per_entry + w) * 4;
+            if read_u32_be(&section.data, off) != Some(expected[w]) {
+                log::debug!(
+                    "{} candidate @ {:#010X} rejected: entry {}{} word {} != {:#010X}",
+                    spec.func,
+                    start,
+                    spec.label,
+                    spec.reg_start + k,
+                    w,
+                    expected[w],
+                );
+                return None;
+            }
+        }
+    }
+
+    // …and the thunk must end the way the CRT's thunks end.
+    let tail_off = pos + (spec.entry_count() * spec.step()) as usize;
+    for (i, &expected) in spec.tail.iter().enumerate() {
+        if read_u32_be(&section.data, tail_off + i * 4) != Some(expected) {
+            log::debug!(
+                "{} candidate @ {:#010X} rejected: tail word {} != {:#010X}",
+                spec.func,
+                start,
+                i,
+                expected
+            );
+            return None;
+        }
+    }
+
+    let entries = (0..spec.entry_count())
+        .map(|k| (start + k * spec.step(), format!("{}{}", spec.label, spec.reg_start + k)))
+        .collect();
+    Some(SledMatch { func: spec.func, start, size: spec.body_size(), entries })
 }
 
 /// Write the sled names straight into the object.
