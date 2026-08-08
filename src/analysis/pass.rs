@@ -1232,4 +1232,135 @@ mod tests {
             FindXboxVtables::execute_collect(&mut config, &obj).expect("execute_collect");
         assert_eq!(candidates.len(), 1, "zero-size label should not block emission");
     }
+
+    // =========================================================================
+    // Xbox 360 CRT save/restore sleds
+    //
+    // Every literal word below was read out of Halo CEA's HCEX.exe at the
+    // address named in the comment, and cross-checked against HCEX.pdb's own
+    // `__savegprlr_*` publics (236 entries, zero disagreements). They are here
+    // as measured data, not as re-derivations of the code under test.
+    // =========================================================================
+
+    /// `__savegprlr` @ 0x82E541F0, verbatim. std r14..r31 at -0x98..-0x08(r1),
+    /// then `stw r12, -8(r1)` (the caller's LR) and `blr`.
+    const HCEX_SAVEGPRLR: [u32; 20] = [
+        0xf9c1ff68, 0xf9e1ff70, 0xfa01ff78, 0xfa21ff80, 0xfa41ff88, 0xfa61ff90, 0xfa81ff98,
+        0xfaa1ffa0, 0xfac1ffa8, 0xfae1ffb0, 0xfb01ffb8, 0xfb21ffc0, 0xfb41ffc8, 0xfb61ffd0,
+        0xfb81ffd8, 0xfba1ffe0, 0xfbc1ffe8, 0xfbe1fff0, 0x9181fff8, 0x4e800020,
+    ];
+
+    fn make_code_obj(base_addr: u32, words: &[u32]) -> ObjInfo {
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "sled-test".into(),
+            vec![],
+            vec![ObjSection {
+                name: ".text".into(),
+                kind: ObjSectionKind::Code,
+                address: base_addr as u64,
+                size: data.len() as u64,
+                data,
+                align: 4,
+                ..Default::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn savegprlr_sled_entries_are_named_by_register() {
+        let obj = make_code_obj(0x82e541f0, &HCEX_SAVEGPRLR);
+        let sleds = find_save_rest_sleds_xbox(&obj);
+        assert_eq!(sleds.len(), 1, "exactly one sled in this image");
+        let sled = &sleds[0];
+        assert_eq!(sled.func, "__savegprlr");
+        assert_eq!(sled.start.address, 0x82e541f0);
+        assert_eq!(sled.size, 0x50, "18 entries + stw + blr");
+        assert_eq!(sled.entries.len(), 18);
+        assert_eq!(sled.entries[0], (SectionAddress::new(0, 0x82e541f0), "__savegprlr_14".into()));
+        // The case this whole change exists for: `bl lbl_82E5421C` should have
+        // read `bl __savegprlr_25` all along.
+        assert_eq!(sled.entries[11], (SectionAddress::new(0, 0x82e5421c), "__savegprlr_25".into()));
+        assert_eq!(sled.entries[17], (SectionAddress::new(0, 0x82e54234), "__savegprlr_31".into()));
+    }
+
+    #[test]
+    fn a_sled_whose_body_does_not_decode_is_not_named() {
+        // The needle (first two words) still matches, so only the full-body
+        // check can reject this. A wrong name is worse than no name: it would
+        // be compared against a real `bl __savegprlr_25` and reported as a
+        // mismatch that looks authoritative.
+        let mut words = HCEX_SAVEGPRLR;
+        words[11] = 0x60000000; // nop where `std r25, -0x40(r1)` belongs
+        let obj = make_code_obj(0x82e541f0, &words);
+        assert!(find_save_rest_sleds_xbox(&obj).is_empty());
+
+        // Same for the tail: a sled that does not end the way the CRT ends is
+        // not the CRT's sled.
+        let mut words = HCEX_SAVEGPRLR;
+        words[19] = 0x60000000; // nop instead of blr
+        let obj = make_code_obj(0x82e541f0, &words);
+        assert!(find_save_rest_sleds_xbox(&obj).is_empty());
+    }
+
+    #[test]
+    fn vmx_upper_half_register_numbers_survive_the_encoding_split() {
+        // The v64..v127 half is the one place the register number is not a
+        // plain field: VMX128 carries its low five bits at bit 21 and bit 5 of
+        // the number in bit 2 of the word, so entry 32 wraps back to the base
+        // register field with bit 2 newly set. These five pairs are read out of
+        // HCEX.exe at 0x82E57DF4 + 8k and pin that rule to measured bytes.
+        let first = [0x3960fc00u32, 0x100b61cb];
+        for (k, expected) in [
+            (0u32, [0x3960fc00u32, 0x100b61cb]),  // __savevmx_64  @ 0x82E57DF4
+            (1, [0x3960fc10, 0x102b61cb]),        // __savevmx_65  @ 0x82E57DFC
+            (31, [0x3960fdf0, 0x13eb61cb]),       // __savevmx_95  @ 0x82E57EEC
+            (32, [0x3960fe00, 0x100b61cf]),       // __savevmx_96  @ 0x82E57EF4
+            (63, [0x3960fff0, 0x13eb61cf]),       // __savevmx_127 @ 0x82E57FEC
+        ] {
+            assert_eq!(
+                sled_expected_words(SledEncoding::Vector, &first, k),
+                expected,
+                "VMX upper entry {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_writes_labels_for_entries_and_a_function_only_where_pdata_says_so() {
+        let mut obj = make_code_obj(0x82e541f0, &HCEX_SAVEGPRLR);
+        obj.known_functions.insert(SectionAddress::new(0, 0x82e541f0), Some(0x50));
+
+        let added = apply_save_rest_sleds_xbox(&mut obj).expect("apply");
+        assert_eq!(added, 19, "18 entries + the family function symbol");
+
+        // The family symbol is the function; the per-register entries are
+        // labels. Typing an entry as a function would end the thunk's extent
+        // 4 bytes into its own body.
+        let at_start = |name: &str| {
+            obj.symbols
+                .at_section_address(0, 0x82e541f0)
+                .find(|(_, s)| s.name == name)
+                .map(|(_, s)| s.kind)
+        };
+        assert_eq!(at_start("__savegprlr"), Some(ObjSymbolKind::Function));
+        assert_eq!(at_start("__savegprlr_14"), Some(ObjSymbolKind::Unknown));
+        assert_eq!(
+            obj.symbols
+                .at_section_address(0, 0x82e5421c)
+                .map(|(_, s)| (s.name.clone(), s.kind))
+                .collect::<Vec<_>>(),
+            vec![("__savegprlr_25".to_string(), ObjSymbolKind::Unknown)]
+        );
+
+        // No .pdata entry: the entries are still named, the family symbol is
+        // simply absent rather than invented at a guessed size.
+        let mut obj = make_code_obj(0x82e541f0, &HCEX_SAVEGPRLR);
+        let added = apply_save_rest_sleds_xbox(&mut obj).expect("apply");
+        assert_eq!(added, 18);
+        assert!(obj.symbols.by_name("__savegprlr").expect("lookup").is_none());
+        assert!(obj.symbols.by_name("__savegprlr_25").expect("lookup").is_some());
+    }
 }
