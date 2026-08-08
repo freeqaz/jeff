@@ -2445,6 +2445,121 @@ fn overlapping_function_intervals(funcs: &[(SymbolIndex, u64, u64)]) -> Vec<(usi
     out
 }
 
+/// Re-run relocation analysis over every function body that the first tracker
+/// pass never walked, and commit only the relocations that are genuinely new.
+///
+/// ## The bug this fixes
+///
+/// `Tracker::process_code` analyses the function symbols that exist *when it
+/// runs*. In `split_write_obj_exe` that is before the whole symbol-repair
+/// pipeline — `grow_undersized_function_symbols`, `clamp_oversized_function_symbols`,
+/// [`synthesize_reloc_targeted_leaf_functions`], [`merge_fallthrough_leaf_fragments`],
+/// [`merge_branch_reached_overcarve_tails`] — which is where a large number of
+/// function symbols are created (synthesized/promoted PDATA-less leaves) or
+/// resized. On Halo CEA that is 1,770 functions, and measured over the emitted
+/// COFFs **every single one of them split with zero relocations**, against
+/// 59,636 real functions that had them: 1,414 unrelocated `bl` across 858
+/// functions (1,375 landing exactly on a known function start) plus most of the
+/// residual unrelocated `lis`/`addi` hi-lo pairs.
+///
+/// The ordering can't simply be inverted: leaf synthesis is *reloc-targeted*,
+/// i.e. it consumes the post-`tracker.apply` relocation set to decide what is a
+/// leaf, so it cannot run before the tracker. Hence a second, incremental pass.
+///
+/// ## Why this shape
+///
+/// * **It runs last** — after every repair pass, so those passes still see
+///   exactly the relocation set they saw before, and this change can only ever
+///   *add* relocations. That keeps an A/B of the split output interpretable.
+/// * **It re-analyses only bodies nobody walked at their current bounds.** The
+///   first tracker records `start -> size` for each body it walked; a symbol
+///   that is new, grown, merged or clamped fails that comparison and is
+///   re-analysed. The ~60k untouched functions are skipped, so the pass costs a
+///   few percent of a split rather than doubling the tracker.
+/// * **It never overwrites an existing relocation.** Any tracked relocation
+///   whose source address already carries one is dropped before `apply`. A
+///   synthesized leaf carved out of an absorbing parent shares addresses with
+///   that parent's (already committed) analysis, and the parent was walked with
+///   full entry-register context while the leaf is walked from its own start
+///   with none — so where the two disagree the first pass is the better
+///   informed one. Dropping instead of replacing also means `apply` can never
+///   hit its "Conflicting relocations" bail.
+/// * **Stripped symbols are excluded.** `prune_overlapping_phantom_functions`
+///   and CFA both retire symbols by renaming to `__DELETED_*` with
+///   `ObjSymbolFlags::Stripped` and `kind: Unknown`; walking a phantom's bogus
+///   range from a bogus entry state is exactly how a wrong relocation would get
+///   invented.
+///
+/// Returns the number of relocations added.
+fn retrack_unanalyzed_functions(obj: &mut ObjInfo, first: &Tracker) -> Result<usize> {
+    let mut pending: Vec<ObjSymbol> = Vec::new();
+    for (section_index, _) in obj.sections.by_kind(ObjSectionKind::Code) {
+        for (_, symbol) in obj.symbols.for_section(section_index) {
+            if symbol.kind != ObjSymbolKind::Function
+                || !symbol.size_known
+                || symbol.size == 0
+                || symbol.flags.is_stripped()
+                || symbol.name.contains("__imp")
+            {
+                continue;
+            }
+            let addr = SectionAddress::new(section_index, symbol.address as u32);
+            if first.analyzed_function_size(addr) == Some(symbol.size as u32) {
+                // Already walked at exactly these bounds by the first pass.
+                continue;
+            }
+            pending.push(symbol.clone());
+        }
+    }
+    if pending.is_empty() {
+        log::info!("Post-repair relocation pass: no unanalyzed function bodies");
+        return Result::Ok(0);
+    }
+
+    let mut tracker = Tracker::new(obj);
+    let mut failed = 0usize;
+    for symbol in &pending {
+        if let Err(e) = tracker.process_function(obj, symbol) {
+            log::warn!(
+                "Post-repair relocation analysis failed for {} @ {:#010x}: {e:#}",
+                symbol.name,
+                symbol.address
+            );
+            failed += 1;
+        }
+    }
+
+    // Keep only relocations at source addresses that don't already have one.
+    let mut existing = 0usize;
+    let candidates = std::mem::take(&mut tracker.relocations);
+    let total = candidates.len();
+    tracker.relocations = candidates
+        .into_iter()
+        .filter(|(addr, _)| {
+            if obj.sections[addr.section].relocations.at(addr.address).is_some() {
+                existing += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let added = tracker.relocations.len();
+
+    tracker.apply_relocations(obj, false)?;
+
+    log::info!(
+        "Post-repair relocation pass: re-analyzed {} function body(ies) never walked by the \
+         initial tracker, adding {} relocation(s) ({} already present, {} failed)",
+        pending.len(),
+        added,
+        existing,
+        failed
+    );
+    debug_assert_eq!(total, added + existing);
+    Result::Ok(added)
+}
+
 fn split_write_obj_exe(
     module: &mut ExeModuleInfo,
     config: &ProjectConfig,
@@ -2564,6 +2679,12 @@ fn split_write_obj_exe(
     // CLASS 4 CENSUS (env-gated, read-only): named-head post-blr/branch over-carve
     // groups. No-op unless JEFF_CLASS4_CENSUS is set.
     census_class4_overcarve(&module.obj);
+    // Every pass above can create or resize function symbols, and the tracker
+    // only ever analysed the bodies that existed when IT ran. Walk the bodies
+    // nobody has walked yet and add the relocations they need. Runs LAST of the
+    // repair passes so none of them sees a changed relocation set, and before
+    // write_symbols_file / split_obj so the new relocations reach the objects.
+    retrack_unanalyzed_functions(&mut module.obj, &tracker)?;
 
     if !config.symbols_known && config.detect_objects {
         debug!("Detecting object boundaries");
