@@ -2457,6 +2457,55 @@ fn split_write_obj_exe(
     debug!("Applying relocations");
     tracker.apply(&mut module.obj, false)?;
 
+    // Debug aid (env-gated, read-only): JEFF_DUMP_RELOCS="0x822F97C0-0x822F9890"
+    // dumps every relocation whose source VA falls in the range as seen right
+    // after tracker.apply, the symbols in the range with their size_known state,
+    // and the module-wide function-size census. This is the instrumentation that
+    // located the sizeless-function bug (functions with size_known=false are
+    // invisible to the tracker, so their units split with zero .text relocs).
+    if let Some(range) = std::env::var("JEFF_DUMP_RELOCS").ok() {
+        if let Some((lo, hi)) = range.split_once('-') {
+            let lo = u32::from_str_radix(lo.trim_start_matches("0x"), 16).unwrap_or(0);
+            let hi = u32::from_str_radix(hi.trim_start_matches("0x"), 16).unwrap_or(0);
+            let mut n = 0usize;
+            for (_idx, sect) in module.obj.sections.iter() {
+                for (addr, reloc) in sect.relocations.iter() {
+                    if addr >= lo && addr < hi {
+                        let tsym = &module.obj.symbols[reloc.target_symbol];
+                        eprintln!(
+                            "RELOC {:#010X} {:?} -> {} (+{:#x}) [sect {}]",
+                            addr, reloc.kind, tsym.name, reloc.addend, sect.name
+                        );
+                        n += 1;
+                    }
+                }
+            }
+            eprintln!("RELOC DUMP: {} relocation(s) in {:#010X}..{:#010X}", n, lo, hi);
+            for (_i, sym) in module.obj.symbols.iter() {
+                let a = sym.address as u32;
+                if a >= lo && a < hi {
+                    eprintln!(
+                        "SYM {:#010X} kind={:?} size={:#x} size_known={} sect={:?} name={}",
+                        a, sym.kind, sym.size, sym.size_known, sym.section, sym.name
+                    );
+                }
+            }
+            if let Some((si, sect)) = module.obj.sections.at_address(lo).ok() {
+                eprintln!(
+                    "SECT idx={} name={} kind={:?} known={} addr={:#010X} size={:#x}",
+                    si, sect.name, sect.kind, sect.section_known, sect.address, sect.size
+                );
+            }
+            let (mut known, mut unknown) = (0usize, 0usize);
+            for (_i, sym) in module.obj.symbols.iter() {
+                if sym.kind == crate::obj::ObjSymbolKind::Function {
+                    if sym.size_known { known += 1 } else { unknown += 1 }
+                }
+            }
+            eprintln!("FUNC SIZE STATS: size_known={} size_unknown={}", known, unknown);
+        }
+    }
+
     // Prune spurious overlapping function symbols (CFA / stale-symbols.txt
     // phantoms). Must run AFTER tracker.apply (so every real reference has been
     // resolved to a target symbol) and BEFORE write_symbols_file / split_obj /
