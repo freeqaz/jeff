@@ -1,4 +1,4 @@
-use std::{fs::File, vec::Vec};
+use std::{collections::HashMap, fs::File, vec::Vec};
 
 use anyhow::{ensure, Result};
 use itertools::Itertools;
@@ -46,6 +46,16 @@ pub fn try_parse_pdb(
         }
     }
 
+    // Resolve a PDB internal offset to a module VA, or None if the offset does
+    // not map (e.g. a COMDAT the linker discarded, offset 0xFFFFFFFF).
+    let resolve_va = |symoffset: &SectionOffset| -> Option<u64> {
+        if symoffset.section == 0 || symoffset.section as usize >= pdb2dtk_section_table.len() {
+            return None;
+        }
+        let section = section_addrs.get(pdb2dtk_section_table[symoffset.section as usize] as u32)?;
+        Some(symoffset.offset as u64 + section.address)
+    };
+
     // churn through actual symbols
     while let Some(symbol) = iter.next()? {
         match symbol.parse() {
@@ -80,37 +90,106 @@ pub fn try_parse_pdb(
         }
     }
 
-    // churn through procedures and mark symbols as funcs
-    iter = symtable.iter();
-    while let Some(symbol) = iter.next()? {
-        match symbol.parse() {
-            Ok(pdb::SymbolData::Procedure(data)) => {
-                let symoffset: SectionOffset = data.offset.to_section_offset(&pdbmap).unwrap();
-                log::debug!("{:#?}", symoffset);
-                match addr_vec.iter_mut().find(|x| {
-                    x.address
-                        == symoffset.offset as u64
-                            + section_addrs
-                                .get(pdb2dtk_section_table[symoffset.section as usize] as u32)
-                                .unwrap_or(&ObjSection::default())
-                                .address
-                }) {
-                    Some(func) => {
-                        func.kind = ObjSymbolKind::Function;
-                        func.flags.set_scope(if data.global {
-                            ObjSymbolScope::Global
-                        } else {
-                            ObjSymbolScope::Local
-                        });
-                        func.size = data.len as u64;
-                        func.size_known = true;
-                    }
-                    _ => {}
+    // VA -> indices of every symbol loaded so far at that address. Publics can
+    // legitimately share a VA (identical COMDAT folding), so this maps to a list
+    // and a procedure record sizes ALL of them.
+    let mut by_addr: HashMap<u64, Vec<usize>> = HashMap::with_capacity(addr_vec.len());
+    for (i, sym) in addr_vec.iter().enumerate() {
+        by_addr.entry(sym.address).or_default().push(i);
+    }
+
+    // Apply one S_GPROC32/S_LPROC32 record: size every existing symbol at its VA,
+    // or create a fresh Function symbol when nothing else names that address
+    // (static functions have no public at all).
+    let mut n_procs = 0usize;
+    let mut n_sized = 0usize;
+    let mut n_created = 0usize;
+    let mut apply_procedure = |data: &pdb::ProcedureSymbol,
+                               addr_vec: &mut Vec<ObjSymbol>,
+                               by_addr: &mut HashMap<u64, Vec<usize>>| {
+        n_procs += 1;
+        let Some(symoffset) = data.offset.to_section_offset(&pdbmap) else {
+            return;
+        };
+        let Some(va) = resolve_va(&symoffset) else {
+            return;
+        };
+        if data.len == 0 {
+            return;
+        }
+        let scope = if data.global { ObjSymbolScope::Global } else { ObjSymbolScope::Local };
+        if let Some(indices) = by_addr.get(&va) {
+            for &i in indices {
+                let func = &mut addr_vec[i];
+                func.kind = ObjSymbolKind::Function;
+                func.flags.set_scope(scope.clone());
+                // First procedure record wins; folded duplicates carry the same len.
+                if !func.size_known {
+                    func.size = data.len as u64;
+                    func.size_known = true;
+                    n_sized += 1;
                 }
             }
-            _ => {}
+        } else {
+            let mut flags = ObjSymbolFlagSet::default();
+            flags.set_scope(scope.clone());
+            addr_vec.push(ObjSymbol {
+                name: data.name.to_string().into(),
+                demangled_name: None,
+                address: va,
+                section: Some(symoffset.section as u32),
+                size: data.len as u64,
+                size_known: true,
+                flags,
+                kind: ObjSymbolKind::Function,
+                align: None,
+                data_kind: ObjDataKind::Unknown,
+                name_hash: None,
+                demangled_name_hash: None,
+            });
+            by_addr.entry(va).or_default().push(addr_vec.len() - 1);
+            n_created += 1;
+        }
+    };
+
+    // Procedure records are where function LENGTHS live, and they are almost
+    // always in the per-module (DBI) streams, not the globals stream — MSVC's
+    // globals stream carries S_PROCREF references, which the pdb crate does not
+    // surface as Procedure. On HCEX.pdb the globals stream contains ZERO
+    // Procedure records while the module streams contain 90,172; skipping the
+    // module streams left every pdata-less leaf function sizeless, the tracker
+    // skipped it (`size_known` filter), and its unit split with no .text
+    // relocations at all.
+    {
+        let di = dbfile.debug_information()?;
+        let mut modules = di.modules()?;
+        while let Some(module) = modules.next()? {
+            let Some(mi) = dbfile.module_info(&module)? else {
+                continue;
+            };
+            let mut msyms = mi.symbols()?;
+            while let Some(sym) = msyms.next()? {
+                if let Ok(pdb::SymbolData::Procedure(data)) = sym.parse() {
+                    apply_procedure(&data, &mut addr_vec, &mut by_addr);
+                }
+            }
         }
     }
+
+    // Some PDBs (none seen yet, but upstream dtk assumed it) put Procedure
+    // records straight in the globals stream; harvest those too.
+    iter = symtable.iter();
+    while let Some(symbol) = iter.next()? {
+        if let Ok(pdb::SymbolData::Procedure(data)) = symbol.parse() {
+            apply_procedure(&data, &mut addr_vec, &mut by_addr);
+        }
+    }
+    log::info!(
+        "PDB procedures: {} records, sized {} public symbol(s), created {} static function(s)",
+        n_procs,
+        n_sized,
+        n_created
+    );
 
     // sort vec
     addr_vec.sort_by(|l, r| {
