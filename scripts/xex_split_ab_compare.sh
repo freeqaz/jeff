@@ -8,7 +8,7 @@
 # reasoning about. This runs `xex split` with two dtk binaries and reports the
 # per-object delta.
 #
-# Two hazards it exists to avoid:
+# Three hazards it exists to avoid:
 #
 #   1. Never overwrite a shared dtk binary that other work is using. Build the
 #      candidate elsewhere (`cargo build --release --target-dir /tmp/jeff-fix`)
@@ -18,17 +18,60 @@
 #      tree. This copies the config (and its symbols/splits files) into a temp
 #      directory and rewrites the relative paths to absolute, so the project is
 #      only ever read.
+#   3. Never assume the raw `xex split` output is what the project actually
+#      scores. `rule split` in a project's build.ninja may set environment
+#      variables and may be followed by steps that REWRITE the split objects,
+#      and if you skip them your staged objects are not the objects objdiff
+#      compares. rb3-xenon does both:
+#
+#        JEFF_MERGE_PROTECT=scripts/target_symbol_map.json dtk xex split ...
+#        python3 scripts/obj_target_symbol_renamer.py --batch --apply
+#
+#      That renamer rewrites 85,015 fn_<addr> symbols across 1,822 of 3,085
+#      objects. Measured 2026-08-10 without it, an A/B of the 1.11.0 sled
+#      naming reported "0 of 9,266 functions changed" for rb3 -- every target
+#      function was still fn_<addr>, so objdiff never compared the relocation
+#      names the change was about. With it, the same A/B reports 61 functions
+#      improved and 3 reaching 100%. A silent false NEGATIVE, which is the
+#      expensive direction: it reads as "this change is a no-op, ship it".
+#
+#      So: read the project's `rule split` before trusting a result, pass its
+#      env with --env, replay its post-split steps with --post-split, and prove
+#      the staging is faithful with --verify-against. --verify-against is the
+#      backstop for all of this -- it is how the omission above was caught.
 #
 # Usage:
 #   scripts/xex_split_ab_compare.sh --old <dtk> --new <dtk> \
-#       --project <repo_root> --config <config_rel_path> [--keep]
+#       --project <repo_root> --config <config_rel_path> [--keep] \
+#       [--env KEY=VALUE]... [--post-split <cmd>] [--verify-against <obj_dir>]
 #
-# Example (Halo CEA):
+# --env             Repeatable. Set for both splits. Relative paths work: the
+#                   split runs with cwd = --project, as the real build does.
+# --post-split      Shell command run after each split, cwd = --project, with
+#                   $SPLIT_OUT set to that side's output directory. Replays the
+#                   project's own post-split object rewriting.
+# --verify-against  Directory of the project's live target objects (e.g.
+#                   build/<version>/obj). Every file there is compared against
+#                   the NEW side. A mismatch means the staging does not
+#                   reproduce the project, so any delta below is measured
+#                   against something the project does not use.
+#
+# Example (Halo CEA -- no split env, no post-split steps):
 #   scripts/xex_split_ab_compare.sh \
 #       --old /home/free/code/milohax/jeff/target/release/dtk \
 #       --new /tmp/jeff-fix/release/dtk \
 #       --project /home/free/code/milohax/cea-decomp \
 #       --config config/2011-07-28/config.yml
+#
+# Example (rb3-xenon -- both, and verified):
+#   scripts/xex_split_ab_compare.sh \
+#       --old /tmp/jeff-presled/release/dtk \
+#       --new /home/free/code/milohax/jeff/target/release/dtk \
+#       --project /home/free/code/milohax/rb3-xenon \
+#       --config config/45410914/config.yml \
+#       --env JEFF_MERGE_PROTECT=scripts/target_symbol_map.json \
+#       --post-split 'python3 scripts/obj_target_symbol_renamer.py --batch --apply --obj-dir "$SPLIT_OUT/obj"' \
+#       --verify-against build/45410914/obj
 #
 set -euo pipefail
 
@@ -37,10 +80,13 @@ NEW_DTK=""
 PROJECT=""
 CONFIG_REL=""
 KEEP=0
+POST_SPLIT=""
+VERIFY_AGAINST=""
+declare -a SPLIT_ENV=()
 WORK_ROOT="${TMPDIR:-/tmp}/jeff-split-ab-$$"
 
 usage() {
-    sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,74p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +96,9 @@ while [[ $# -gt 0 ]]; do
         --project) PROJECT="$2"; shift 2 ;;
         --config) CONFIG_REL="$2"; shift 2 ;;
         --work-dir) WORK_ROOT="$2"; shift 2 ;;
+        --env) SPLIT_ENV+=("$2"); shift 2 ;;
+        --post-split) POST_SPLIT="$2"; shift 2 ;;
+        --verify-against) VERIFY_AGAINST="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -75,6 +124,11 @@ echo "[split-ab] old: $OLD_DTK ($("$OLD_DTK" --version 2>/dev/null | head -1))"
 echo "[split-ab] new: $NEW_DTK ($("$NEW_DTK" --version 2>/dev/null | head -1))"
 echo "[split-ab] project: $PROJECT ($CONFIG_REL)"
 echo "[split-ab] work dir: $WORK_ROOT"
+if [[ ${#SPLIT_ENV[@]} -gt 0 ]]; then
+    echo "[split-ab] split env: ${SPLIT_ENV[*]}"
+fi
+[[ -n "$POST_SPLIT" ]] && echo "[split-ab] post-split: $POST_SPLIT"
+[[ -n "$VERIFY_AGAINST" ]] && echo "[split-ab] verify against: $VERIFY_AGAINST"
 
 CONFIG_DIR_REL="$(dirname "$CONFIG_REL")"
 
@@ -113,17 +167,82 @@ run() {
     local out="$WORK_ROOT/$side/out"
     mkdir -p "$out"
     echo "[split-ab] splitting ($side)..." >&2
-    if ! "$dtk" xex split "$cfg" "$out" >"$WORK_ROOT/$side/split.log" 2>&1; then
+    # cwd = the project, so a relative path in --env resolves the way it does in
+    # the project's own `rule split`. Nothing relative is written: the staged
+    # config and the output directory are both absolute.
+    if ! (cd "$PROJECT" && env ${SPLIT_ENV[@]+"${SPLIT_ENV[@]}"} \
+            "$dtk" xex split "$cfg" "$out") >"$WORK_ROOT/$side/split.log" 2>&1; then
         echo "[split-ab] FAIL: $side split failed, see $WORK_ROOT/$side/split.log" >&2
         exit 1
     fi
+    if [[ -n "$POST_SPLIT" ]]; then
+        echo "[split-ab] post-split ($side)..." >&2
+        if ! (cd "$PROJECT" && SPLIT_OUT="$out" eval "$POST_SPLIT") \
+                >>"$WORK_ROOT/$side/split.log" 2>&1; then
+            echo "[split-ab] FAIL: $side --post-split failed, see $WORK_ROOT/$side/split.log" >&2
+            exit 1
+        fi
+    fi
     echo "$out"
+}
+
+# Prove the staged NEW side reproduces the objects the project actually scores.
+# Without this the whole comparison can be measured against objects no build
+# ever produces, and the failure is silent -- see hazard 3 in the header.
+verify_against() {
+    local new_out="$1" ref="$2"
+    [[ "$ref" = /* ]] || ref="$PROJECT/$ref"
+    if [[ ! -d "$ref" ]]; then
+        echo "[split-ab] FAIL: --verify-against is not a directory: $ref" >&2
+        exit 2
+    fi
+    python3 - "$new_out" "$ref" <<'PY'
+import hashlib, os, sys
+new_out, ref = sys.argv[1], sys.argv[2]
+def h(p):
+    with open(p, 'rb') as f: return hashlib.sha256(f.read()).hexdigest()
+same = diff = missing = 0
+examples = []
+for dirpath, _, files in os.walk(ref):
+    for f in files:
+        rp = os.path.join(dirpath, f)
+        rel = os.path.relpath(rp, ref)
+        # the reference is the project's object directory; the split writes it
+        # under obj/, so try both shapes rather than guessing.
+        for cand in (os.path.join(new_out, rel), os.path.join(new_out, 'obj', rel)):
+            if os.path.exists(cand): break
+        else:
+            missing += 1
+            if len(examples) < 5: examples.append(('missing', rel))
+            continue
+        if h(rp) == h(cand): same += 1
+        else:
+            diff += 1
+            if len(examples) < 5: examples.append(('differs', rel))
+print('[split-ab] verify vs %s: identical %d, different %d, missing %d' % (ref, same, diff, missing))
+for kind, rel in examples:
+    print('[split-ab]     %s: %s' % (kind, rel))
+if diff or missing:
+    print('[split-ab] STAGING IS NOT FAITHFUL. The delta below is measured against objects')
+    print('[split-ab] the project does not use. Check `rule split` in build.ninja for env')
+    print('[split-ab] vars (--env) and for post-split object rewriting (--post-split).')
+    raise SystemExit(1)
+print('[split-ab] staging is faithful: the new side reproduces the project byte-for-byte.')
+PY
 }
 
 OLD_CFG="$(stage old)"
 NEW_CFG="$(stage new)"
 OLD_OUT="$(run old "$OLD_DTK" "$OLD_CFG")"
 NEW_OUT="$(run new "$NEW_DTK" "$NEW_CFG")"
+
+if [[ -n "$VERIFY_AGAINST" ]]; then
+    verify_against "$NEW_OUT" "$VERIFY_AGAINST"
+else
+    echo "[split-ab] NOTE: no --verify-against, so nothing proves this staging matches the"
+    echo "[split-ab] project's real objects. If its \`rule split\` sets env vars or rewrites"
+    echo "[split-ab] objects afterwards, a no-op result here may be a false negative."
+fi
 
 python3 - "$OLD_OUT" "$NEW_OUT" <<'PY'
 import hashlib, os, sys
