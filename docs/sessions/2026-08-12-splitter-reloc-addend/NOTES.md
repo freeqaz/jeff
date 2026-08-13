@@ -1000,3 +1000,53 @@ shipped pipeline breaks either way.)
    parity account, or neither account is readable.
 5. **cea-decomp is in the blast radius and was not measured** (also X360,
    dtk-split). Measure it or accept it explicitly before the deploy.
+
+---
+
+## Integrator — 2026-08-13 — merged, re-verified, T5 held, not deployed
+
+Branch `jeff-integration` off `main` = `8a42efb`, worktree
+`.worktrees/integration`. Full readout: [`INTEGRATION.md`](INTEGRATION.md).
+
+**Merged, `--no-ff`, no cherry-pick and no squash, zero conflicts:** t3, t4, t5,
+t7 (linear stack), then t1, t2, t6 (documents and tools only). Plus three
+integrator commits: the session record itself is now in git (`503afb5` — it was
+untracked for the entire campaign), the T5 revert (`dbc887a`), and the version
+bump 1.11.0 → 1.12.0 (`8b1b75a`).
+
+**T5 is REVERTED, and T7's recommendation is upheld on re-verification.** I
+diffed T7's two linked images myself rather than accepting the readout: 28 bytes
+differ, and at file offset `0x0106f4b8` the word is `e96b5566` → `e96b5568`, i.e.
+the linked low half moves by exactly the in-place `0x0002`. REFLO is additive,
+so with the 2-byte-off `lbl_82F446EE` anchor the mask converts a right-linking
+wrong object into a wrong-linking right object. T3's DS-form test is
+`#[ignore]`d with the whole argument on it, not deleted and not weakened; its red
+still reproduces under `cargo test --bin dtk -- --ignored ds_form`.
+
+**Everything re-run on the integrated tree, not inherited.** 163 passed / 0
+failed / 1 ignored. Staging self-check FIRED on three projects — dc3 2223/2223,
+rb3-xenon 3085/3085, cea-decomp 3675/3675, so 8,983 objects reproduce the live
+target trees byte-for-byte. 5 / 188 / 2 objects change, and every changed object's
+ONLY difference is removed REL14 records (−8 / −633 / −3, 0 added, 0
+layout/data/symbol changes). REFHI/REFLO+PAIR shape identical between arms.
+Intra-function REL14 → 0 on both games under the naming-independent witness; the
+16 cross-section survivors preserved as a set. objdiff with one ruler: dc3 1
+symbol up (`Curl_resolv_unlock` 99.87 → 100, the whole 156 bytes), rb3-xenon 21
+up / 0 fuzzy down / 2 normalized-only down on symbols matching 0 bytes in both
+arms, cea 0 moved. Zero skew, zero unexplained. The `normalized == 100`
+population — the gap-bug-hunt sampling predicate — moves by **+0** on both games.
+
+**Three corrections to the readouts.** (1) T7's `?GetNextLine` row is now
+measured to the ROW, not explained by class: 5 `equal` + 3 `diff_arg` becomes 8
+`equal`, i.e. three branch operands stop rendering as an invented relocation
+symbol name. (2) NOTES item 5 above is closed — cea-decomp IS in the blast radius
+at the object level (2 objects, −3 REL14, the same two XDK units as dc3) and is
+NOT at the score level (0 of 73,828 symbols). (3) T7's dc3 "6 changed objects" is
+5 for what lands, the sixth being T5's ArcDetector.
+
+**NOT DEPLOYED.** `target/release/dtk` is still `2026-08-08 22:32:10`,
+8,371,016 bytes; `objdiff-cli` still `2026-08-12 05:56`. The evidence licenses
+the swap — see INTEGRATION.md §7 — but the ruler must not be built from a branch
+that is not on `main`: nobody could reproduce it, and the next bare `cargo build
+--release` in the main checkout would silently revert it and move every score
+back. Merge first, then deploy; the four commands are INTEGRATION.md §8.
