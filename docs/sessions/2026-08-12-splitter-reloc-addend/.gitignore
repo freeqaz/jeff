@@ -1,0 +1,5 @@
+# Session scratch: derived split output, private cargo target dirs, reports.
+# Never commit -- these run to hundreds of MB and are re-derivable.
+scratch/
+scratch-t6/
+**/__pycache__/
