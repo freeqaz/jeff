@@ -14,10 +14,18 @@ on `main` and deploying a ruler whose source is not on `main` is silently
 reversible by the next `cargo build` in the main checkout. Deploy after the merge;
 the exact steps are in §8.
 
-Nothing was pushed. `main` was not committed to in any repo. Deploy paths at the
-end of this session: `jeff/target/release/dtk` still `2026-08-08 22:32:10`,
-8,371,016 bytes; `objdiff/target/release/objdiff-cli` still `2026-08-12 05:56`.
-Every build used `CARGO_TARGET_DIR=<this worktree>/target-scratch`.
+Nothing was pushed. `main` was not committed to in any repo. Every build used
+`CARGO_TARGET_DIR=<this worktree>/target-scratch`, and the splitter deploy path
+`jeff/target/release/dtk` is untouched at the end of this session —
+`2026-08-08 22:32:10`, 8,371,016 bytes.
+
+The *ruler* deploy path is a different story, and not mine: a peer session
+rebuilt `objdiff/target/release/objdiff-cli` at **01:38 today**, mid-session,
+while a report of mine was generating. I did not build objdiff and caught it on
+the end-of-session hazard check. Everything was re-measured under both binaries
+and the splitter delta is identical under each. Full account in **§4.7** — it is
+worth reading even if you only care about the ruler, because nobody has
+regenerated a `report.json` since.
 
 ---
 
@@ -273,13 +281,27 @@ displacement is a pre-split value the linker overwrites. The MSVC compiler emits
 **zero** REL14 in 2,193 objects across both games, so the candidate matches
 compiler convention and the deployed binary does not.
 
-### 4.4 objdiff report A/B — one ruler, per symbol
+### 4.4 objdiff report A/B — per symbol, and now under TWO rulers
 
-**Ruler: the deployed `objdiff-cli` (2026-08-12 05:56) for every arm.** T1 landed
-nothing, so this is the ruler the projects use today. Four shadow projects of
-symlinks: real `objdiff.json`, real `build/<id>/src`, real `icf_aliases.map`, only
-`build/<id>/obj` varies. One `-o` path per arm — the report `.cache` sidecar does
-not key on its inputs — and all six runs logged `Report cache: 0 hits`.
+Six shadow projects of symlinks: real `objdiff.json`, real `build/<id>/src`, real
+`icf_aliases.map`, only `build/<id>/obj` varies. One `-o` path per arm — the
+report `.cache` sidecar does not key on its inputs — and every run logged
+`Report cache: 0 hits`.
+
+**Ruler R1: `objdiff-cli` as deployed at 2026-08-12 05:56**, the binary the
+projects were using when this session started. Both arms of every project.
+
+**Ruler R2: `objdiff-cli` at objdiff `0688f1d`** — because a peer session
+rebuilt the shared deploy path at 01:38, mid-session. See §4.7. Both arms of
+every project were re-run under it.
+
+The tables below are R1. **R2 gives byte-for-byte the same deltas** — dc3 1
+symbol moved up (+156 `matched_code`), rb3-xenon 23 moved / 21 fuzzy up / 0 fuzzy
+down (+1,840), cea 0 moved, `normalized == 100` +0 on both games, `fuzzy == 100`
++1 and +15, the same two normalized-only downward rows — on top of different
+absolute baselines (dc3 `matched_code` 4,856,756 under R1 vs 4,911,176 under R2).
+So the splitter delta is **ruler-robust**, which is a stronger result than the
+single-ruler account this section was originally scoped for.
 
 | project | units | symbols | unit skew | symbol skew | moved | fuzzy up | fuzzy down |
 |---|---|---|---|---|---|---|---|
@@ -372,6 +394,54 @@ Splitting dc3 with the 1.11.0 and 1.12.0 builds of *this same tree*:
 **2223/2223 byte-identical, 0 changed.** The bump does rewrite
 `build/<id>/config.json`, which records the dtk version.
 
+### 4.7 INCIDENT: a peer session replaced the shared ruler mid-run
+
+At **2026-08-13 01:38**, while this session's cea-decomp report was generating,
+`objdiff/target/release/objdiff-cli` — the single global binary that
+`~/.local/bin/objdiff-cli` symlinks to, and the ruler for every project on this
+box — was rebuilt by another session. I did not build it; I caught it on the
+end-of-session hazard check.
+
+```
+session start:  -rwxr-xr-x  11727000  Aug 12 05:56   objdiff-cli 4.2.3
+session end:    -rwxr-xr-x  11774944  Aug 13 01:38   objdiff-cli 4.2.3 (0688f1dd4f06, xxh3 b14e53944d0c53c0)
+```
+
+`0688f1d` is objdiff `main`, tip of a `laneQ-report-provenance` merge about
+report cache keys and `--version` provenance — **not** T1's lane. But it is
+downstream of `4c38c31`/`f2424d6`, so it carries T1's ruler change as a side
+effect, and then some: T1 measured objdiff HEAD `9138611` at dc3
+`matched_code_percent` 43.098682, and this binary reports **43.181156**. There
+are further commits beyond what T1 measured.
+
+**Three consequences, none of which invalidate the account above.**
+
+1. **The dc3 and rb3-xenon A/Bs were never mixed.** Both arms of both games were
+   generated at 01:08:33–01:08:42, thirty minutes before the swap, from the same
+   binary. Attribution is intact.
+2. **The cea A/B could have straddled it** — before arm written 01:31:22, after
+   arm 01:42:07, swap at 01:38. A running process holds its own inode, so the
+   after arm almost certainly executed the old binary, but "almost certainly" is
+   not a measurement. So **all six reports were regenerated under the new
+   binary** and the A/B redone; the result is identical (§4.4). The straddling
+   pair is not relied on for anything.
+3. **T1's advice to deploy the splitter and the ruler in separate steps has been
+   partly overtaken by events.** The ruler moved, without a parity account for
+   the commits beyond T1's measured HEAD, and without anyone regenerating
+   consumers' `report.json`. That is a live inconsistency in the projects right
+   now, independent of anything this campaign lands. Whoever picks up T1's deploy
+   should start by re-measuring what is actually deployed rather than what T1
+   measured.
+
+The silver lining is a stronger result than was asked for: the splitter delta is
+**ruler-robust**, identical under both binaries, so no part of §7's license
+depends on which objdiff is installed.
+
+This is hazard 1's shape — a shared, unversioned deploy path written by a bare
+build — playing out live on the ruler while the campaign was arguing about it on
+the splitter. It is the reason §7 declines to deploy a dtk built from an unmerged
+branch.
+
 ---
 
 ## 5. Hazard ledger
@@ -384,7 +454,7 @@ Splitting dc3 with the 1.11.0 and 1.12.0 builds of *this same tree*:
 | 4. do not rebuild or re-split dc3 | Both projects split into scratch dirs under this worktree, against private config copies. `build/373307D9` and `build/45410914` were only ever READ; both projects' `symbols.txt` mtimes unchanged. |
 | 5. `report.json` is not a baseline | No project `report.json` was read or written. Both arms of every comparison were generated in-session. |
 | 6. the A/B harness once reported a false no-op | `--verify-against` used on all three projects and **fired**, 8,983 objects. |
-| — objdiff-cli untouched | still `2026-08-12 05:56`, T1 deployed nothing. |
+| — objdiff-cli untouched **by me** | I never built objdiff. It was nevertheless replaced at 01:38 by a peer session — see §4.7. |
 
 ---
 
@@ -412,6 +482,8 @@ Splitting dc3 with the 1.11.0 and 1.12.0 builds of *this same tree*:
 6. **`objdiff-cli diff --format proto` ignores the project-level
    functionRelocDiffs** (T1's side finding, pre-existing, not caused here). Any
    consumer scoring through proto is on a different ruler than `report.json`.
+   Nor is the row-level classification behind §3.1 available at the report's
+   `name_check` ruler — only through the oneshot path's configuration.
 7. **Four sibling worktree consumers** (`dc3-addrid-e0`, `dc3-bankv10-wt`,
    `dc3-vein1-wt`, `rb3-xenon-s5flat-wt`) point at the same dtk. They are the same
    two games, so they are covered by class, but each has its own build tree that
@@ -452,10 +524,17 @@ it.
 Deploying **now** would also be defensible if the merge follows within the hour;
 what is not defensible is deploying and leaving the branch unmerged.
 
-**Do NOT land this and T1's objdiff-cli rebuild in one step.** T1's is a separate
-deploy with a separate parity account, it moves rb3 (Wii) which this one cannot
-touch, and it moves 16 functions across `normalized == 100` where this one moves
-none. Landed together, neither account is readable afterwards.
+**Do NOT land this and an objdiff-cli rebuild in one step.** The ruler deploy is
+a separate change with a separate parity account: it moves rb3 (Wii), which this
+one cannot touch, and it moves 16 functions across `normalized == 100`, where
+this one moves none. Landed together, neither account is readable afterwards.
+
+**And note the ruler has already moved without one.** §4.7: a peer session
+rebuilt `objdiff-cli` at 01:38 today, to a commit beyond the one T1 measured, and
+no consumer's `report.json` was regenerated. That is a pre-existing inconsistency
+this campaign did not create and does not fix. It does not block the splitter
+deploy — the splitter delta is identical under both rulers — but anyone reading a
+project `report.json` today is reading a number from neither.
 
 ---
 
@@ -493,7 +572,8 @@ Under `<this worktree>/scratch/` (gitignored, ~5 GB, delete after review):
 
 - `dc3-ab/`, `rb3x-ab/`, `cea-ab/` — both arms' object trees per project;
   `new/out/obj` is the **deployed** arm, `old/out/obj` the **candidate**
-- `report-{dc3,rb3x,cea}-{before,after}.json` — six full objdiff reports
+- `report-{dc3,rb3x,cea}-{before,after}.json` — six full objdiff reports, ruler R1
+- `r2-{dc3,rb3x,cea}-{before,after}.json` — the same six under ruler R2 (§4.7)
 - `{dc3,rb3x,cea}-symbol-delta.json` — machine-readable per-symbol deltas
 - `getnextline-{before,after}.json` — the row-level diff behind §3.1
 - `dtk-t4only`, `dtk-1.12.0` — the two candidate binaries
