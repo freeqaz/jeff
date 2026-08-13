@@ -275,11 +275,25 @@ inside the enclosing function, which does not depend on symbol naming.
 **Intra-function REL14 is 0 in both candidate trees under W1**, and the 16
 load-bearing cross-section records survive as a set (16 → 16, 0 added). The 17th
 survivor is T4's COMDAT-boundary case, kept deliberately and pinned by its own
-negative control. W2's residual 10 is T7's documented classifier artifact — all 17
-survivors target a symbol not defined in the emitting object, so their encoded
-displacement is a pre-split value the linker overwrites. The MSVC compiler emits
+negative control. W2's residual 10 is T7's documented classifier artifact — **16
+of the 17** survivors target a symbol not defined in the emitting object, so their
+encoded displacement is a pre-split value the linker overwrites. The MSVC compiler emits
 **zero** REL14 in 2,193 objects across both games, so the candidate matches
 compiler convention and the deployed binary does not.
+
+> **Correction, 2026-08-13 (task 161).** This paragraph originally read "all 17
+> survivors target a symbol not defined in the emitting object". It is 16 of 17,
+> which is what T4-shape2-fix.md §3 says ("All 16 target a symbol not defined in
+> the emitting object" + "The 17th survivor is the COMDAT-boundary case"); the
+> sentence merged the two. Re-verified against the artifact — the deployed
+> splitter's own output at `rb3-xenon/build/45410914/obj`, which carries 17 REL14
+> records: 16 with `SectionNumber = 0` (undefined) and one **defined in its own
+> object**, `xdk/d3dx9/d3dxmath.obj .text+0xa4 -> lbl_82858E94`, the
+> COMDAT-boundary record named two sentences earlier. Task 161 retires that
+> record — its destination's COMDAT region is now held in the parent `.text`, so
+> both ends share an emitted section and the relocation is unnecessary — leaving
+> **16 REL14 on rb3-xenon, all 16 undefined**, and the sentence true as written
+> for the first time. See `../2026-08-13-tracker-runaway-walk/README.md`.
 
 ### 4.4 objdiff report A/B — per symbol, and now under TWO rulers
 

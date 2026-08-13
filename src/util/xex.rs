@@ -1778,6 +1778,65 @@ pub fn clamp_functions_over_except_data(obj: &mut ObjInfo) -> usize {
     plan.len()
 }
 
+/// Destination of the relative `bc` at `offset`, as a section offset.
+///
+/// `None` when the word there is not a `bc` (primary opcode 16) or is absolute
+/// (`AA = 1`, whose destination does not depend on where the linker puts the
+/// site) or when the destination would be before the start of the section.
+fn encoded_bc_dest_offset(data: &[u8], offset: u64) -> Option<u64> {
+    let start = offset as usize;
+    let word = data.get(start..start + 4)?;
+    let ins = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    if ins >> 26 != 16 || ins & 0b10 != 0 {
+        return None;
+    }
+    // BD is bits 16..29; the low two bits of the halfword are AA/LK.
+    let disp = ((ins & 0xFFFC) as u16 as i16) as i64;
+    u64::try_from(offset as i64 + disp).ok()
+}
+
+/// Per-section list of COMDAT regions as `(start, size)`, ascending by start.
+///
+/// `comdat_regions` is keyed on `(section, start)` and a `BTreeMap` range query
+/// only ever reveals the region with the greatest start ≤ the offset. That is
+/// wrong here because **COMDAT regions nest**: dc3 `entropydec.obj` extracts
+/// `?prvDecodeFrameHeader` at `[0x0, 0x600)` *and* `jumptable_82EA5A0C` at
+/// `[0xac, 0xd8)` inside it. Asking the range query about offset `0x200` finds
+/// the jump table, sees `0x200` past its end, and answers "not in any region" —
+/// so an ordinary intra-function branch reads as crossing a section boundary.
+/// Measured cost of that mistake: 19 spurious COMDAT keep-backs across 9 dc3
+/// objects. A containment test therefore has to consider EVERY region, not the
+/// nearest one.
+fn build_comdat_region_index(
+    comdat_regions: &BTreeMap<(ObjSectionIndex, u64), (ObjSymbolIndex, u64)>,
+) -> BTreeMap<ObjSectionIndex, Vec<(u64, u64)>> {
+    let mut index: BTreeMap<ObjSectionIndex, Vec<(u64, u64)>> = BTreeMap::new();
+    // BTreeMap iteration is already ordered by (section, start).
+    for (&(sect_idx, start), &(_, size)) in comdat_regions {
+        index.entry(sect_idx).or_default().push((start, size));
+    }
+    index
+}
+
+/// Which emitted COMDAT region `offset` ends up in, identified by its start
+/// offset; `None` means it stays in the parent section.
+///
+/// The extraction loop walks regions in ascending start order and zeroes each
+/// one in the parent after copying it, so where regions overlap it is the
+/// LOWEST-start region that carries the real bytes. `find` on an ascending list
+/// returns exactly that.
+fn comdat_region_containing(
+    index: &BTreeMap<ObjSectionIndex, Vec<(u64, u64)>>,
+    sect_idx: ObjSectionIndex,
+    offset: u64,
+) -> Option<u64> {
+    index
+        .get(&sect_idx)?
+        .iter()
+        .find(|&&(start, size)| offset >= start && offset < start + size)
+        .map(|&(start, _)| start)
+}
+
 pub fn write_coff(
     obj: &ObjInfo,
     genuine_except_data: &std::collections::BTreeSet<String>,
@@ -2009,38 +2068,93 @@ pub fn write_coff(
         comdat_regions.insert((section_idx, offset), (idx, effective_size));
     }
 
-    // Remove COMDAT entries involved in REL14 relocations.
-    // REL14 (conditional branch) has only ±32KB range. If either the source or
-    // target of a REL14 is in a separate .text$dup COMDAT section, the linker may
-    // interleave other sections between them, causing REL14 fixup overflow (LNK2013).
-    // Keeping both source and target in the contiguous main .text prevents overflow.
+    // Remove COMDAT entries whose extraction could break a conditional branch.
+    //
+    // A `bc` encodes a 14-bit PC-relative displacement, i.e. ±32 KB of range. If
+    // the branch site and its destination are emitted into DIFFERENT COFF
+    // sections, the linker may lay them out arbitrarily far apart and interleave
+    // other sections between them — the encoded displacement is then wrong, and
+    // the fixup (if there is one) can overflow (LNK2013, which has bitten this
+    // writer before). Keeping both ends in the contiguous parent `.text`
+    // prevents both failures.
+    //
+    // DERIVED FROM THE INSTRUCTION STREAM, NOT FROM RELOCATION RECORDS.
+    // Until 2026-08-13 this pass scanned `sect.relocations` for
+    // `ObjRelocKind::PpcRel14`. That coupled COMDAT layout to the analyser's
+    // opinion about relocations, and the analyser was wrong: the tracker's
+    // executor walked past `function_end` and stamped intra-function conditional
+    // branches with a REL14 they should never have had (T2 root cause). Those
+    // bogus records were load-bearing HERE — they are what kept, e.g., dc3
+    // `Curl_resolv_unlock` out of a COMDAT — so fixing the tracker with this
+    // pass unchanged silently re-enabled COMDAT extraction on 2 dc3 objects.
+    //
+    // The instruction stream cannot go stale that way. Every `bc` in a code
+    // section is decoded directly out of the section bytes (primary opcode 16,
+    // AA = 0 ⇒ destination = site + sign_extend(BD‖0b00)), and the region on each
+    // end is looked up by containment. This subsumes what the record-derived rule
+    // was providing — a genuine cross-region `bc` still has a REL14 record and is
+    // still caught — while dropping its dependence on a walk that could be wrong.
+    // See docs/sessions/2026-08-13-tracker-runaway-walk/README.md.
     {
-        let mut rel14_keep: Vec<(ObjSectionIndex, u64)> = Vec::new();
+        let region_index = build_comdat_region_index(&comdat_regions);
+        let region_of = |sect_idx: ObjSectionIndex, offset: u64| -> Option<u64> {
+            comdat_region_containing(&region_index, sect_idx, offset)
+        };
+
+        let mut keep: Vec<(ObjSectionIndex, u64)> = Vec::new();
         for (sect_idx, sect) in obj.sections.iter() {
-            for (addr, reloc) in sect.relocations.iter() {
-                if matches!(reloc.kind, ObjRelocKind::PpcRel14) {
-                    // Keep the TARGET in main .text
-                    let target_sym = &obj.symbols[reloc.target_symbol];
-                    if let Some(target_section) = target_sym.section {
-                        let target_sect = &obj.sections[target_section];
-                        let offset = target_sym.address - target_sect.address;
-                        rel14_keep.push((target_section, offset));
-                    }
-                    // Keep the SOURCE (containing function) in main .text
-                    // Find which COMDAT region contains this relocation address
-                    let reloc_offset = addr as u64;
-                    for (&(si, start), &(_sym_idx, sz)) in &comdat_regions {
-                        if si == sect_idx && reloc_offset >= start && reloc_offset < start + sz {
-                            rel14_keep.push((si, start));
-                            break;
-                        }
-                    }
+            if sect.kind != ObjSectionKind::Code {
+                continue;
+            }
+            for (i, word) in sect.data.chunks_exact(4).enumerate() {
+                let ins = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+                // bc / bca / bcl / bcla — primary opcode 16.
+                if ins >> 26 != 16 {
+                    continue;
+                }
+                // AA = 1 is an absolute branch: its destination does not depend
+                // on where the linker puts the site, so extraction cannot break
+                // the encoding. (None are emitted by either target, but the
+                // arithmetic below would be wrong for them.)
+                if ins & 0b10 != 0 {
+                    continue;
+                }
+                let site_offset = (i * 4) as u64;
+                // BD is bits 16..29; the low two bits of the halfword are AA/LK.
+                let disp = ((ins & 0xFFFC) as u16 as i16) as i64;
+                let dest_offset = site_offset as i64 + disp;
+
+                let site_region = region_of(sect_idx, site_offset);
+                let (dest_in_section, dest_region) =
+                    if dest_offset >= 0 && (dest_offset as u64) < sect.size {
+                        (true, region_of(sect_idx, dest_offset as u64))
+                    } else {
+                        // Destination is outside this section entirely. The
+                        // encoded displacement is meaningless after the split, so
+                        // the site must stay where the linker's own fixup has the
+                        // shortest reach: the contiguous parent .text.
+                        (false, None)
+                    };
+
+                if dest_in_section && site_region == dest_region {
+                    // Same emitted section on both ends: the linker preserves the
+                    // relative distance and the encoding stays correct.
+                    continue;
+                }
+                if let Some(start) = site_region {
+                    keep.push((sect_idx, start));
+                }
+                if let Some(start) = dest_region {
+                    keep.push((sect_idx, start));
                 }
             }
         }
-        for key in &rel14_keep {
+        for key in &keep {
             if comdat_regions.remove(key).is_some() {
-                log::debug!("Keeping REL14-involved function in main .text (not COMDAT): {:?}", key);
+                log::debug!(
+                    "Keeping conditional-branch-involved function in main .text (not COMDAT): {:?}",
+                    key
+                );
             }
         }
     }
@@ -2397,14 +2511,9 @@ pub fn write_coff(
     // `None` means "stays in the parent section". Two offsets with the same
     // answer are emitted into the SAME COFF section and therefore keep their
     // relative distance; different answers mean the linker may move them apart.
+    let emitted_region_index = build_comdat_region_index(&comdat_regions);
     let emitted_region = |sect_idx: ObjSectionIndex, offset: u64| -> Option<u64> {
-        comdat_regions
-            .range(..=(sect_idx, offset))
-            .next_back()
-            .filter(|(&(si, start), &(_, sz))| {
-                si == sect_idx && offset >= start && offset < start + sz
-            })
-            .map(|(&(_, start), _)| start)
+        comdat_region_containing(&emitted_region_index, sect_idx, offset)
     };
 
     // insert the relocs
@@ -2451,24 +2560,44 @@ pub fn write_coff(
             // split a branch from its target with no relocation left to fix it.
             if matches!(reloc.kind, ObjRelocKind::PpcRel14) {
                 let target_sym = &obj.symbols[reloc.target_symbol];
-                if target_sym.section == Some(sect_idx) {
-                    let site_offset = addr as u64;
-                    let dest_offset = (target_sym.address as i64 + reloc.addend
-                        - sect.address as i64)
-                        as u64;
-                    if emitted_region(sect_idx, site_offset)
-                        == emitted_region(sect_idx, dest_offset)
-                    {
-                        log::debug!(
-                            "Dropping intra-section PpcRel14 @ {}+{:#x} -> {}+{:#x} \
-                             (encoded displacement is already correct)",
-                            sect.name,
-                            addr,
-                            target_sym.name,
-                            reloc.addend
-                        );
-                        continue;
-                    }
+                let site_offset = addr as u64;
+                // Where the relocation SAYS the branch goes, and where the
+                // instruction itself says it goes. They are allowed to disagree
+                // and routinely do: T2 measured 182 of rb3-xenon's 634 REL14
+                // records anchored on an address the `bc` does not branch to.
+                // Within one emitted section the instruction is authoritative —
+                // `write_coff` copies the section bytes verbatim and has no
+                // PpcRel14 arm in the data fixup — so the containment question
+                // ("would the linker be free to move these two ends apart?") is
+                // asked of the ENCODED destination.
+                let anchor_offset =
+                    (target_sym.address as i64 + reloc.addend - sect.address as i64) as u64;
+                let encoded_offset = encoded_bc_dest_offset(&sect.data, site_offset);
+                // Both must really land in this section. An addend can carry the
+                // anchor outside it — a negative result wraps to a huge u64 here,
+                // an overlarge one is simply past the end — and `emitted_region`
+                // answers `None` for both, which is indistinguishable from "in the
+                // parent section". Without this guard an out-of-section
+                // destination compares EQUAL to a site in the parent `.text` and
+                // the record is silently dropped, deleting the one relocation that
+                // could still fix the branch.
+                let in_section = target_sym.section == Some(sect_idx)
+                    && anchor_offset < sect.size
+                    && matches!(encoded_offset, Some(off) if off < sect.size);
+                if in_section
+                    && emitted_region(sect_idx, site_offset)
+                        == emitted_region(sect_idx, encoded_offset.unwrap())
+                {
+                    log::debug!(
+                        "Dropping intra-section PpcRel14 @ {}+{:#x} -> {}+{:#x} \
+                         (encoded destination {:#x} is in the same emitted section)",
+                        sect.name,
+                        addr,
+                        target_sym.name,
+                        reloc.addend,
+                        encoded_offset.unwrap(),
+                    );
+                    continue;
                 }
             }
             let sym_id = match sym_map.get(&reloc.target_symbol) {
@@ -3012,6 +3141,23 @@ mod tests {
 
     const IMAGE_REL_PPC_REL14: u16 = 0x0007;
 
+    /// Raw sizes of every emitted COMDAT section, in section order.
+    fn comdat_section_sizes(coff_data: &[u8]) -> Vec<u32> {
+        const IMAGE_SCN_LNK_COMDAT: u32 = 0x0000_1000;
+        let nsec = u16::from_le_bytes(coff_data[2..4].try_into().unwrap()) as usize;
+        let opt_hdr = u16::from_le_bytes(coff_data[16..18].try_into().unwrap()) as usize;
+        let mut out = Vec::new();
+        for i in 0..nsec {
+            let sh = 20 + opt_hdr + i * 40;
+            let raw_size = u32::from_le_bytes(coff_data[sh + 16..sh + 20].try_into().unwrap());
+            let flags = u32::from_le_bytes(coff_data[sh + 36..sh + 40].try_into().unwrap());
+            if flags & IMAGE_SCN_LNK_COMDAT != 0 {
+                out.push(raw_size);
+            }
+        }
+        out
+    }
+
     /// NEGATIVE CONTROL for the R1 emission rule (session
     /// `2026-08-12-splitter-reloc-addend`). The rule drops a REL14 only when the
     /// destination stays inside the emitted section; a `bc` whose target is not
@@ -3094,28 +3240,40 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL, second shape: the target IS in this section, but it is
-    /// inside a COMDAT region the writer is about to extract into its own COFF
-    /// section while the branch site stays in the parent `.text`. The two ends
-    /// end up in different emitted sections, the linker may interleave anything
-    /// between them, and the encoded displacement stops being correct — so the
-    /// relocation must be kept.
+    /// Second shape: a conditional branch whose destination is inside a COMDAT
+    /// region the writer would otherwise extract, while the branch site stays in
+    /// the parent `.text`.
     ///
-    /// The keep-back pass above (`Remove COMDAT entries involved in REL14
-    /// relocations`) does not save this case: it only un-COMDATs the region whose
-    /// START offset equals the target symbol's address, and here the anchor is an
-    /// interior label, so the region survives extraction.
+    /// **This test changed contract on 2026-08-13 (task 161) and the old
+    /// expectation is recorded here on purpose.** It used to assert that the
+    /// REL14 record SURVIVES, because the record-derived keep-back could not see
+    /// this case: it only un-COMDATed the region whose START offset equalled the
+    /// target symbol's address, and here the anchor is an interior label. The
+    /// branch therefore ended up split across two emitted sections with a
+    /// relocation that `write_coff` has no fixup arm for — its in-place
+    /// displacement stays a stale pre-split value (INTEGRATION.md §6 gap 4).
+    ///
+    /// The keep-back is now derived from the instruction stream, so it sees the
+    /// `bc` directly and refuses to extract the region the branch reaches into.
+    /// Both ends stay in the contiguous parent `.text`, the encoded displacement
+    /// remains correct, and no relocation is needed — which is strictly better
+    /// than emitting a malformed one.
+    ///
+    /// Discriminating in both directions: `func_c` is an equally eligible COMDAT
+    /// that nothing branches into, and it must STILL be extracted, so a rule that
+    /// simply stopped extracting COMDATs fails here.
     #[test]
-    fn test_rel14_across_a_comdat_boundary_is_kept() {
-        // .text: func_a [0x00,0x10)  func_b [0x10,0x20) (COMDAT)
-        let mut data = vec![0u8; 0x20];
-        for i in (0..0x20).step_by(4) {
+    fn test_comdat_region_reached_by_a_conditional_branch_is_kept_in_parent_text() {
+        // .text: func_a [0x00,0x10)  func_b [0x10,0x20) (COMDAT)  func_c [0x20,0x30) (COMDAT)
+        let mut data = vec![0u8; 0x30];
+        for i in (0..0x30).step_by(4) {
             data[i..i + 4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); // nop
         }
         // func_a+0x00: beq cr6, +0x18 -> 0x18, inside func_b
         data[0x00..0x04].copy_from_slice(&0x419A_0018u32.to_be_bytes());
         data[0x0C..0x10].copy_from_slice(&0x4E80_0020u32.to_be_bytes()); // blr
         data[0x1C..0x20].copy_from_slice(&0x4E80_0020u32.to_be_bytes()); // blr
+        data[0x2C..0x30].copy_from_slice(&0x4E80_0020u32.to_be_bytes()); // blr
 
         let mut relocations = ObjRelocations::default();
         relocations
@@ -3183,14 +3341,35 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "func_c".into(),
+                address: 0x20,
+                section: Some(0),
+                size: 0x10,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
         obj.comdat_symbols.insert("func_b".into());
+        obj.comdat_symbols.insert("func_c".into());
 
         let coff_data = write_coff(&obj, &Default::default()).unwrap();
         assert_eq!(
+            comdat_section_sizes(&coff_data),
+            vec![0x10],
+            "func_b is reached by a conditional branch from the parent .text and must \
+             stay there; func_c is reached by nothing and must still be extracted, so \
+             exactly one 0x10-byte COMDAT section is expected"
+        );
+        assert_eq!(
             count_coff_relocs(&coff_data, IMAGE_REL_PPC_REL14),
-            1,
-            "a REL14 whose target is extracted into a COMDAT section while the site \
-             stays in the parent .text must still be emitted"
+            0,
+            "with func_b held in the parent .text both ends of the branch are in one \
+             emitted section, so the encoded displacement is correct and no REL14 \
+             record is needed"
         );
     }
 
