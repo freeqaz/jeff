@@ -280,8 +280,48 @@ impl Tracker {
         possible_missed_branches: &mut BTreeMap<SectionAddress, Box<VM>>,
     ) -> Result<ExecCbResult<()>> {
         let ExecCbData { executor, vm, result, ins_addr, section: _, ins, block_start: _ } = data;
+
+        // Judge containment against the function that actually CONTAINS this
+        // instruction, not against the function the walk started from.
+        //
+        // `Executor::run` walks a basic block linearly — `ExecCbResult::Continue`
+        // advances `state.address += 4` — and it bounds that walk at the end of
+        // the SECTION, not at the end of a function; it has no notion of a
+        // function at all. So a block that does not end in a terminator runs off
+        // the end of its function and into the next one. That happens routinely:
+        // `StepResult::Illegal` returns `Continue`, so the inter-function padding
+        // word does not end a block, and `StepResult::Jump` seeds
+        // `possible_missed_branches` with `ins_addr + 4`, which after a tail `b`
+        // IS that padding word (dc3 `Curl_resolv_timeout` @ 0x8256AAD4).
+        //
+        // The defect is not that the walk strays — it is that `function_start` /
+        // `function_end` are captured once per `process_function` and do not
+        // follow it, so `is_function_addr` answers for the WRONG function. At dc3
+        // `hostip.obj` `.text+0x53c` the captured bounds are
+        // `[0x8256AAB8, 0x8256AAD8)` (`Curl_resolv_timeout`) while `ins_addr` is
+        // 0x8256AAFC and the branch target 0x8256AB0C — both inside
+        // `Curl_resolv_unlock` `[0x8256AAD8, 0x8256AB74)`. The intra-function `bc`
+        // reads as leaving its function and gets a `Rel14` it must never have.
+        // (T2-rel14-rootcause.md §1.)
+        //
+        // WHY NOT JUST STOP THE WALK. Measured, and rejected on the measurement:
+        // ending the block at `function_end` costs 94 relocation records across
+        // 17 rb3-xenon objects (26 REFLO, 47 PAIR, 21 REFHI, 3 ADDR24) and their
+        // in-place immediates stop being zeroed. Those records are CORRECT — they
+        // are `lis`/`lfs` hi-lo pairs whose two halves straddle a function
+        // boundary that dtk carved in the wrong place (`fn_8249B200` is declared
+        // `size:0x4`; `Color.obj`'s `lis` sits in the previous function and its
+        // `lfs` in `fn_824F5730`). Hi-lo pairing is a dataflow fact and does not
+        // depend on function bounds; only the branch-containment question does.
+        // A bounds check on the whole callback throws the first away to fix the
+        // second. See docs/sessions/2026-08-13-tracker-runaway-walk/README.md.
+        let (fn_start, fn_end) = if ins_addr >= function_start && ins_addr < function_end {
+            (function_start, function_end)
+        } else {
+            enclosing_function_bounds(obj, ins_addr).unwrap_or((function_start, function_end))
+        };
         // Using > instead of >= to treat a branch to the beginning of the function as a tail call
-        let is_function_addr = |addr: SectionAddress| addr > function_start && addr < function_end;
+        let is_function_addr = |addr: SectionAddress| addr > fn_start && addr < fn_end;
         let _span = debug_span!("ins", addr = %ins_addr, op = ?ins.op).entered();
 
         match result {
@@ -492,6 +532,24 @@ impl Tracker {
                             } else {
                                 (SectionAddress::new(SectionIndex::MAX, 0), false)
                             };
+                            // NOTE, task 161: the not-taken entry here is a
+                            // SYNTHESIZED fall-through — `VM::step` builds it as
+                            // `BranchTarget::Address(ins_addr + 4)` with
+                            // `link: false` — and when a `bc` is the last
+                            // instruction of its declared function that address
+                            // equals `function_end`, fails the exclusive test in
+                            // `is_function_addr`, and is stamped with a Rel14
+                            // naming the instruction AFTER the branch. T2's
+                            // second trigger. Suppressing it here was implemented
+                            // and MEASURED, and is deliberately not landed: it
+                            // perturbs `merge_fallthrough_leaf_fragments`, whose
+                            // absorb decisions read the tracker's reloc-target
+                            // xref counts, and cost 5 mangled rb3-xenon symbol
+                            // names across 15 objects. The records themselves are
+                            // stopped at the writer instead, by comparing the
+                            // relocation against the instruction's own encoded
+                            // displacement (util/xex.rs, R1). See
+                            // docs/sessions/2026-08-13-tracker-runaway-walk/README.md §6.
                             if branch.link || !is_fn_addr {
                                 self.relocations.insert(ins_addr, match ins.op {
                                     Opcode::B => Relocation::Rel24(target),
@@ -909,6 +967,48 @@ impl Tracker {
     }
 }
 
+/// Bounds `(start, end)` of the function that actually contains `addr`.
+///
+/// `Tracker::instruction_callback` uses this only when the executor's block walk
+/// has run past the end of the function it was started on: the containment
+/// question ("does this branch leave its function, and therefore need a
+/// relocation?") has to be answered by the function the branch is IN, and the
+/// walk's own `function_start`/`function_end` no longer describe it.
+///
+/// `end` is the declared end when `addr` falls inside the declared body. When it
+/// does not — an instruction in the gap after an under-sized or size-less symbol
+/// — it is the start of the next function symbol, so that the gap is attributed
+/// to the symbol that precedes it rather than to no function at all. dtk carves
+/// plenty of those: dc3's `??$FindSetBitInArray@I@D3DXShader@@YAIPAIIK@Z` is
+/// declared `size:0x40` while its loop-exit `bc` sits one instruction past the
+/// declared end and branches back INTO the body.
+///
+/// Returns `None` when no function symbol precedes `addr` in its section, in
+/// which case the caller keeps the walk's own bounds.
+fn enclosing_function_bounds(
+    obj: &ObjInfo,
+    addr: SectionAddress,
+) -> Option<(SectionAddress, SectionAddress)> {
+    let section = obj.sections.get(addr.section)?;
+    let (_, start_sym) = obj
+        .symbols
+        .for_section_range(addr.section, ..=addr.address)
+        .rev()
+        .find(|(_, s)| s.kind == ObjSymbolKind::Function)?;
+    let start = SectionAddress::new(addr.section, start_sym.address as u32);
+    let declared_end = start + start_sym.size as u32;
+    if start_sym.size_known && start_sym.size > 0 && addr < declared_end {
+        return Some((start, declared_end));
+    }
+    let next = obj
+        .symbols
+        .for_section_range(addr.section, start.address.saturating_add(1)..)
+        .find(|(_, s)| s.kind == ObjSymbolKind::Function)
+        .map(|(_, s)| s.address as u32)
+        .unwrap_or_else(|| (section.address + section.size) as u32);
+    Some((start, SectionAddress::new(addr.section, next.max(declared_end.address))))
+}
+
 fn data_kind_from_op(op: Opcode) -> DataKind {
     match op {
         Opcode::Lbz => DataKind::Byte,
@@ -1143,5 +1243,130 @@ mod tests {
             }
             _ => panic!("expected absolute relocation to .text target"),
         }
+    }
+
+    /// REGRESSION, task 161: the executor must not walk out of the function it
+    /// was given and evaluate the next function's instructions against the
+    /// previous function's bounds.
+    ///
+    /// This reproduces the dc3 `hostip.obj` shape measured in
+    /// `docs/sessions/2026-08-12-splitter-reloc-addend/findings/T2-rel14-rootcause.md`
+    /// exactly, at toy addresses:
+    ///
+    /// ```text
+    ///   fn_a  [0x1000, 0x1010)      declared size 0x10
+    ///     0x1000  b   +0x40         -> fn_c; StepResult::Jump seeds
+    ///                                  possible_missed_branches with 0x1004
+    ///     0x1004  nop
+    ///     0x1008  nop
+    ///     0x100C  0x00000000        inter-function padding; StepResult::Illegal
+    ///                                  returns Continue, so the block does NOT end
+    ///   fn_b  [0x1010, 0x1040)      a DIFFERENT function, never passed to the tracker
+    ///     0x1018  beq +0x10         -> 0x1028, entirely inside fn_b
+    /// ```
+    ///
+    /// Walking the `possible_missed_branches` entry at 0x1004 runs 0x1004, 0x1008,
+    /// through the pad at 0x100C and into fn_b. `function_start`/`function_end`
+    /// still say `[0x1000, 0x1010)`, so `is_function_addr` answers `false` for
+    /// both of fn_b's in-range branch destinations and the intra-function `beq`
+    /// at 0x1018 is given a `Rel14` — the exact defect that put a bogus
+    /// `PpcRel14 -> Curl_resolv_unlock (+0x34)` in `hostip.obj .text+0x53c`.
+    ///
+    /// Without `enclosing_function_bounds` feeding `is_function_addr` in
+    /// `instruction_callback`, this test fails on the second assertion with
+    /// `0:0x1018 -> Rel14(Address(0:0x1028))`.
+    #[test]
+    fn walk_does_not_escape_function_end_into_the_next_function() {
+        const NOP: u32 = 0x6000_0000;
+        let words: [u32; 20] = [
+            // fn_a [0x1000, 0x1010)
+            0x4800_0040, // 0x1000  b +0x40 -> fn_c at 0x1040 (leaves fn_a: Rel24)
+            NOP,         // 0x1004
+            NOP,         // 0x1008
+            0x0000_0000, // 0x100C  padding word -> StepResult::Illegal
+            // fn_b [0x1010, 0x1040) -- must not be touched by fn_a's walk
+            NOP,         // 0x1010
+            NOP,         // 0x1014
+            0x4182_0010, // 0x1018  beq +0x10 -> 0x1028, INSIDE fn_b
+            NOP,         // 0x101C
+            NOP,         // 0x1020
+            NOP,         // 0x1024
+            NOP,         // 0x1028
+            NOP,         // 0x102C
+            NOP,         // 0x1030
+            NOP,         // 0x1034
+            NOP,         // 0x1038
+            0x4E80_0020, // 0x103C  blr
+            // fn_c [0x1040, 0x1050)
+            NOP,         // 0x1040
+            NOP,         // 0x1044
+            NOP,         // 0x1048
+            0x4E80_0020, // 0x104C  blr
+        ];
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let text_sec = ObjSection {
+            name: ".text".to_string(),
+            kind: ObjSectionKind::Code,
+            address: 0x1000,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            elf_index: 0,
+            relocations: Default::default(),
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+
+        let mk = |name: &str, address: u64, size: u64| ObjSymbol {
+            name: name.to_string(),
+            address,
+            section: Some(0),
+            size,
+            size_known: true,
+            kind: ObjSymbolKind::Function,
+            ..Default::default()
+        };
+        let fn_a = mk("fn_a", 0x1000, 0x10);
+        let obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "runaway".to_string(),
+            vec![fn_a.clone(), mk("fn_b", 0x1010, 0x30), mk("fn_c", 0x1040, 0x10)],
+            vec![text_sec],
+        );
+
+        let mut tracker = Tracker::new(&obj);
+        // ONLY fn_a is analysed. Anything the tracker records at an address >=
+        // 0x1010 was produced by a walk that left fn_a.
+        tracker.process_function(&obj, &fn_a).expect("process_function should succeed");
+
+        // Positive control: the in-bounds analysis still happens. The `b` at
+        // 0x1000 genuinely leaves fn_a and must still be relocated, otherwise a
+        // test that simply analysed nothing would pass.
+        let branch_out = SectionAddress::new(0, 0x1000);
+        assert!(
+            matches!(
+                tracker.relocations.get(&branch_out),
+                Some(Relocation::Rel24(RelocationTarget::Address(t)))
+                    if *t == SectionAddress::new(0, 0x1040)
+            ),
+            "the tail branch out of fn_a must still be recorded as Rel24 -> 0x1040, got {:?}",
+            tracker.relocations.get(&branch_out)
+        );
+
+        let escaped: Vec<_> = tracker
+            .relocations
+            .range(SectionAddress::new(0, 0x1010)..)
+            .map(|(addr, reloc)| format!("{addr} -> {reloc:?}"))
+            .collect();
+        assert!(
+            escaped.is_empty(),
+            "the walk of fn_a [0x1000,0x1010) escaped into fn_b and recorded {} \
+             relocation(s) against fn_a's bounds: {:?}",
+            escaped.len(),
+            escaped
+        );
     }
 }
