@@ -2367,6 +2367,20 @@ pub fn write_coff(
         None
     };
 
+    // Which COMDAT region (if any) an offset in `sect_idx` will be emitted into.
+    // `None` means "stays in the parent section". Two offsets with the same
+    // answer are emitted into the SAME COFF section and therefore keep their
+    // relative distance; different answers mean the linker may move them apart.
+    let emitted_region = |sect_idx: ObjSectionIndex, offset: u64| -> Option<u64> {
+        comdat_regions
+            .range(..=(sect_idx, offset))
+            .next_back()
+            .filter(|(&(si, start), &(_, sz))| {
+                si == sect_idx && offset >= start && offset < start + sz
+            })
+            .map(|(&(_, start), _)| start)
+    };
+
     // insert the relocs
     for (sect_idx, sect) in obj.sections.iter() {
         // Skip original .pdata relocations — we've reconstructed the section
@@ -2374,6 +2388,63 @@ pub fn write_coff(
             continue;
         }
         for (addr, reloc) in sect.relocations.iter() {
+            // Emit a REL14 only when the branch destination LEAVES the emitted
+            // section (session 2026-08-12-splitter-reloc-addend, rule R1).
+            //
+            // A conditional branch encodes a 14-bit PC-relative displacement.
+            // Within one emitted section the split copies the XEX bytes verbatim
+            // and the linker preserves relative distances, so that displacement
+            // is already correct and no relocation is needed. MSVC agrees by
+            // construction: measured across 2,193 compiler-produced objects in
+            // dc3 and rb3-xenon, the compiler emits ZERO REL14 (NOTES.md
+            // FINDING 3) — every REL14 in a target object is splitter-originated.
+            //
+            // Emitting one anyway is not merely redundant, it is wrong twice
+            // over. PPC-COFF has no addend field on the record and the in-place
+            // displacement is never rewritten to the MSVC `-offset_in_section`
+            // convention (there is no PpcRel14 arm in the data fixup above), so
+            // (a) objdiff resolves the operand through the relocation to
+            // `symbol+0` and renders a control-flow difference that does not
+            // exist, and (b) the linker would add the stale displacement on top
+            // of its own computation. The tracker's own containment test cannot
+            // be trusted here either: it uses the walk's `function_start`/
+            // `function_end`, which go stale when the executor runs past the end
+            // of a function (T2 root cause, `analysis/tracker.rs:503`).
+            //
+            // Cross-section REL14 is kept: dtk carves functions into separate
+            // COMDAT sections, so a `bc` whose destination lands in another
+            // emitted section has no valid encoded displacement after relayout.
+            //
+            // NOTE ON PLACEMENT: this must stay downstream of the COMDAT
+            // keep-back pass above (`Remove COMDAT entries involved in REL14
+            // relocations`), which reads these same relocation records to force
+            // both ends of a REL14 to stay in the contiguous parent .text. That
+            // pass is what makes "same emitted section" true here — it fires 7
+            // times on a dc3 split — so dropping the record any earlier (e.g. in
+            // the tracker) would silently re-enable COMDAT extraction and could
+            // split a branch from its target with no relocation left to fix it.
+            if matches!(reloc.kind, ObjRelocKind::PpcRel14) {
+                let target_sym = &obj.symbols[reloc.target_symbol];
+                if target_sym.section == Some(sect_idx) {
+                    let site_offset = addr as u64;
+                    let dest_offset = (target_sym.address as i64 + reloc.addend
+                        - sect.address as i64)
+                        as u64;
+                    if emitted_region(sect_idx, site_offset)
+                        == emitted_region(sect_idx, dest_offset)
+                    {
+                        log::debug!(
+                            "Dropping intra-section PpcRel14 @ {}+{:#x} -> {}+{:#x} \
+                             (encoded displacement is already correct)",
+                            sect.name,
+                            addr,
+                            target_sym.name,
+                            reloc.addend
+                        );
+                        continue;
+                    }
+                }
+            }
             let sym_id = match sym_map.get(&reloc.target_symbol) {
                 Some(id) => id,
                 None => {
@@ -2557,8 +2628,8 @@ pub fn coff_path_for_unit(unit: &str) -> Utf8NativePathBuf {
 mod tests {
     use super::*;
     use crate::obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjRelocations, ObjSection, ObjSectionKind, ObjSymbol,
-        ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
+        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjRelocations, ObjSection,
+        ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
     };
 
     /// Build a minimal relocatable ObjInfo with one .text section and one symbol.
@@ -2888,6 +2959,212 @@ mod tests {
         assert_eq!(
             dup_bytes, &func_b_bytes,
             "func_b bytes should be in the COMDAT payload section"
+        );
+    }
+
+    /// Count relocation records of a given COFF type across every section.
+    fn count_coff_relocs(coff_data: &[u8], typ: u16) -> usize {
+        let nsec = u16::from_le_bytes(coff_data[2..4].try_into().unwrap()) as usize;
+        let opt_hdr = u16::from_le_bytes(coff_data[16..18].try_into().unwrap()) as usize;
+        let mut count = 0;
+        for i in 0..nsec {
+            let sh = 20 + opt_hdr + i * 40;
+            let relptr = u32::from_le_bytes(coff_data[sh + 24..sh + 28].try_into().unwrap())
+                as usize;
+            let nrel = u16::from_le_bytes(coff_data[sh + 32..sh + 34].try_into().unwrap())
+                as usize;
+            for r in 0..nrel {
+                let off = relptr + r * 10;
+                let rtyp = u16::from_le_bytes(coff_data[off + 8..off + 10].try_into().unwrap());
+                if rtyp == typ {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    const IMAGE_REL_PPC_REL14: u16 = 0x0007;
+
+    /// NEGATIVE CONTROL for the R1 emission rule (session
+    /// `2026-08-12-splitter-reloc-addend`). The rule drops a REL14 only when the
+    /// destination stays inside the emitted section; a `bc` whose target is not
+    /// defined in this object has no valid encoded displacement after the split,
+    /// so its relocation is load-bearing and must survive.
+    ///
+    /// This is the test that makes "never emit REL14" — which would also pass
+    /// `xex_reloc_tests::shape2_intra_function_conditional_branch_emits_no_relocation`
+    /// — fail. The compiler emitting zero REL14 is a fact about *compiler* input,
+    /// not a licence to drop every branch fixup a split needs.
+    #[test]
+    fn test_rel14_to_external_symbol_is_kept() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&0x419A_0010u32.to_be_bytes()); // beq cr6, +0x10
+        data[4..8].copy_from_slice(&0x4E80_0020u32.to_be_bytes()); // blr
+
+        let mut relocations = ObjRelocations::default();
+        relocations
+            .insert(0, ObjReloc {
+                kind: ObjRelocKind::PpcRel14,
+                target_symbol: 1,
+                addend: 0,
+                module: None,
+            })
+            .unwrap();
+
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            elf_index: 0,
+            relocations,
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+        let mut obj = ObjInfo::new(
+            ObjKind::Relocatable,
+            ObjArchitecture::PowerPc,
+            "extern_rel14.obj".into(),
+            vec![],
+            vec![section],
+        );
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "local_fn".into(),
+                address: 0,
+                section: Some(0),
+                size: 8,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        // Defined in another split unit: no section, so the split cannot know the
+        // distance and the linker must fix the branch up.
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "other_unit_fn".into(),
+                address: 0,
+                section: None,
+                size: 0,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let coff_data = write_coff(&obj, &Default::default()).unwrap();
+        assert_eq!(
+            count_coff_relocs(&coff_data, IMAGE_REL_PPC_REL14),
+            1,
+            "a REL14 whose target is not defined in this object is load-bearing and \
+             must still be emitted"
+        );
+    }
+
+    /// NEGATIVE CONTROL, second shape: the target IS in this section, but it is
+    /// inside a COMDAT region the writer is about to extract into its own COFF
+    /// section while the branch site stays in the parent `.text`. The two ends
+    /// end up in different emitted sections, the linker may interleave anything
+    /// between them, and the encoded displacement stops being correct — so the
+    /// relocation must be kept.
+    ///
+    /// The keep-back pass above (`Remove COMDAT entries involved in REL14
+    /// relocations`) does not save this case: it only un-COMDATs the region whose
+    /// START offset equals the target symbol's address, and here the anchor is an
+    /// interior label, so the region survives extraction.
+    #[test]
+    fn test_rel14_across_a_comdat_boundary_is_kept() {
+        // .text: func_a [0x00,0x10)  func_b [0x10,0x20) (COMDAT)
+        let mut data = vec![0u8; 0x20];
+        for i in (0..0x20).step_by(4) {
+            data[i..i + 4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); // nop
+        }
+        // func_a+0x00: beq cr6, +0x18 -> 0x18, inside func_b
+        data[0x00..0x04].copy_from_slice(&0x419A_0018u32.to_be_bytes());
+        data[0x0C..0x10].copy_from_slice(&0x4E80_0020u32.to_be_bytes()); // blr
+        data[0x1C..0x20].copy_from_slice(&0x4E80_0020u32.to_be_bytes()); // blr
+
+        let mut relocations = ObjRelocations::default();
+        relocations
+            .insert(0x00, ObjReloc {
+                kind: ObjRelocKind::PpcRel14,
+                target_symbol: 2, // lbl_inside, an interior label of func_b
+                addend: 0,
+                module: None,
+            })
+            .unwrap();
+
+        let section = ObjSection {
+            name: ".text".into(),
+            kind: ObjSectionKind::Code,
+            address: 0,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            elf_index: 0,
+            relocations,
+            virtual_address: None,
+            file_offset: 0,
+            section_known: true,
+            splits: Default::default(),
+        };
+        let mut obj = ObjInfo::new(
+            ObjKind::Relocatable,
+            ObjArchitecture::PowerPc,
+            "comdat_rel14.obj".into(),
+            vec![],
+            vec![section],
+        );
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "func_a".into(),
+                address: 0x00,
+                section: Some(0),
+                size: 0x10,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "func_b".into(),
+                address: 0x10,
+                section: Some(0),
+                size: 0x10,
+                size_known: true,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.symbols
+            .add_direct(ObjSymbol {
+                name: "lbl_00000018".into(),
+                address: 0x18,
+                section: Some(0),
+                size: 0,
+                flags: ObjSymbolFlagSet(ObjSymbolFlags::Local.into()),
+                kind: ObjSymbolKind::Unknown,
+                ..Default::default()
+            })
+            .unwrap();
+        obj.comdat_symbols.insert("func_b".into());
+
+        let coff_data = write_coff(&obj, &Default::default()).unwrap();
+        assert_eq!(
+            count_coff_relocs(&coff_data, IMAGE_REL_PPC_REL14),
+            1,
+            "a REL14 whose target is extracted into a COMDAT section while the site \
+             stays in the parent .text must still be emitted"
         );
     }
 

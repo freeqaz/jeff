@@ -35,6 +35,8 @@ pub mod u8_arc;
 pub mod wad;
 pub mod xex;
 pub mod xex_imports;
+#[cfg(test)]
+mod xex_reloc_tests;
 pub mod xpdb;
 
 #[inline]
