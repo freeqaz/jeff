@@ -11,17 +11,18 @@
 //! file reads a dc3/rb3-xenon checkout, an XEX, or any toolchain output — the
 //! tests are portable.
 //!
-//! | test | shape | at `8a42efb` | after integration |
+//! | test | shape | at `8a42efb` | today |
 //! |---|---|---|---|
 //! | `shape2_intra_function_conditional_branch_emits_no_relocation` | Shape 2 | RED | GREEN (T4 landed) |
-//! | `ds_form_immediate_zeroing_must_preserve_xo_bits` | Q8 / FINDING 8 | RED | `#[ignore]` (T5 reverted) |
+//! | `ds_form_immediate_zeroing_must_preserve_xo_bits` | Q8 / FINDING 8 | RED | GREEN (T5 restored) |
 //! | `refhi_reflo_pair_record_shape_is_pinned` | characterization | GREEN | GREEN |
 //!
-//! The ignored one is not a retired test: its writer defect is real and
-//! measured, but fixing the writer without the analysis-side DS-form address
-//! decode makes the LINKED image worse, so the fix was reverted at
-//! integration. The full reasoning is on the test itself; reproduce its red
-//! with `cargo test --bin dtk -- --ignored ds_form`.
+//! The DS-form test was `#[ignore]`d for one commit at integration (`dbc887a`)
+//! and is live again as of the DS-form decode fix
+//! (`docs/sessions/2026-08-13-dsform-decode/`): the writer half alone made the
+//! LINKED image worse, because the analysis side minted the anchor two bytes
+//! past the real datum and the two errors cancelled. Both halves are now
+//! correct, so the test is green for the right reason.
 //!
 //! Run them with — note this crate has **no `[lib]` target**, only `[[bin]] dtk`,
 //! so `cargo test --lib` errors with "no library targets found":
@@ -266,27 +267,17 @@ fn shape2_intra_function_conditional_branch_emits_no_relocation() {
 ///
 /// EXPECTED TO FAIL at `main` = `8a42efb` on the two DS-form sites.
 ///
-/// IGNORED AT INTEGRATION (2026-08-13), and the reason is not "this test is
-/// wrong". T5's fix made it green; the integrator reverted that fix because a
-/// relink of dc3 with the project's own `link.exe` showed MSVC's REFLO is
-/// **additive** — the linked low half moves by exactly the in-place `0x0002` —
-/// and the analysis side mints the DS-form anchor two bytes past the real
-/// datum (`lbl_82F446EE` where the EA is `sDefaultHoverTimer` at
-/// `0x82F446EC`). With that anchor, a zero displacement field and a zeroed XO
-/// *cancel* into the retail `lwa` at link time, while the corrected in-place
-/// word links to `ld` at displacement + 2. So the writer defect this test pins
-/// is real, and fixing the writer alone makes the LINKED image worse.
-///
-/// Re-enable this test together with the analysis-side DS-form address decode
-/// (`hi<<16 | (lo & ~3)`), then relink and check the word at image VA
-/// `0x830746b8` — the harness is in the T7 run dir. Reproduce the red today
-/// with `cargo test --bin dtk -- --ignored ds_form`.
-///
-/// Do NOT weaken the assertion to make it pass: XO must survive, and that
-/// claim is measured against the compiler's own objects.
+/// HISTORY, because this test was red, then green, then ignored, then green:
+/// T5 (`b204ebd`) made it pass; the integrator reverted that fix (`dbc887a`)
+/// and marked this `#[ignore]` after a relink showed MSVC's REFLO is
+/// **additive**, so with the analysis side minting the DS-form anchor two bytes
+/// past the real datum (`lbl_82F446EE` where the EA is `sDefaultHoverTimer` at
+/// `0x82F446EC`) the two defects cancelled at link time and fixing only the
+/// writer made the linked image worse. The analysis-side decode is now fixed
+/// (`analysis::vm::load_store_displacement`), so the writer fix is restored and
+/// this test is live again. Do NOT weaken the assertion: XO must survive, and
+/// that claim is measured against the compiler's own objects.
 #[test]
-#[ignore = "writer fix reverted at integration: correct in the object, wrong at link time \
-            until the DS-form anchor decode is fixed -- see the doc comment"]
 fn ds_form_immediate_zeroing_must_preserve_xo_bits() {
     // offset -> (input word, expected word after the write_coff data fixup)
     let sites: [(u32, u32, u32); 3] = [

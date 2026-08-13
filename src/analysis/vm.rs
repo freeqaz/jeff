@@ -866,7 +866,8 @@ impl VM {
                         source_reg: source as u8,
                     };
                 } else if let Value::Constant(base) = self.gpr[source].value {
-                    let address = base.wrapping_add(ins.field_simm() as u64) as u32;
+                    let address =
+                        base.wrapping_add(load_store_displacement(&ins) as i64 as u64) as u32;
                     if let Some(target) = section_address_for(obj, ins_addr, address) {
                         if is_update_op(op) {
                             self.gpr[source].set_lo(
@@ -1140,6 +1141,42 @@ pub fn is_storef_op(op: Opcode) -> bool {
 #[inline]
 pub fn is_load_store_op(op: Opcode) -> bool {
     is_load_op(op) || is_loadf_op(op) || is_store_op(op) || is_storef_op(op)
+}
+
+/// True for the DS-form load/stores: primary opcode 58 (`ld`/`ldu`/`lwa`) and
+/// primary opcode 62 (`std`/`stdu`).
+///
+/// These do NOT carry a 16-bit displacement. The displacement is the 14-bit
+/// `DS` field, bits [15:2], scaled by 4 — i.e. `EA = (RA|0) + (DS || 0b00)` —
+/// and bits [1:0] are an **opcode extension** (XO), not part of the address.
+/// Reading the whole low halfword as the displacement therefore mis-decodes
+/// the effective address by the XO value: on dc3 `system/gesture/ArcDetector`
+/// VA `0x82E025AC`, `0xE96B46EE` (`lwa`, XO=2) decodes to `0x82F446EE` instead
+/// of `0x82F446EC`, which is how the splitter came to mint `lbl_82F446EE` two
+/// bytes into `sDefaultHoverTimer`.
+///
+/// The other split-field load/store encodings (DQ-form `lq`/`stq`, DS-form
+/// `lfdp`/`stfdp`) are not implemented by the Xenon CPU, so 58/62 is the
+/// complete set here. The mirror of this rule on the writer side is in
+/// `write_coff`'s `PpcAddr16Ha | PpcAddr16Lo` arm (`util/xex.rs`); the two must
+/// agree or the object and the linked image disagree about the opcode.
+#[inline]
+pub fn is_ds_form_load_store_op(op: Opcode) -> bool {
+    matches!(op, Opcode::Ld | Opcode::Ldu | Opcode::Lwa | Opcode::Std | Opcode::Stdu)
+}
+
+/// The byte displacement of a D-form or DS-form load/store, sign-extended.
+///
+/// D-form: the full signed 16-bit immediate. DS-form: `field_ds()`, which is
+/// the same halfword with bits [1:0] (the opcode extension) masked off — see
+/// [`is_ds_form_load_store_op`].
+#[inline]
+pub fn load_store_displacement(ins: &Ins) -> i32 {
+    if is_ds_form_load_store_op(ins.op) {
+        ins.field_ds() as i32
+    } else {
+        ins.field_simm() as i32
+    }
 }
 
 #[inline]
