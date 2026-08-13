@@ -2127,11 +2127,37 @@ pub fn write_coff(
                         // resolved addresses baked in (e.g., lis r11, 0x8200),
                         // which would become spurious addends causing overflow.
                         // Zero the immediate to match compiler output (addend=0).
+                        //
+                        // ...but "the immediate" is not always 16 bits wide. In a
+                        // DS-form instruction — primary opcode 58 (ld/ldu/lwa) or
+                        // 62 (std/stdu) — the displacement is bits [15:2] and the
+                        // low TWO bits are an opcode extension (XO). Masking all 16
+                        // bits there does not clear an addend, it rewrites the
+                        // opcode: lwa (XO=2) becomes ld, ldu (XO=1) becomes ld,
+                        // stdu (XO=1) becomes std. Measured firing on dc3 retail at
+                        // system/gesture/ArcDetector .text+0x824 (VA 0x82E025AC,
+                        // in ?UpdateOverlay@ArcDetector@@QAAMPAVRndOverlay@@M@Z):
+                        // 0xE96B46EE `lwa` was emitted as 0xE96B0000 `ld`, while
+                        // our own compiler object carries `lwa` (0xE96B0002) at the
+                        // corresponding REFLO sites. So: zero the displacement
+                        // field only, and leave XO alone.
+                        //
+                        // D-form (everything else that takes a REFHI/REFLO) keeps
+                        // the full 16-bit clear — the compiler's own objects have a
+                        // zero 16-bit immediate at those sites.
+                        //
+                        // Only DS-form matters on Xenon: the other split-field
+                        // load/store encodings (DQ-form lq/stq, DS-form lfdp/stfdp)
+                        // are not implemented by this CPU.
                         if offset + 4 <= data.len() {
                             let insn = u32::from_be_bytes(
                                 data[offset..offset + 4].try_into().unwrap(),
                             );
-                            let new_insn = insn & 0xFFFF0000;
+                            let keep_mask = match insn >> 26 {
+                                58 | 62 => 0xFFFF0003, // DS-form: preserve XO [1:0]
+                                _ => 0xFFFF0000,       // D-form: whole immediate
+                            };
+                            let new_insn = insn & keep_mask;
                             data[offset..offset + 4]
                                 .copy_from_slice(&new_insn.to_be_bytes());
                         }
