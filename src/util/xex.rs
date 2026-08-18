@@ -2161,6 +2161,23 @@ pub fn write_coff(
 
     // Track COMDAT sections: maps (section_index, offset) -> comdat_section_id
     let mut comdat_extracted_sections: BTreeMap<(ObjSectionIndex, u64), SectionId> = Default::default();
+    // Offsets of the dead-space holes left in a parent CODE section by COMDAT
+    // extraction below. Each gets a hidden boundary symbol after the section is
+    // created; see the comment at the emission site for why this is necessary.
+    let mut comdat_gaps: Vec<(ObjSectionIndex, u64)> = Vec::new();
+    // Per-section symbol addresses + kinds, used to decide whether planting a
+    // marker is SAFE (see the emission site). Built once; obj.symbols is not
+    // mutated between here and there.
+    let mut syms_by_section: BTreeMap<ObjSectionIndex, Vec<(u64, ObjSymbolKind)>> =
+        Default::default();
+    for (_, sym) in obj.symbols.iter() {
+        if let Some(s) = sym.section {
+            syms_by_section.entry(s).or_default().push((sym.address, sym.kind));
+        }
+    }
+    for v in syms_by_section.values_mut() {
+        v.sort_by_key(|&(a, _)| a);
+    }
 
     // insert the sections
     let mut generated_pdata_section_id: Option<SectionId> = None;
@@ -2355,6 +2372,55 @@ pub fn write_coff(
                     // bytes become dead space. Relocations from this region are also
                     // skipped in the parent (see relocation loop below).
                     data[start..end].fill(0);
+                    // Record the hole so a boundary symbol can be planted at its start
+                    // once the parent section exists (it is created after this loop).
+                    // Code only: data sections get always-visible section symbols from
+                    // objdiff and take a different size path, so leave them alone.
+                    //
+                    // ⛔ ONLY WHERE IT CANNOT SWALLOW. The marker has no end boundary:
+                    // its own inferred size runs to the next Function-or-Object symbol,
+                    // and objdiff SKIPS LABEL/Unknown symbols when looking for that
+                    // boundary. jeff's retained bc-target fragments are emitted as
+                    // `lbl_*` LABELs, so a marker planted before one absorbs it and its
+                    // row disappears -- and such a fragment can be REAL CODE.
+                    //
+                    // Measured on cea-decomp: an unguarded marker silently removed
+                    // `lbl_823784DC` (36 B, `mflr r12; stw r12,-8(r1); stwu r1,-96(r1);
+                    // bl ...; mtlr r12`) and `lbl_82E6823C` (12 B, `li r3,1; mr; blr`).
+                    // Both are genuine code. With this guard they survive at their exact
+                    // original sizes and cea is Delta-0 whole-binary.
+                    //
+                    // ⚠ ADJUDICATE SUCH A ROW ONLY FROM ITS COFF SYMBOL VALUE. Two
+                    // instruments gave confident WRONG answers while this was being
+                    // diagnosed: "absent from symbols.txt therefore dead space" (proves
+                    // nothing), and reading the image at the address embedded in the
+                    // NAME -- `lbl_` names LIE about their address, so that read lands
+                    // on unrelated real code and manufactures exactly the false positive
+                    // it is meant to detect. Read at the symbol's real value: rb3-xenon's
+                    // 7 removed rows are all-zero over 240 B and collapse CORRECTLY,
+                    // whereas cea's two are not. Only the bytes decide, at the right
+                    // address.
+                    //
+                    // So plant only when the next symbol after the hole start is itself
+                    // a Function or Object (or there is none): then the marker is
+                    // terminated immediately and can consume nothing. Holes followed by
+                    // a LABEL keep today's inflated behaviour -- not fixed, but never
+                    // made worse. Strict improvement over both alternatives.
+                    if matches!(sect.kind, ObjSectionKind::Code) {
+                        let hole_va = sect.address + offset;
+                        let safe = match syms_by_section.get(&idx) {
+                            Some(v) => match v.iter().find(|&&(a, _)| a > hole_va) {
+                                Some(&(_, k)) => {
+                                    matches!(k, ObjSymbolKind::Function | ObjSymbolKind::Object)
+                                }
+                                None => true,
+                            },
+                            None => true,
+                        };
+                        if safe {
+                            comdat_gaps.push((idx, offset));
+                        }
+                    }
                 }
             }
         }
@@ -2380,6 +2446,49 @@ pub fn write_coff(
             cur_coff.append_section_bss(sect_id, sect.size, sect.align);
         }
         sect_map.insert(idx, sect_id);
+    }
+
+    // Plant a boundary symbol at the start of every COMDAT dead-space hole.
+    //
+    // WHY: extracting a COMDAT zero-fills its bytes in the parent but does NOT
+    // shrink the parent section, and we deliberately RETAIN in the parent any
+    // function that is the site or destination of a cross-region `bc` (14-bit
+    // displacement). COFF carries no symbol size, so objdiff sizes a Function
+    // symbol as the distance to the next Function-or-Object symbol
+    // (objdiff-core/src/obj/read.rs, infer_symbol_sizes -- LABEL/Unknown are
+    // skipped, so an interior lbl_ does NOT truncate). With every intervening
+    // function moved out to .text$dup, the retained head absorbed the ENTIRE
+    // hole: measured, one 12-byte fragment billed 25,912 bytes, and rb3-xenon's
+    // whole-binary total_code was inflated by 58,044 bytes across 17 rows.
+    //
+    // The symbol must satisfy BOTH conditions or it does not work:
+    //   * kind Data -> objdiff SymbolKind::Object, which is what terminates a
+    //     Function's inferred size. An Object marker ALONE truncates the head
+    //     but the bytes merely reappear as a new row -- measured.
+    //   * an objdiff-hidden name prefix (`__comdat_gap`, alongside
+    //     `except_data_`/`__unwind`/`__catch` in read.rs), so the marker itself
+    //     contributes no row. Hidden symbols still act as size boundaries --
+    //     the Hidden flag is not consulted by the boundary predicate.
+    // The offset is baked into the name because a section can hold many holes
+    // and duplicate symbol names within one object are invalid.
+    for (sect_idx, offset) in comdat_gaps {
+        let Some(&sect_id) = sect_map.get(&sect_idx) else { continue };
+        cur_coff.add_symbol(object::write::Symbol {
+            name: format!("__comdat_gap_{offset:08x}").into_bytes(),
+            value: offset,
+            size: 0,
+            kind: SymbolKind::Data,
+            // EXTERNAL (storage class 2), matching the configuration this fix was
+            // validated under. STATIC was tried first, but whether a STATIC data
+            // symbol reads back as object::SymbolKind::Data or ::Unknown decides
+            // whether the marker terminates a Function's size at all -- and
+            // ::Unknown would fail SILENTLY. These target objects are diff
+            // references and are never linked, so EXTERNAL costs nothing.
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(sect_id),
+            flags: SymbolFlags::None,
+        });
     }
 
     // insert the symbols
