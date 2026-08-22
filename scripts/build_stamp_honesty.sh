@@ -47,7 +47,16 @@ fi
 
 BACKUP=$(mktemp -t xex-backup-XXXXXX)
 cp -p "$VICTIM" "$BACKUP"
-restore() { cp -p "$BACKUP" "$VICTIM"; rm -f "$BACKUP"; return 0; }
+# NOTE the deliberate absence of `-p`, and the `touch`. Restoring with `cp -p`
+# puts the ORIGINAL mtime back -- older than the sabotaged version -- and cargo
+# watches `rerun-if-changed` paths by MTIME, not content, so it does not notice
+# and leaves the previous binary in place. State 3 below went red for exactly
+# that reason the first time this ran. It is the same mtime-invisible class the
+# split manifest exists to defeat (restore `symbols.txt` with an older mtime and
+# ninja does not plan a SPLIT at all), and it is worth knowing that cargo has it
+# too: a `git stash pop`, a `tar -x` or a reflinked worktree can leave you
+# running a binary built from code that is no longer on disk.
+restore() { cp "$BACKUP" "$VICTIM"; touch "$VICTIM"; rm -f "$BACKUP"; return 0; }
 trap restore EXIT INT TERM
 
 fail=0
