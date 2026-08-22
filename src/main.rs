@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 pub mod analysis;
 pub mod argp_version;
+pub mod build_id;
 pub mod cmd;
 pub mod obj;
 pub mod util;

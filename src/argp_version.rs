@@ -30,11 +30,14 @@ where T: FromArgs
         match Version::from_args(command_name, args) {
             Ok(v) => {
                 if v.version {
+                    // Version, git commit and the hash of these very bytes. A
+                    // version plus a commit cannot tell two builds apart, and
+                    // telling two builds apart is the whole problem: the dtk
+                    // deployed on 2026-08-18 printed a commit whose code it did
+                    // not contain. See crate::build_id.
                     println!(
-                        "{} {} {}",
-                        command_name.first().unwrap_or(&""),
-                        env!("CARGO_PKG_VERSION"),
-                        env!("GIT_COMMIT_SHA"),
+                        "{}",
+                        crate::build_id::version_line(command_name.first().unwrap_or(&""))
                     );
                     std::process::exit(0);
                 } else {
