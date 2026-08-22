@@ -52,6 +52,7 @@ use crate::{
         path::native_path,
         proposed_splits::write_proposed_splits,
         split::{split_obj, update_splits},
+        split_manifest::{write_manifest, SplitManifestBuilder},
         xex::{
             coff_path_for_unit, extract_exe, genuine_except_data_set, list_exe_sections,
             clamp_functions_over_except_data, strip_spurious_except_data,
@@ -188,6 +189,14 @@ fn split(args: SplitArgs) -> Result<()> {
     let out_config_path = args.out_dir.join("config.json");
     let mut dep = DepFile::new(out_config_path.clone());
 
+    // Every file this split writes gets recorded here and declared in
+    // <out_dir>/split_manifest.json. config.json is the only output any build
+    // system has ever known about; the thousands of target objects that carry
+    // the entire reference side of every diff were undeclared side effects.
+    // See util::split_manifest for the 341-function reproduction that motivated
+    // it, and for why this is a manifest and not a depfile.
+    let mut manifest = SplitManifestBuilder::new("xex split", &args.config, &args.out_dir);
+
     // load_analyze_dol is called here, takes in ProjectConfig and ObjectBase and returns a Result<AnalyzeResult>
     // load_dol_module - returns a Result<(ObjInfo, Utf8NativePathBuf)> - process_xex, then the path of the object
     info!("Loading and analyzing xex");
@@ -223,17 +232,24 @@ fn split(args: SplitArgs) -> Result<()> {
             vtable_candidates.len()
         );
         write_proposed_splits(&proposed_path, &exe.obj, &vtable_candidates)?;
+        // Re-read rather than re-render: write_proposed_splits owns its own
+        // formatting, and the manifest must describe what is ON DISK.
+        manifest.record_output_from_disk(&proposed_path)?;
     }
 
     // write the exe in the same dir the xex is
+    // NOTE: this lands OUTSIDE out_dir, next to the xex. It is the split's most
+    // easily missed output -- nothing in out_dir hints at it -- so it is
+    // recorded like any other.
     let exe_path: Utf8NativePathBuf =
         config.base.object.with_encoding().parent().unwrap().join(&exe_name);
     info!("Extracting exe to {exe_path}");
-    std::fs::write(exe_path, exe_bytes)?;
+    std::fs::write(&exe_path, &exe_bytes)?;
+    manifest.record_output(&exe_path, &exe_bytes);
 
     info!("Rebuilding relocations and splitting");
     // dol split_write_obj
-    let output_module = split_write_obj_exe(&mut exe, &config, &args.out_dir)?;
+    let output_module = split_write_obj_exe(&mut exe, &config, &args.out_dir, &mut manifest)?;
     // here, out_config = OutputConfig { the result of split_write_obj }
     let out_config = OutputConfig {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -248,15 +264,41 @@ fn split(args: SplitArgs) -> Result<()> {
         serde_json::to_writer_pretty(&mut out_file, &out_config)?;
         out_file.flush()?;
     }
+    manifest.record_output_from_disk(&out_config_path)?;
 
     // Write dep file here
     dep.extend(exe.dep);
+    let dep_path = args.out_dir.join("dep");
     {
-        let dep_path = args.out_dir.join("dep");
         let mut dep_file = buf_writer(&dep_path)?;
         dep.write(&mut dep_file)?;
         dep_file.flush()?;
     }
+    manifest.record_output_from_disk(&dep_path)?;
+
+    // The dep file is the split's own account of what it READ; hash that same
+    // set into the manifest so a consumer can answer "did these objects come
+    // from the config that is on disk right now?" by content instead of by
+    // mtime. The mtime answer is the one that fails silently: restore
+    // symbols.txt with an older mtime than config.json and ninja will not even
+    // plan a re-split.
+    for input in dep.dependencies.iter() {
+        manifest.record_input(Utf8NativePath::new(input.as_str()));
+    }
+    // The dep set is what the ANALYSIS read; the config file itself is read
+    // before any of that and never lands in it. It is also the one input the
+    // build system does declare, so omitting it here would leave the manifest
+    // strictly weaker than the ninja edge it is meant to strengthen.
+    manifest.record_input(&args.config);
+
+    // Written LAST, and never listing itself: its presence is therefore also
+    // the split's completion signal. A split that died partway leaves the
+    // PREVIOUS manifest, whose recorded outputs will not match the half-rewritten
+    // tree on disk.
+    let manifest = manifest.finish();
+    let n_outputs = manifest.outputs.len();
+    let manifest_path = write_manifest(&args.out_dir, &manifest)?;
+    info!("Declared {n_outputs} output(s) in {manifest_path}");
 
     info!("Done!");
     Ok(())
@@ -2613,6 +2655,7 @@ fn split_write_obj_exe(
     module: &mut ExeModuleInfo,
     config: &ProjectConfig,
     out_dir: &Utf8NativePath,
+    manifest: &mut SplitManifestBuilder,
 ) -> Result<OutputModule> {
     debug!("Performing relocation analysis");
     let mut tracker = Tracker::new(&module.obj);
@@ -2811,6 +2854,10 @@ fn split_write_obj_exe(
             DirBuilder::new().recursive(true).create(parent)?;
         }
         write_coff_if_changed(&out_path, &out_obj)?;
+        // Record the bytes we just committed, not a re-read: write_coff_if_changed
+        // deliberately SKIPS the write when they are already there, and the
+        // manifest's job is to state what the split produced either way.
+        manifest.record_output(&out_path, &out_obj);
     }
 
     // for coff_obj in &split_objs {
@@ -2933,26 +2980,38 @@ fn split_write_obj_exe(
                 std::fs::create_dir_all(parent)?;
             }
 
-            // write the file
-            let file = File::create(&full_path)?;
-            let mut writer = BufWriter::new(file);
-            match write_asm(&mut writer, &asm_obj)
+            // Render into memory, then commit. This keeps the original
+            // anti-truncation contract (a failed write_asm must not leave a
+            // half-written listing that downstream consumers cannot tell from a
+            // real one) while also handing the exact bytes to the manifest --
+            // re-reading 241 MB of listings back off disk per split, purely to
+            // hash what we just rendered, is the alternative.
+            let mut rendered: Vec<u8> = Vec::new();
+            match write_asm(&mut rendered, &asm_obj)
                 .with_context(|| format!("Failed to write {full_path}"))
             {
                 std::result::Result::Ok(()) => {
-                    // Only commit the buffer when the writer succeeded —
-                    // flushing a partial buffer leaves a truncated file on
-                    // disk that downstream consumers can't tell from a real
-                    // one (the original silent-truncation bug).
+                    let file = File::create(&full_path)?;
+                    let mut writer = BufWriter::new(file);
+                    writer.write_all(&rendered)?;
                     writer.flush()?;
+                    manifest.record_output(&full_path, &rendered);
                 }
                 Err(e) => {
                     log::error!("[ASM WRITE ERROR] {full_path}: {e:#}");
-                    drop(writer); // discard the partially-buffered output
-                    if let Err(remove_err) = std::fs::remove_file(&full_path) {
-                        log::warn!(
-                            "Failed to remove partial asm file {full_path}: {remove_err}"
-                        );
+                    // Parity with the pre-manifest behaviour: never leave a
+                    // previous generation's listing standing in for a failed
+                    // one. Nothing was truncated this time, but a stale .s is
+                    // its own silent-misleading class.
+                    match std::fs::remove_file(full_path.as_str()) {
+                        std::result::Result::Ok(()) => {}
+                        Err(remove_err)
+                            if remove_err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(remove_err) => {
+                            log::warn!(
+                                "Failed to remove stale asm file {full_path}: {remove_err}"
+                            );
+                        }
                     }
                     asm_failures.push((full_path, e));
                 }
