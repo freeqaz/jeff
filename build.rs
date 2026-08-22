@@ -24,14 +24,29 @@
 //!      `rustc-` -- so cargo saw a build script that declared NO rerun inputs and
 //!      fell back to "re-run if any file in the package changes". And `.git/HEAD`
 //!      is a plain path, which does not exist in a linked worktree, where `.git`
-//!      is a file. We declare HEAD, the ref HEAD points at, and the index, each
-//!      resolved through `git rev-parse --git-path` so it works from a worktree.
+//!      is a file.
 //!
-//! Even so the stamp remains ADVISORY, and the module doc on `crate::build_id`
-//! says so: cargo cannot be asked to re-run a build script because "a tracked
-//! file was edited but not staged". The authoritative identity is the xxh3 of the
+//! Both halves of (2) matter, and the first attempt at this file got it wrong by
+//! fixing only one. Declaring the git refs and nothing else is a REGRESSION for
+//! the commonest dirty case: an unstaged edit to a tracked source file moves
+//! neither HEAD nor the index, so the build script does not re-run and the
+//! `-dirty` marker never appears. Caught by the sabotage below, which is why it
+//! exists. Declaring *any* `rerun-if-changed` also switches off cargo's
+//! "any file in the package" fallback -- so the fallback has to be re-declared
+//! by hand. Hence both sets: the git refs (a commit or checkout that does not
+//! touch a file) AND the compiled sources (a file that does not touch a ref).
+//!
+//! Even with both, the stamp remains ADVISORY, and the module doc on
+//! `crate::build_id` says so. Cargo watches these paths by mtime, and mtime is
+//! not content; a tracked file outside the declared set (`README.md`,
+//! `docs/`) can differ from HEAD without the marker appearing. That case does
+//! not change the binary, but it does mean "clean" here means "the code is
+//! clean", not "the tree is". The authoritative identity is the xxh3 of the
 //! executable itself, computed at runtime -- this stamp exists to make that hash
 //! human-readable, not to replace it.
+//!
+//! `scripts/build_stamp_honesty.sh` is the sabotage: it builds clean, builds
+//! dirty, and builds clean again, and requires the stamp to move and come back.
 //!
 //! Modelled on objdiff's `objdiff-cli/build.rs`, which got here first; that
 //! stamp is why `callee_gate` and `pattern_census` can name their instrument.
@@ -46,8 +61,10 @@ fn main() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
 
-    // Re-run when the checked-out commit changes. `--git-path` resolves correctly
-    // from a linked worktree, where `.git` is a file rather than a directory.
+    // (a) Re-run when the checked-out commit changes without a file changing --
+    // a `git commit` of what is already on disk, a checkout, a branch switch.
+    // `--git-path` resolves correctly from a linked worktree, where `.git` is a
+    // file rather than a directory.
     for path in ["HEAD", "index"] {
         if let Some(p) = git(&["rev-parse", "--git-path", path]) {
             println!("cargo:rerun-if-changed={p}");
@@ -57,6 +74,16 @@ fn main() {
         if let Some(p) = git(&["rev-parse", "--git-path", &head_ref]) {
             println!("cargo:rerun-if-changed={p}");
         }
+    }
+
+    // (b) ...and when a file changes without the commit changing -- the unstaged
+    // edit, which is how the 2026-08-18 binary came to exist. Declaring (a)
+    // switches off cargo's "any file in the package" default, so the part of it
+    // that was load-bearing has to be re-declared. These are exactly the inputs
+    // that can change the compiled bytes; watching them costs three `git`
+    // invocations per source edit.
+    for path in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
+        println!("cargo:rerun-if-changed={path}");
     }
 
     let commit = match git(&["rev-parse", "HEAD"]) {
