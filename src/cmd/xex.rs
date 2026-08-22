@@ -285,6 +285,11 @@ fn split(args: SplitArgs) -> Result<()> {
     for input in dep.dependencies.iter() {
         manifest.record_input(Utf8NativePath::new(input.as_str()));
     }
+    // The dep set is what the ANALYSIS read; the config file itself is read
+    // before any of that and never lands in it. It is also the one input the
+    // build system does declare, so omitting it here would leave the manifest
+    // strictly weaker than the ninja edge it is meant to strengthen.
+    manifest.record_input(&args.config);
 
     // Written LAST, and never listing itself: its presence is therefore also
     // the split's completion signal. A split that died partway leaves the
