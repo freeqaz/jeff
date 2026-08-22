@@ -69,7 +69,13 @@ use typed_path::{Utf8NativePath, Utf8NativePathBuf};
 
 /// Bump when the document's *shape* changes in a way a reader must notice.
 /// Readers should refuse a version they do not know rather than guess.
-pub const MANIFEST_VERSION: u32 = 1;
+///
+/// * `1` — initial.
+/// * `2` — `tool_binary_hash` added, and `tool_commit` became *honest*: it may
+///   now be empty (not a git checkout) or `-dirty`-suffixed. A v1 reader that
+///   assumed a bare 40-hex sha would be misled by both, which is precisely the
+///   kind of change this constant exists to announce. See [`crate::build_id`].
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// Written next to `config.json`, i.e. `<out_dir>/split_manifest.json`.
 pub const MANIFEST_FILE_NAME: &str = "split_manifest.json";
@@ -106,11 +112,25 @@ pub struct SplitManifest {
     pub manifest_version: u32,
     /// `CARGO_PKG_VERSION` of the dtk that wrote this.
     pub tool_version: String,
-    /// `GIT_COMMIT_SHA` of the dtk that wrote this. Two dtk builds with the
-    /// same outputs is the common case, but when outputs *do* move this is the
-    /// field that says why, and it is the one thing a consumer cannot recover
-    /// by hashing files on disk.
+    /// The git commit the dtk that wrote this was *stamped* with —
+    /// `-dirty`-suffixed if its tree had modified tracked files at build time,
+    /// and EMPTY if it was not built from a git checkout at all.
+    ///
+    /// ADVISORY, and the empty and `-dirty` forms are the point. This field used
+    /// to be a bare `git rev-parse HEAD`, and on 2026-08-18 it would have
+    /// recorded `b4b25bcb4805…` for a binary built from `614331e` — a commit
+    /// that was not even an ancestor of `main` — because the tree was dirty when
+    /// it was built. A provenance field that cannot say "unknown" records a
+    /// guess as a fact. Prefer [`Self::tool_binary_hash`] when the question is
+    /// "was it the same tool"; see [`crate::build_id`] for why the two are not
+    /// equivalent.
     pub tool_commit: String,
+    /// xxHash3-64 (hex) of the dtk executable that wrote this. AUTHORITATIVE:
+    /// different bytes, different splitter, whatever `tool_commit` claims.
+    ///
+    /// `None` only when the running executable could not be located or read; the
+    /// manifest says so rather than substituting the advisory identity.
+    pub tool_binary_hash: Option<String>,
     /// e.g. `"xex split"`. Present so a future `dol split` manifest is
     /// distinguishable without inspecting the payload.
     pub command: String,
@@ -195,7 +215,8 @@ impl SplitManifestBuilder {
         SplitManifest {
             manifest_version: MANIFEST_VERSION,
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            tool_commit: env!("GIT_COMMIT_SHA").trim().to_string(),
+            tool_commit: crate::build_id::commit().to_string(),
+            tool_binary_hash: crate::build_id::binary_hash().map(str::to_string),
             command: self.command,
             config: self.config,
             out_dir: self.out_dir,
@@ -339,6 +360,53 @@ mod tests {
         );
         assert_eq!(fs::read(path.as_str()).unwrap(), b"second");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The manifest must name its instrument, and it must name the *authoritative*
+    /// one. `tool_commit` alone was what shipped a splitter claiming a commit it
+    /// did not contain (2026-08-18, `b4b25bcb4805…` for code from `614331e`).
+    #[test]
+    fn manifest_records_the_authoritative_tool_identity() {
+        let manifest = builder().finish();
+        // The binary hash must actually be there. If `binary_hash()` silently
+        // returned `None` in every environment, every assertion about it would
+        // be vacuous and the manifest would be back to one advisory field.
+        let hash = manifest
+            .tool_binary_hash
+            .as_deref()
+            .expect("the running executable must be hashable under `cargo test`");
+        assert_eq!(hash.len(), 16, "xxh3-64 renders as 16 hex chars: {hash:?}");
+
+        // And the advisory one must be honest about its own state rather than
+        // fabricating a clean-looking sha.
+        let c = &manifest.tool_commit;
+        if !c.is_empty() {
+            let sha = c.strip_suffix("-dirty").unwrap_or(c);
+            assert_eq!(sha.len(), 40, "tool_commit is neither empty nor a sha: {c:?}");
+            assert!(sha.chars().all(|ch| ch.is_ascii_hexdigit()), "not hex: {c:?}");
+        }
+
+        // Both identities must survive to the rendered document; a field that
+        // serde skipped would make all of the above true and useless.
+        let text = String::from_utf8(render(&manifest).unwrap()).unwrap();
+        assert!(text.contains("tool_binary_hash"), "{text}");
+        assert!(text.contains(hash), "{text}");
+    }
+
+    /// "Unknown" must be representable. A `String` that is always populated is
+    /// how a guess gets recorded as a fact.
+    #[test]
+    fn an_unknown_binary_hash_renders_as_null_not_as_a_guess() {
+        let mut manifest = builder().finish();
+        manifest.tool_binary_hash = None;
+        manifest.tool_commit = String::new();
+        let text = String::from_utf8(render(&manifest).unwrap()).unwrap();
+        assert!(text.contains("\"tool_binary_hash\": null"), "{text}");
+        assert!(text.contains("\"tool_commit\": \"\""), "{text}");
+        // ...and it must round-trip, so a consumer reads `None`, not `""`.
+        let back: SplitManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.tool_binary_hash, None);
+        assert_eq!(back.tool_commit, "");
     }
 
     /// Path keys must be stable across the ways the same file can be spelled,
