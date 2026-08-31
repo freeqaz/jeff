@@ -111,14 +111,55 @@ pub fn apply_symbols_file(
                 // duplicate name later trips create_gap_splits into
                 // emitting an auto-split boundary that bisects a
                 // legitimate object.
-                if let Some((_, existing)) = obj.symbols.by_name(&symbol.name)? {
+                if let Some((existing_idx, existing)) = obj.symbols.by_name(&symbol.name)? {
                     if existing.address != symbol.address {
+                        // Auto/generated name families (fn_/lbl_/jumptable_/
+                        // except_*) really do go stale across rebuilds: keep
+                        // preferring the prior loader's placement for those.
+                        let generated = symbol.name.starts_with("fn_")
+                            || symbol.name.starts_with("lbl_")
+                            || symbol.name.starts_with("jumptable_")
+                            || symbol.name.starts_with("except_data_")
+                            || symbol.name.starts_with("except_record_");
+                        if generated {
+                            log::warn!(
+                                "Dropping symbol {} @ {:#010X}: name already used by \
+                                 prior loader at {:#010X} (likely stale symbols.txt entry)",
+                                symbol.name, symbol.address, existing.address,
+                            );
+                            continue;
+                        }
+                        // A REAL name in symbols.txt is the user's naming
+                        // authority; the collision is a prior loader (imports,
+                        // PDB, pdata) having auto-placed the same name at a
+                        // different address, possibly one that symbols.txt
+                        // renames on a LATER line (measured: `sprintf @
+                        // 0x829A2760` was dropped because the import loader
+                        // pre-named the RtlSprintf thunk at 0x82EE6584
+                        // `sprintf`, whose symbols.txt rename line came 20k
+                        // lines later; the user rename then reverted on every
+                        // split).  Free the name: park the prior symbol on an
+                        // auto name — its own symbols.txt line, if any, will
+                        // rename it again when reached.
+                        let existing = existing.clone();
+                        let prefix = if existing.kind == ObjSymbolKind::Function {
+                            "fn"
+                        } else {
+                            "lbl"
+                        };
+                        let parked =
+                            create_auto_symbol_name(prefix, 0, existing.address as u32);
                         log::warn!(
-                            "Dropping symbol {} @ {:#010X}: name already used by \
-                             prior loader at {:#010X} (likely stale symbols.txt entry)",
-                            symbol.name, symbol.address, existing.address,
+                            "symbols.txt claims name {} for {:#010X}; parking prior \
+                             loader's {:#010X} as {} (a later symbols.txt line may \
+                             rename it)",
+                            symbol.name, symbol.address, existing.address, parked,
                         );
-                        continue;
+                        obj.symbols.replace(existing_idx, ObjSymbol {
+                            name: parked,
+                            demangled_name: None,
+                            ..existing
+                        })?;
                     }
                 }
                 // A function symbol from symbols.txt whose address falls
