@@ -22,8 +22,8 @@ use typed_path::{Utf8NativePathBuf, Utf8UnixPath};
 use crate::{
     analysis::{cfa::SectionAddress, read_u32},
     obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjRelocKind, ObjSection, ObjSectionKind, ObjSymbol,
-        ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
+        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind,
+        ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
         SectionIndex as ObjSectionIndex, SectionIndex, SymbolIndex as ObjSymbolIndex, SymbolIndex,
     },
     util::{
@@ -1778,6 +1778,63 @@ pub fn clamp_functions_over_except_data(obj: &mut ObjInfo) -> usize {
     plan.len()
 }
 
+/// True for a relocation on a NON-LINKING branch (`b` or `bc`, LK = 0) whose
+/// encoded destination is the start of the very function that contains it: a
+/// loop back-edge to a leaf function's first instruction, not a call.
+///
+/// MSVC's compiler emits a plain label branch for these. Measured over dc3's
+/// 2,000+ compiler-produced objects: ZERO REL24 or REL14 records sit on a
+/// non-linking branch whose target is in the same section (recursive `bl`
+/// keeps its REL24 -- 797 of those -- and is not matched here). The tracker
+/// records such a `bc` as `Rel24` (`analysis/tracker.rs`, "MSVC's linker
+/// doesn't accept REL14 in tail calls", because `is_function_addr` excludes
+/// `function_start`), and the REL24 data fixup below then writes a 24-bit
+/// displacement over the `bc`'s BO/BI fields: dc3 CharLipSync's
+/// `fill<_Bit_iter>` at 0x82341FD4, `40 9A FF 94` (bne cr6) -> `43 FF FF 94`.
+/// On a `b` the fixup happens to rewrite the same displacement (the target is
+/// section offset 0 of a function that is emitted whole), so the bytes
+/// survive and only a relocation MSVC never writes is left behind.
+///
+/// The function is emitted whole -- into its COMDAT section or the parent
+/// .text -- so the encoded displacement stays valid and no relocation is
+/// needed.
+fn is_self_loop_branch(
+    obj: &ObjInfo,
+    sect_idx: ObjSectionIndex,
+    sect: &ObjSection,
+    offset: u64,
+    reloc: &ObjReloc,
+) -> bool {
+    if !matches!(reloc.kind, ObjRelocKind::PpcRel24 | ObjRelocKind::PpcRel14) {
+        return false;
+    }
+    let start = offset as usize;
+    let Some(word) = sect.data.get(start..start + 4) else { return false };
+    let ins = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    // AA (bit 1) and LK (bit 0) must both be clear.
+    if ins & 0b11 != 0 {
+        return false;
+    }
+    let disp = match ins >> 26 {
+        16 => ((ins & 0xFFFC) as u16 as i16) as i64,
+        18 => (((ins & 0x03FF_FFFC) << 6) as i32 >> 6) as i64,
+        _ => return false,
+    };
+    let target = &obj.symbols[reloc.target_symbol];
+    if target.kind != ObjSymbolKind::Function
+        || target.section != Some(sect_idx)
+        || reloc.addend != 0
+    {
+        return false;
+    }
+    let Some(fn_start) = target.address.checked_sub(sect.address) else { return false };
+    let encoded = offset as i64 + disp;
+    encoded == fn_start as i64
+        && offset >= fn_start
+        && target.size > 0
+        && offset < fn_start + target.size
+}
+
 /// Destination of the relative `bc` at `offset`, as a section offset.
 ///
 /// `None` when the word there is not a `bc` (primary opcode 16) or is absolute
@@ -2222,6 +2279,10 @@ pub fn write_coff(
         if sect.kind != ObjSectionKind::Bss {
             for (addr, reloc) in sect.relocations.iter() {
                 let offset = addr as usize;
+                // Not emitted (see the relocation loop): the bytes stay verbatim.
+                if is_self_loop_branch(obj, idx, sect, addr as u64, reloc) {
+                    continue;
+                }
                 match reloc.kind {
                     ObjRelocKind::Absolute => {
                         // ADDR32: entire 4-byte value is the address/addend
@@ -2329,7 +2390,9 @@ pub fn write_coff(
                     for (raddr, reloc) in sect.relocations.iter() {
                         let abs_off = raddr as usize;
                         if abs_off >= start && abs_off < end {
-                            if matches!(reloc.kind, ObjRelocKind::PpcRel24) {
+                            if matches!(reloc.kind, ObjRelocKind::PpcRel24)
+                                && !is_self_loop_branch(obj, idx, sect, raddr as u64, reloc)
+                            {
                                 let comdat_off = abs_off - start;
                                 if comdat_off + 4 <= comdat_data.len() {
                                     let insn = u32::from_be_bytes(
@@ -2632,6 +2695,18 @@ pub fn write_coff(
             continue;
         }
         for (addr, reloc) in sect.relocations.iter() {
+            // A loop back-edge to the containing function's own first
+            // instruction: MSVC writes a label branch, never a relocation.
+            if is_self_loop_branch(obj, sect_idx, sect, addr as u64, reloc) {
+                log::debug!(
+                    "Dropping self-loop {:?} @ {}+{:#x} -> {}",
+                    reloc.kind,
+                    sect.name,
+                    addr,
+                    obj.symbols[reloc.target_symbol].name,
+                );
+                continue;
+            }
             // Emit a REL14 only when the branch destination LEAVES the emitted
             // section (session 2026-08-12-splitter-reloc-addend, rule R1).
             //

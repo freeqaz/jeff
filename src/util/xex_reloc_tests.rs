@@ -482,3 +482,69 @@ fn refhi_reflo_pair_record_shape_is_pinned() {
     assert_eq!(word_at(&text, 0x00), 0x3D80_0000);
     assert_eq!(word_at(&text, 0x08), 0x398C_0000);
 }
+
+// ---------------------------------------------------------------------------
+// (4) SELF-LOOP — a non-linking branch back to its own function's first
+//     instruction must carry no relocation, and its bytes must survive
+// ---------------------------------------------------------------------------
+
+/// The tracker records a `bc` whose destination is the containing function's
+/// start as `Rel24` ("MSVC's linker doesn't accept REL14 in tail calls"): its
+/// `is_function_addr` excludes `function_start`, so a loop back-edge to a leaf
+/// function's first instruction reads as leaving the function. The REL24 data
+/// fixup then wrote `-(offset)` into bits [25:2], i.e. straight over the `bc`'s
+/// BO/BI fields. Measured: dc3 CharLipSync `fill<_Bit_iter>` at 0x82341FD4,
+/// `40 9A FF 94` (bne cr6) in the XEX, `43 FF FF 94` in the carved object;
+/// 2 such `bc` in dc3 and 5 in rb3-xenon, plus 16 / 19 `b` back-edges that
+/// carried a REL24 MSVC never writes. Across dc3's compiler-produced objects
+/// MSVC puts ZERO REL24/REL14 on a non-linking branch whose target is in the
+/// same section, and keeps REL24 on a recursive `bl` (797 of those).
+///
+/// Fixture: `bne cr6` and `b` back to fn+0 (both `Rel24`, as the tracker
+/// produces them), and a recursive `bl` to fn+0 as the control that must keep
+/// its relocation.
+#[test]
+fn self_loop_branch_to_own_function_start_emits_no_relocation() {
+    const FN_SIZE: u64 = 0x20;
+    let mut data = vec![0u8; FN_SIZE as usize];
+    data[0x00..0x04].copy_from_slice(&0x816B_0000u32.to_be_bytes()); // lwz r11, 0(r11)
+    data[0x10..0x14].copy_from_slice(&0x409A_FFF0u32.to_be_bytes()); // bne cr6, -0x10 -> fn+0
+    data[0x14..0x18].copy_from_slice(&0x4BFF_FFECu32.to_be_bytes()); // b -0x14 -> fn+0
+    data[0x18..0x1C].copy_from_slice(&0x4BFF_FFE9u32.to_be_bytes()); // bl -0x18 -> fn+0
+    data[0x1C..0x20].copy_from_slice(&0x4E80_0020u32.to_be_bytes()); // blr
+
+    let mut relocations = ObjRelocations::default();
+    for off in [0x10u32, 0x14, 0x18] {
+        relocations
+            .insert(off, ObjReloc {
+                kind: ObjRelocKind::PpcRel24,
+                target_symbol: 0,
+                addend: 0,
+                module: None,
+            })
+            .unwrap();
+    }
+
+    let mut obj = ObjInfo::new(
+        ObjKind::Relocatable,
+        ObjArchitecture::PowerPc,
+        "selfloop.obj".into(),
+        vec![],
+        vec![text_section(data, relocations)],
+    );
+    obj.symbols.add_direct(global_fn("fill_bit_iter", 0, FN_SIZE)).unwrap();
+
+    let coff = write_coff(&obj, &empty_except_data()).unwrap();
+    let (text, records) = read_section(&coff, ".text");
+
+    assert_eq!(
+        word_at(&text, 0x10),
+        0x409A_FFF0,
+        "the bc's BO/BI fields were overwritten by the REL24 fixup"
+    );
+    assert_eq!(word_at(&text, 0x14), 0x4BFF_FFEC);
+    let at = |o: u64| records.iter().filter(|r| r.offset == o).count();
+    assert_eq!(at(0x10), 0, "self-loop bc kept a relocation: {records:#x?}");
+    assert_eq!(at(0x14), 0, "self-loop b kept a relocation: {records:#x?}");
+    assert_eq!(at(0x18), 1, "recursive bl lost its REL24: {records:#x?}");
+}
