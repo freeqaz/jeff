@@ -93,6 +93,23 @@ pub struct Tracker {
 }
 
 impl Tracker {
+    /// The data kind (and the alignment it implies) that the analysis inferred
+    /// for an access at `target`, as `apply` records it on a symbol starting
+    /// there. `(Unknown, None)` when nothing loaded or stored through it.
+    pub fn inferred_data_kind(&self, target: SectionAddress) -> (ObjDataKind, Option<u32>) {
+        self.data_types
+            .get(&target)
+            .map(|dt| match dt {
+                DataKind::Unknown => (ObjDataKind::Unknown, None),
+                DataKind::Word => (ObjDataKind::Byte4, None),
+                DataKind::Half => (ObjDataKind::Byte2, None),
+                DataKind::Byte => (ObjDataKind::Byte, None),
+                DataKind::Float => (ObjDataKind::Float, Some(4)),
+                DataKind::Double => (ObjDataKind::Double, Some(8)),
+            })
+            .unwrap_or_default()
+    }
+
     pub fn new(obj: &ObjInfo) -> Tracker {
         Self {
             processed_functions: Default::default(),
@@ -878,18 +895,7 @@ impl Tracker {
                     );
                 }
             }
-            let (data_kind, inferred_alignment) = self
-                .data_types
-                .get(&target)
-                .map(|dt| match dt {
-                    DataKind::Unknown => (ObjDataKind::Unknown, None),
-                    DataKind::Word => (ObjDataKind::Byte4, None),
-                    DataKind::Half => (ObjDataKind::Byte2, None),
-                    DataKind::Byte => (ObjDataKind::Byte, None),
-                    DataKind::Float => (ObjDataKind::Float, Some(4)),
-                    DataKind::Double => (ObjDataKind::Double, Some(8)),
-                })
-                .unwrap_or_default();
+            let (data_kind, inferred_alignment) = self.inferred_data_kind(target);
             let (target_symbol, addend) =
                 if let Some(symbol) = self.special_symbol(obj, target.address, reloc_kind) {
                     (symbol, 0)

@@ -36,7 +36,7 @@ use crate::{
         OutputUnit, ProjectConfig,
     },
     obj::{
-        best_match_for_reloc, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSectionKind,
+        best_match_for_reloc, ObjDataKind, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSectionKind,
         ObjSections, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
         SectionIndex, SymbolIndex,
     },
@@ -2651,6 +2651,239 @@ fn retrack_unanalyzed_functions(obj: &mut ObjInfo, first: &Tracker) -> Result<us
     Result::Ok(added - interior)
 }
 
+/// Anchor every code `@ha`/`@l` relocation on a symbol at the EXACT address
+/// the instruction pair forms, instead of `containing_label + addend`.
+///
+/// ## Why
+///
+/// `write_coff` cannot encode an addend on a REFHI/REFLO: it zeroes the
+/// instruction's 16-bit immediate and writes the PAIR record's displacement as
+/// 0 (see the data fixup and the relocation loop). So a site the tracker
+/// resolved to `lbl_X + 4` reaches the target object as a reference to `lbl_X`
+/// itself. Every reader of the split object — objdiff, and any tool that
+/// reads retail values through the relocation — then sees the wrong address.
+/// Measured on RB3 (lane W16-PW): `ProfileMgr::GetJoypadExtraLagInits` loads
+/// 74.0 from `0x82091FC0`, but `lbl_82091FBC` was sized 8, so the split object
+/// relocated the load to `0x82091FBC` (14.0) and objdiff charged our correct
+/// constant as a wrong one.
+///
+/// ## Why a new label is the faithful encoding
+///
+/// MSVC's own objects never carry an addend on a REFHI/REFLO: over all 1,268
+/// of rb3-xenon's compiled objects (678,382 REFHI/REFLO records) every PAIR
+/// displacement is zero and every in-place immediate is zero (the two nonzero
+/// low bits found are DS-form `lwa` opcode bits, not an addend). The compiler forms a
+/// member or element address with `addi`/a register offset, never with
+/// `sym+N@l`. So an `@l` that lands N bytes into a dtk label proves the
+/// original object had a symbol starting there, and the label's size (usually
+/// inferred from the gap to the next symbol) is what is wrong.
+///
+/// ## What it does
+///
+/// For each code-section `PpcAddr16Ha`/`PpcAddr16Lo` whose target is a
+/// non-function symbol in a non-code section and whose addend is positive and
+/// inside that symbol, the exact address becomes a split point of the symbol.
+/// A `lbl_<addr>` (`vftable_<addr>` inside a vtable) is added there, with the
+/// data kind and alignment the tracker inferred for that address (else the
+/// container's, the alignment only when the address honours it), the container and each new piece
+/// are sized to the next split point, and every relocation of any kind whose
+/// effective target falls in a piece is re-pointed to that piece with its
+/// addend reduced accordingly. ADDR32 relocations keep their effective target:
+/// `write_coff` writes their addend in place.
+///
+/// Skipped, and counted: a split point already occupied by a symbol the
+/// tracker could not reference (stripped / relocation-ignore), and a container
+/// that is not a generated `lbl_`/`vftable_`/`jumptable_`/`stringBase` label —
+/// a named object keeps its size and its addend-carrying references unchanged.
+///
+/// One call reaches the fixed point: the next split run finds the new labels
+/// in `symbols.txt` and the tracker resolves the same sites with addend 0.
+fn anchor_interior_data_references(obj: &mut ObjInfo, tracker: &Tracker) -> usize {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let census = std::env::var_os("JEFF_ADDEND_CENSUS").is_some();
+    let section_is_code =
+        |obj: &ObjInfo, s: SectionIndex| obj.sections[s].kind == ObjSectionKind::Code;
+
+    // container symbol -> set of interior split addresses
+    let mut splits: BTreeMap<SymbolIndex, BTreeSet<u64>> = BTreeMap::new();
+    let (mut sites, mut skip_named, mut skip_occupied) = (0usize, 0usize, 0usize);
+    for (src_sec, section) in obj.sections.iter() {
+        if section.kind != ObjSectionKind::Code {
+            continue;
+        }
+        for (src_addr, reloc) in section.relocations.iter() {
+            if !matches!(reloc.kind, ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo)
+                || reloc.addend <= 0
+            {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            if tsym.kind == ObjSymbolKind::Function || section_is_code(obj, tsec) {
+                continue;
+            }
+            let tva = tsym.address + reloc.addend as u64;
+            if tva >= tsym.address + tsym.size {
+                continue;
+            }
+            sites += 1;
+            if census {
+                eprintln!(
+                    "ADDEND {:?} @ {}:{:#010X} -> {}+{:#x} = {:#010X} (size {:#x})",
+                    reloc.kind,
+                    obj.sections[src_sec].name,
+                    src_addr,
+                    tsym.name,
+                    reloc.addend,
+                    tva,
+                    tsym.size
+                );
+            }
+            if generated_data_label_prefix(&tsym.name).is_none() {
+                skip_named += 1;
+                continue;
+            }
+            if obj.symbols.at_section_address(tsec, tva as u32).next().is_some() {
+                skip_occupied += 1;
+                continue;
+            }
+            splits.entry(reloc.target_symbol).or_default().insert(tva);
+        }
+    }
+
+    // Carve each container into pieces and remember (section, piece) ranges.
+    let module_id = obj.module_id;
+    let mut pieces: BTreeMap<(SectionIndex, u64), (u64, SymbolIndex, SymbolIndex)> =
+        BTreeMap::new(); // (sec, start) -> (end, new symbol, container)
+    let mut created = 0usize;
+    for (&cidx, points) in &splits {
+        let container = obj.symbols[cidx].clone();
+        let sec = container.section.unwrap();
+        let end = container.address + container.size;
+        let mut bounds: Vec<u64> = points.iter().copied().collect();
+        bounds.push(end);
+        let mut shrunk = container.clone();
+        shrunk.size = bounds[0] - container.address;
+        shrunk.size_known = true;
+        if let Err(e) = obj.symbols.replace(cidx, shrunk) {
+            log::warn!("Failed to shrink {} for interior anchors: {e:#}", container.name);
+            continue;
+        }
+        for w in bounds.windows(2) {
+            let (start, next) = (w[0], w[1]);
+            // What the tracker inferred for an access at exactly `start` is what
+            // `apply` would record on a symbol found there on the next split, so
+            // using it here makes this split's output the fixed point; the
+            // container's own kind is the fallback.
+            let (inferred_kind, inferred_align) =
+                tracker.inferred_data_kind(SectionAddress::new(sec, start as u32));
+            let data_kind = if inferred_kind != ObjDataKind::Unknown {
+                inferred_kind
+            } else {
+                container.data_kind
+            };
+            let align =
+                inferred_align.or(container.align).filter(|&a| a != 0 && start % a as u64 == 0);
+            let prefix = generated_data_label_prefix(&container.name).unwrap_or("lbl");
+            let name = create_auto_symbol_name(prefix, module_id, start as u32);
+            log::info!(
+                "Anchoring interior reference: {} @ {:#010x} (size {:#x}) carved from {}",
+                name,
+                start,
+                next - start,
+                container.name
+            );
+            match obj.symbols.add_direct(ObjSymbol {
+                name,
+                address: start,
+                section: Some(sec),
+                size: next - start,
+                size_known: true,
+                kind: container.kind,
+                flags: container.flags,
+                align,
+                data_kind,
+                ..Default::default()
+            }) {
+                std::result::Result::Ok(idx) => {
+                    pieces.insert((sec, start), (next, idx, cidx));
+                    created += 1;
+                }
+                Err(e) => log::warn!("Failed to add interior anchor @ {start:#010x}: {e:#}"),
+            }
+        }
+    }
+
+    // Re-point every relocation that targeted a container inside a new piece.
+    let mut repoints: Vec<(SectionIndex, u32, ObjReloc)> = Vec::new();
+    for (src_sec, section) in obj.sections.iter() {
+        for (src_addr, reloc) in section.relocations.iter() {
+            if !splits.contains_key(&reloc.target_symbol) {
+                continue;
+            }
+            let tsym = &obj.symbols[reloc.target_symbol];
+            let Some(tsec) = tsym.section else { continue };
+            let tva = tsym.address as i64 + reloc.addend;
+            if tva < 0 {
+                continue;
+            }
+            let tva = tva as u64;
+            let Some((&(_, start), &(end, new_idx, cidx))) =
+                pieces.range(..=(tsec, tva)).next_back()
+            else {
+                continue;
+            };
+            if cidx != reloc.target_symbol || tva >= end {
+                continue;
+            }
+            repoints.push((
+                src_sec,
+                src_addr,
+                ObjReloc { target_symbol: new_idx, addend: (tva - start) as i64, ..reloc.clone() },
+            ));
+        }
+    }
+    for (src_sec, src_addr, reloc) in &repoints {
+        obj.sections[*src_sec].relocations.replace(*src_addr, reloc.clone());
+    }
+
+    log::info!(
+        "Interior-reference anchoring: {} code @ha/@l site(s) resolved into a data symbol's \
+         interior; {} label(s) created in {} container(s), {} relocation(s) re-pointed; \
+         skipped {} into named objects, {} onto an occupied address",
+        sites,
+        created,
+        splits.len(),
+        repoints.len(),
+        skip_named,
+        skip_occupied
+    );
+    created
+}
+
+/// The name prefix for a piece carved out of `name`, when `name` is a
+/// dtk-generated data symbol whose size is an inference rather than a fact.
+///
+/// `vftable_` symbols come from `FindXboxVtables`, which sizes a table up to
+/// the next COL pointer or non-code word. Code compiled without RTTI (the
+/// Quazal block, vendor code) lays function-pointer tables end to end with no
+/// COL between them, so two tables read as one. Retail code that stores the
+/// address of the second one (`lis r4,0x8218; addi r3,r4,0x4894` against
+/// `vftable_82184888`, size 0x20) is the evidence of the boundary.
+fn generated_data_label_prefix(name: &str) -> Option<&'static str> {
+    if name.starts_with("vftable_") {
+        Some("vftable")
+    } else if ["lbl_", "jumptable_", "stringBase", "@stringBase"]
+        .iter()
+        .any(|p| name.starts_with(p))
+    {
+        Some("lbl")
+    } else {
+        None
+    }
+}
+
 fn split_write_obj_exe(
     module: &mut ExeModuleInfo,
     config: &ProjectConfig,
@@ -2777,6 +3010,11 @@ fn split_write_obj_exe(
     // repair passes so none of them sees a changed relocation set, and before
     // write_symbols_file / split_obj so the new relocations reach the objects.
     retrack_unanalyzed_functions(&mut module.obj, &tracker)?;
+
+    // `write_coff` cannot encode an addend on @ha/@l, so a load resolved to
+    // `label + N` would be emitted as a load of `label`. Give each such site a
+    // label at its exact address. After the retrack so its relocations count.
+    anchor_interior_data_references(&mut module.obj, &tracker);
 
     if !config.symbols_known && config.detect_objects {
         debug!("Detecting object boundaries");
@@ -3718,13 +3956,14 @@ fn info(args: InfoArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        overlapping_function_intervals, plan_fallthrough_merge_runs,
-        retrack_unanalyzed_functions, synthesize_reloc_targeted_leaf_functions, LeafFrag,
+        anchor_interior_data_references, overlapping_function_intervals,
+        plan_fallthrough_merge_runs, retrack_unanalyzed_functions,
+        synthesize_reloc_targeted_leaf_functions, LeafFrag,
     };
     use crate::analysis::tracker::Tracker;
     use crate::obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection, ObjSectionKind,
-        ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
+        ObjArchitecture, ObjDataKind, ObjInfo, ObjKind, ObjReloc, ObjRelocKind, ObjSection,
+        ObjSectionKind, ObjSymbol, ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind,
     };
 
 
@@ -4173,6 +4412,139 @@ mod tests {
                 assert!(ok, "reported overlap addr {oa:#x} for index {i} is bogus: {funcs:?}");
             }
         }
+    }
+
+    // ---- interior data references (`label + addend` on @ha/@l) --------------
+    //
+    // RB3's `ProfileMgr::GetJoypadExtraLagInits` loads 74.0 from 0x82091FC0,
+    // but `lbl_82091FBC` (14.0) was sized 8, so the tracker resolved the load to
+    // `lbl_82091FBC + 4` and write_coff, which cannot encode that addend,
+    // emitted a load of 14.0. The fixture is the same shape:
+    //
+    //   .text  0x82000000  lis r11, 0x8201
+    //          0x82000004  lfs f0, 4(r11)      ; 0x82010004
+    //          0x82000008  blr
+    //   .rdata 0x82010000  14.0f, 74.0f        ; one 8-byte label
+    //   .data  0x82020000  ADDR32 -> 0x82010004
+
+    /// The `lis` and the `lfs` (section relocations are keyed by VA).
+    const SITES: [u32; 2] = [0x8200_0000, 0x8200_0004];
+
+    fn interior_ref_obj(container: &str) -> (ObjInfo, u32) {
+        let code: Vec<u8> =
+            [0x3D60_8201u32, 0xC00B_0004, BLR].iter().flat_map(|w| w.to_be_bytes()).collect();
+        let rdata: Vec<u8> =
+            [0x4160_0000u32, 0x4294_0000].iter().flat_map(|w| w.to_be_bytes()).collect();
+        let data: Vec<u8> = 0x8201_0004u32.to_be_bytes().to_vec();
+        let mk = |name: &str, kind, address, data: Vec<u8>| ObjSection {
+            name: name.into(),
+            kind,
+            address,
+            size: data.len() as u64,
+            data,
+            align: 4,
+            ..Default::default()
+        };
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "interior-ref-test".into(),
+            vec![],
+            vec![
+                mk(".text", ObjSectionKind::Code, 0x8200_0000, code),
+                mk(".rdata", ObjSectionKind::ReadOnlyData, 0x8201_0000, rdata),
+                mk(".data", ObjSectionKind::Data, 0x8202_0000, data),
+            ],
+        );
+        let sym = |name: &str, section, address, size, kind| ObjSymbol {
+            name: name.into(),
+            address,
+            section: Some(section),
+            size,
+            size_known: true,
+            flags: ObjSymbolFlagSet(ObjSymbolFlags::Global.into()),
+            kind,
+            ..Default::default()
+        };
+        obj.add_symbol(sym("f", 0, 0x8200_0000, 0xC, ObjSymbolKind::Function), false).unwrap();
+        let c = obj
+            .add_symbol(sym(container, 1, 0x8201_0000, 8, ObjSymbolKind::Object), false)
+            .unwrap();
+        obj.add_symbol(sym("ptr", 2, 0x8202_0000, 4, ObjSymbolKind::Object), false).unwrap();
+        obj.sections[2]
+            .relocations
+            .insert(
+                0x8202_0000,
+                ObjReloc {
+                    kind: ObjRelocKind::Absolute,
+                    target_symbol: c,
+                    addend: 4,
+                    module: None,
+                },
+            )
+            .unwrap();
+        (obj, c)
+    }
+
+    fn track(obj: &mut ObjInfo) -> Tracker {
+        let mut tracker = Tracker::new(obj);
+        let f = obj.symbols.by_name("f").unwrap().unwrap().1.clone();
+        tracker.process_function(obj, &f).unwrap();
+        tracker.apply_relocations(obj, false).unwrap();
+        tracker
+    }
+
+    #[test]
+    fn interior_data_load_is_anchored_on_its_exact_address() {
+        let (mut obj, container) = interior_ref_obj("lbl_82010000");
+        let tracker = track(&mut obj);
+
+        // The defect, reproduced: both halves resolve to the container + 4.
+        for site in SITES {
+            let r = obj.sections[0].relocations.at(site).expect("@ha/@l must be tracked");
+            assert_eq!((r.target_symbol, r.addend), (container, 4), "site {site:#x}");
+        }
+
+        assert_eq!(anchor_interior_data_references(&mut obj, &tracker), 1);
+
+        let (new_idx, new_sym) = obj.symbols.by_name("lbl_82010004").unwrap().unwrap();
+        assert_eq!((new_sym.address, new_sym.size, new_sym.section), (0x8201_0004, 4, Some(1)));
+        assert_eq!(new_sym.data_kind, ObjDataKind::Float, "the lfs's inferred kind");
+        assert_eq!(new_sym.align, Some(4));
+        assert_eq!(obj.symbols[container].size, 4, "container shrinks to the split point");
+        for site in SITES {
+            let r = obj.sections[0].relocations.at(site).unwrap();
+            assert_eq!((r.target_symbol, r.addend), (new_idx, 0), "site {site:#x}");
+        }
+        // A data pointer into the carved piece keeps its effective target.
+        let p = obj.sections[2].relocations.at(0x8202_0000).unwrap();
+        assert_eq!((p.target_symbol, p.addend), (new_idx, 0));
+
+        // Fixed point: the next split finds the label and the tracker resolves
+        // the same sites with addend 0, so the pass has nothing left to do.
+        for site in SITES {
+            obj.sections[0].relocations.remove(site);
+        }
+        let tracker = track(&mut obj);
+        for site in SITES {
+            let r = obj.sections[0].relocations.at(site).unwrap();
+            assert_eq!((r.target_symbol, r.addend), (new_idx, 0), "re-split site {site:#x}");
+        }
+        assert_eq!(anchor_interior_data_references(&mut obj, &tracker), 0);
+    }
+
+    #[test]
+    fn interior_data_load_into_a_named_object_is_left_alone() {
+        let (mut obj, container) = interior_ref_obj("?gTable@@3PAMA");
+        let tracker = track(&mut obj);
+        let before = obj.symbols.count();
+
+        assert_eq!(anchor_interior_data_references(&mut obj, &tracker), 0);
+
+        assert_eq!(obj.symbols.count(), before, "no label carved out of a named object");
+        assert_eq!(obj.symbols[container].size, 8);
+        let r = obj.sections[0].relocations.at(SITES[1]).unwrap();
+        assert_eq!((r.target_symbol, r.addend), (container, 4));
     }
 
     // ---- post-repair relocation pass ----------------------------------------
