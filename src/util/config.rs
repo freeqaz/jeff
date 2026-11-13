@@ -18,7 +18,7 @@ use crate::{
     analysis::cfa::SectionAddress,
     obj::{
         ObjDataKind, ObjInfo, ObjKind, ObjSectionKind, ObjSplit, ObjSymbol, ObjSymbolFlagSet,
-        ObjSymbolFlags, ObjSymbolKind, ObjUnit, SectionIndex,
+        ObjSymbolFlags, ObjSymbolKind, ObjUnit, SectionIndex, SymbolIndex,
     },
     util::{
         file::{buf_writer, FileReadInfo},
@@ -111,56 +111,93 @@ pub fn apply_symbols_file(
                 // duplicate name later trips create_gap_splits into
                 // emitting an auto-split boundary that bisects a
                 // legitimate object.
-                if let Some((existing_idx, existing)) = obj.symbols.by_name(&symbol.name)? {
-                    if existing.address != symbol.address {
-                        // Auto/generated name families (fn_/lbl_/jumptable_/
-                        // except_*) really do go stale across rebuilds: keep
-                        // preferring the prior loader's placement for those.
-                        let generated = symbol.name.starts_with("fn_")
-                            || symbol.name.starts_with("lbl_")
-                            || symbol.name.starts_with("jumptable_")
-                            || symbol.name.starts_with("except_data_")
-                            || symbol.name.starts_with("except_record_");
-                        if generated {
-                            log::warn!(
-                                "Dropping symbol {} @ {:#010X}: name already used by \
-                                 prior loader at {:#010X} (likely stale symbols.txt entry)",
-                                symbol.name, symbol.address, existing.address,
-                            );
-                            continue;
-                        }
-                        // A REAL name in symbols.txt is the user's naming
-                        // authority; the collision is a prior loader (imports,
-                        // PDB, pdata) having auto-placed the same name at a
-                        // different address, possibly one that symbols.txt
-                        // renames on a LATER line (measured: `sprintf @
-                        // 0x829A2760` was dropped because the import loader
-                        // pre-named the RtlSprintf thunk at 0x82EE6584
-                        // `sprintf`, whose symbols.txt rename line came 20k
-                        // lines later; the user rename then reverted on every
-                        // split).  Free the name: park the prior symbol on an
-                        // auto name — its own symbols.txt line, if any, will
-                        // rename it again when reached.
-                        let existing = existing.clone();
-                        let prefix = if existing.kind == ObjSymbolKind::Function {
-                            "fn"
-                        } else {
-                            "lbl"
-                        };
-                        let parked =
-                            create_auto_symbol_name(prefix, 0, existing.address as u32);
+                // Prior symbols that already carry this name at a DIFFERENT
+                // place. Collected with `for_name` rather than `by_name`:
+                // once two file-statics legitimately share a name (below),
+                // `by_name` bails on every later lookup of it.
+                let collisions: Vec<(SymbolIndex, ObjSymbol)> = obj
+                    .symbols
+                    .for_name(&symbol.name)
+                    .filter(|(_, s)| s.address != symbol.address)
+                    .map(|(idx, s)| (idx, s.clone()))
+                    .collect();
+                // Auto/generated name families (fn_/lbl_/jumptable_/
+                // except_*) really do go stale across rebuilds: keep
+                // preferring the prior loader's placement for those.
+                let generated = symbol.name.starts_with("fn_")
+                    || symbol.name.starts_with("lbl_")
+                    || symbol.name.starts_with("jumptable_")
+                    || symbol.name.starts_with("except_data_")
+                    || symbol.name.starts_with("except_record_");
+                // Two `scope:local` entries of one name are two file-statics
+                // from different translation units (MSVC's map lists e.g.
+                // `?PackVector@@...` under "Static symbols" once for
+                // rnddx9:Mesh.obj and once for rndobj:Mesh.obj). That is not
+                // a stale entry and must not park either one: both survive,
+                // exactly as upstream dtk keeps per-TU `@stringBase0`s. Only
+                // when EVERY prior holder is local too, and none of them sits
+                // in the same declared split (two statics of one name in one
+                // object would be a real conflict) -- a global on either side
+                // keeps today's handling below, and so does a generated name
+                // (those encode an address; a second address means stale).
+                let coexisting_statics = !generated
+                    && symbol.flags.is_local()
+                    && !collisions.is_empty()
+                    && collisions.iter().all(|(_, existing)| {
+                        existing.flags.is_local()
+                            && !in_same_declared_split(obj, existing, &symbol)
+                    });
+                if coexisting_statics {
+                    log::debug!(
+                        "Keeping local {} @ {:#010X} alongside {} other local(s) of the \
+                         same name (distinct file-statics)",
+                        symbol.name,
+                        symbol.address,
+                        collisions.len(),
+                    );
+                }
+                let collisions = if coexisting_statics { vec![] } else { collisions };
+                if generated {
+                    if let Some((_, existing)) = collisions.first() {
                         log::warn!(
-                            "symbols.txt claims name {} for {:#010X}; parking prior \
-                             loader's {:#010X} as {} (a later symbols.txt line may \
-                             rename it)",
-                            symbol.name, symbol.address, existing.address, parked,
+                            "Dropping symbol {} @ {:#010X}: name already used by \
+                             prior loader at {:#010X} (likely stale symbols.txt entry)",
+                            symbol.name, symbol.address, existing.address,
                         );
-                        obj.symbols.replace(existing_idx, ObjSymbol {
-                            name: parked,
-                            demangled_name: None,
-                            ..existing
-                        })?;
+                        continue;
                     }
+                }
+                for (existing_idx, existing) in collisions {
+                    // A REAL name in symbols.txt is the user's naming
+                    // authority; the collision is a prior loader (imports,
+                    // PDB, pdata) having auto-placed the same name at a
+                    // different address, possibly one that symbols.txt
+                    // renames on a LATER line (measured: `sprintf @
+                    // 0x829A2760` was dropped because the import loader
+                    // pre-named the RtlSprintf thunk at 0x82EE6584
+                    // `sprintf`, whose symbols.txt rename line came 20k
+                    // lines later; the user rename then reverted on every
+                    // split).  Free the name: park the prior symbol on an
+                    // auto name — its own symbols.txt line, if any, will
+                    // rename it again when reached.
+                    let prefix = if existing.kind == ObjSymbolKind::Function {
+                        "fn"
+                    } else {
+                        "lbl"
+                    };
+                    let parked =
+                        create_auto_symbol_name(prefix, 0, existing.address as u32);
+                    log::warn!(
+                        "symbols.txt claims name {} for {:#010X}; parking prior \
+                         loader's {:#010X} as {} (a later symbols.txt line may \
+                         rename it)",
+                        symbol.name, symbol.address, existing.address, parked,
+                    );
+                    obj.symbols.replace(existing_idx, ObjSymbol {
+                        name: parked,
+                        demangled_name: None,
+                        ..existing
+                    })?;
                 }
                 // A function symbol from symbols.txt whose address falls
                 // inside a pdata-described function is a label, not a
@@ -205,6 +242,25 @@ pub fn apply_symbols_file(
     } else {
         None
     })
+}
+
+/// Whether two symbols fall inside the SAME declared (splits.txt) split.
+/// Used to refuse letting two same-named file-statics coexist when they would
+/// land in one object. Symbols outside every declared split are never "the
+/// same split": gap splits are created later, and `create_gap_splits` already
+/// cuts an auto split at a repeated name.
+fn in_same_declared_split(obj: &ObjInfo, a: &ObjSymbol, b: &ObjSymbol) -> bool {
+    let (Some(sa), Some(sb)) = (a.section, b.section) else {
+        return false;
+    };
+    if sa != sb {
+        return false;
+    }
+    let splits = &obj.sections[sa].splits;
+    match (splits.for_address(a.address as u32), splits.for_address(b.address as u32)) {
+        (Some((start_a, _)), Some((start_b, _))) => start_a == start_b,
+        _ => false,
+    }
 }
 
 pub fn parse_symbol_line(line: &str, obj: &mut ObjInfo) -> Result<Option<ObjSymbol>> {
@@ -1093,5 +1149,161 @@ impl serde::Serialize for SectionAddressRef {
         } else {
             serializer.serialize_str(&format!("{:#X}", self.address))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use typed_path::Utf8NativePathBuf;
+
+    use super::apply_symbols_file;
+    use crate::obj::{ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind, ObjSplit};
+
+    /// One `.text` section at 0x82000000 holding two declared splits, the
+    /// shape of dc3's `rnddx9/Mesh.cpp` + `rndobj/Mesh.cpp`, which each carry
+    /// a file-static `?PackVector@@...`.
+    fn two_unit_obj() -> ObjInfo {
+        let mut obj = ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "dup-local-test".into(),
+            vec![],
+            vec![ObjSection {
+                name: ".text".into(),
+                kind: ObjSectionKind::Code,
+                address: 0x8200_0000,
+                size: 0x100,
+                data: vec![0; 0x100],
+                align: 4,
+                ..Default::default()
+            }],
+        );
+        let split = |unit: &str, end| ObjSplit {
+            unit: unit.into(),
+            end,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        };
+        obj.sections[0].splits.push(0x8200_0000, split("a.cpp", 0x8200_0080));
+        obj.sections[0].splits.push(0x8200_0080, split("b.cpp", 0x8200_0100));
+        obj
+    }
+
+    /// Apply `lines` as a symbols.txt and return `(name, address)` for every
+    /// symbol at the two addresses the tests use.
+    fn apply(lines: &[&str]) -> Vec<(String, u64)> {
+        let mut obj = two_unit_obj();
+        let path = scratch_path();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let native = Utf8NativePathBuf::from(path.to_str().unwrap());
+        apply_symbols_file(&native, &mut obj).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut out: Vec<(String, u64)> = obj
+            .symbols
+            .iter()
+            .filter(|(_, s)| s.address == 0x8200_0000 || s.address == 0x8200_0080)
+            .map(|(_, s)| (s.name.clone(), s.address))
+            .collect();
+        out.sort_by_key(|(_, a)| *a);
+        out
+    }
+
+    /// A per-call file name: tests run on parallel threads of one process.
+    fn scratch_path() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("dtk-dup-local-{}-{n}.txt", std::process::id()))
+    }
+
+    fn named(name: &str, addr: u64) -> (String, u64) { (name.to_string(), addr) }
+
+    #[test]
+    fn two_local_statics_of_one_name_both_survive() {
+        let got = apply(&[
+            "f = .text:0x82000000; // type:function size:0x10 scope:local",
+            "f = .text:0x82000080; // type:function size:0x10 scope:local",
+        ]);
+        assert_eq!(got, vec![named("f", 0x8200_0000), named("f", 0x8200_0080)]);
+    }
+
+    #[test]
+    fn three_local_statics_of_one_name_all_survive() {
+        // A third holder must not trip `by_name`'s "Multiple symbols" bail.
+        let mut obj = two_unit_obj();
+        obj.sections[0].splits.push(0x8200_00C0, ObjSplit {
+            unit: "c.cpp".into(),
+            end: 0x8200_0100,
+            align: None,
+            common: false,
+            autogenerated: false,
+            skip: false,
+            rename: None,
+        });
+        let path = scratch_path();
+        std::fs::write(
+            &path,
+            "f = .text:0x82000000; // type:function size:0x10 scope:local\n\
+             f = .text:0x82000080; // type:function size:0x10 scope:local\n\
+             f = .text:0x820000C0; // type:function size:0x10 scope:local\n",
+        )
+        .unwrap();
+        apply_symbols_file(&Utf8NativePathBuf::from(path.to_str().unwrap()), &mut obj).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut addrs: Vec<u64> = obj.symbols.for_name("f").map(|(_, s)| s.address).collect();
+        addrs.sort();
+        assert_eq!(addrs, vec![0x8200_0000, 0x8200_0080, 0x8200_00C0]);
+    }
+
+    #[test]
+    fn global_duplicate_still_parks_the_prior_holder() {
+        // Unchanged behaviour (f4e81e0): a real name claimed again parks the
+        // earlier holder on an auto name.
+        let got = apply(&[
+            "f = .text:0x82000000; // type:function size:0x10 scope:global",
+            "f = .text:0x82000080; // type:function size:0x10 scope:global",
+        ]);
+        assert_eq!(got, vec![named("fn_82000000", 0x8200_0000), named("f", 0x8200_0080)]);
+    }
+
+    #[test]
+    fn local_claiming_a_global_name_still_parks_it() {
+        // Only BOTH-local pairs coexist; this is the 2026-11-13 dc3 probe
+        // (PackVector bound scope:local over a scope:global holder).
+        let got = apply(&[
+            "f = .text:0x82000000; // type:function size:0x10 scope:global",
+            "f = .text:0x82000080; // type:function size:0x10 scope:local",
+        ]);
+        assert_eq!(got, vec![named("fn_82000000", 0x8200_0000), named("f", 0x8200_0080)]);
+    }
+
+    #[test]
+    fn global_claiming_a_local_name_still_parks_it() {
+        let got = apply(&[
+            "f = .text:0x82000000; // type:function size:0x10 scope:local",
+            "f = .text:0x82000080; // type:function size:0x10 scope:global",
+        ]);
+        assert_eq!(got, vec![named("fn_82000000", 0x8200_0000), named("f", 0x8200_0080)]);
+    }
+
+    #[test]
+    fn two_locals_in_one_declared_split_still_park() {
+        // Two statics of one name in ONE object is a real conflict.
+        let got = apply(&[
+            "f = .text:0x82000000; // type:function size:0x10 scope:local",
+            "f = .text:0x82000040; // type:function size:0x10 scope:local",
+        ]);
+        assert!(got.contains(&named("fn_82000000", 0x8200_0000)), "{got:?}");
+    }
+
+    #[test]
+    fn generated_duplicate_is_still_dropped() {
+        let got = apply(&[
+            "lbl_82000000 = .text:0x82000000; // type:function size:0x10 scope:local",
+            "lbl_82000000 = .text:0x82000080; // type:function size:0x10 scope:local",
+        ]);
+        assert_eq!(got, vec![named("lbl_82000000", 0x8200_0000)]);
     }
 }
